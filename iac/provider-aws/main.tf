@@ -3,6 +3,42 @@ locals {
   resolved_snapshot_bucket = coalesce(var.snapshot_bucket_name, "${var.prefix}-${var.environment}-snapshots")
   resolved_build_bucket    = coalesce(var.build_bucket_name, "${var.prefix}-${var.environment}-builds")
   resolved_log_bucket      = coalesce(var.log_bucket_name, "${var.prefix}-${var.environment}-logs")
+  enable_cloudflare        = var.cloudflare_zone_id != "" && var.cloudflare_api_token != ""
+  ssm_managed_instance_core = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = [
+          "ssm:DescribeAssociation",
+          "ssm:GetDeployablePatchSnapshotForInstance",
+          "ssm:GetDocument",
+          "ssm:DescribeDocument",
+          "ssm:GetManifest",
+          "ssm:GetParameters",
+          "ssm:ListAssociations",
+          "ssm:ListInstanceAssociations",
+          "ssm:PutInventory",
+          "ssm:PutComplianceItems",
+          "ssm:PutConfigurePackageResult",
+          "ssm:UpdateAssociationStatus",
+          "ssm:UpdateInstanceAssociationStatus",
+          "ssm:UpdateInstanceInformation",
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
+          "ec2messages:AcknowledgeMessage",
+          "ec2messages:DeleteMessage",
+          "ec2messages:FailMessage",
+          "ec2messages:GetEndpoint",
+          "ec2messages:GetMessages",
+          "ec2messages:SendReply"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
 module "vpc" {
@@ -155,7 +191,12 @@ resource "aws_iam_role_policy" "worker_bucket_access" {
           "ecr:BatchCheckLayerAvailability",
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage",
-          "ecr:DescribeImages"
+          "ecr:DescribeImages",
+          "ecr:DescribeRepositories",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage"
         ],
         Resource = "*"
       },
@@ -170,6 +211,13 @@ resource "aws_iam_role_policy" "worker_bucket_access" {
       }
     ]
   })
+}
+
+resource "aws_iam_role_policy" "worker_ssm" {
+  name = "${var.prefix}-${var.environment}-worker-ssm"
+  role = aws_iam_role.worker.id
+
+  policy = local.ssm_managed_instance_core
 }
 
 resource "aws_iam_role_policy" "control_plane_bucket_access" {
@@ -198,7 +246,12 @@ resource "aws_iam_role_policy" "control_plane_bucket_access" {
           "ecr:BatchCheckLayerAvailability",
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage",
-          "ecr:DescribeImages"
+          "ecr:DescribeImages",
+          "ecr:DescribeRepositories",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage"
         ],
         Resource = "*"
       },
@@ -213,6 +266,13 @@ resource "aws_iam_role_policy" "control_plane_bucket_access" {
       }
     ]
   })
+}
+
+resource "aws_iam_role_policy" "control_plane_ssm" {
+  name = "${var.prefix}-${var.environment}-control-plane-ssm"
+  role = aws_iam_role.control_plane.id
+
+  policy = local.ssm_managed_instance_core
 }
 
 resource "aws_iam_instance_profile" "worker" {
@@ -239,7 +299,8 @@ resource "aws_route53_record" "domain" {
 }
 
 resource "cloudflare_record" "domain" {
-  count = var.cloudflare_zone_id != "" && var.cloudflare_api_token != "" ? 1 : 0
+  count    = local.enable_cloudflare ? 1 : 0
+  provider = cloudflare.managed
 
   zone_id = var.cloudflare_zone_id
   name    = var.domain_name
@@ -256,6 +317,21 @@ resource "aws_lb" "api" {
   subnets            = module.vpc.public_subnets
 
   tags = var.tags
+}
+
+resource "aws_lb_listener" "http_redirect" {
+  load_balancer_arn = aws_lb.api.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
 }
 
 resource "aws_lb_target_group" "api" {
@@ -277,6 +353,14 @@ resource "aws_security_group" "api" {
   name        = "${var.prefix}-${var.environment}-alb"
   description = "Allow HTTPS ingress to the E2B control-plane load balancer"
   vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    description = "HTTP redirect"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   ingress {
     description = "HTTPS"
@@ -365,7 +449,22 @@ resource "aws_launch_template" "control_plane" {
   }
 
   vpc_security_group_ids = [aws_security_group.control_plane.id]
-  user_data              = var.control_plane_user_data
+  user_data              = base64encode(var.control_plane_user_data)
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = var.root_volume_size
+      volume_type = "gp3"
+      encrypted   = true
+      kms_key_id  = var.root_volume_kms_key_id != "" ? var.root_volume_kms_key_id : null
+    }
+  }
+
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
 
   tag_specifications {
     resource_type = "instance"
@@ -384,7 +483,22 @@ resource "aws_launch_template" "worker" {
   }
 
   vpc_security_group_ids = [aws_security_group.workers.id]
-  user_data              = var.worker_user_data
+  user_data              = base64encode(var.worker_user_data)
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = var.root_volume_size
+      volume_type = "gp3"
+      encrypted   = true
+      kms_key_id  = var.root_volume_kms_key_id != "" ? var.root_volume_kms_key_id : null
+    }
+  }
+
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
 
   tag_specifications {
     resource_type = "instance"

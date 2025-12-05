@@ -62,12 +62,22 @@ variable "cloudflare_api_token" {
   description = "Cloudflare API token if you prefer Cloudflare DNS. Leave empty to skip Cloudflare management."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.cloudflare_zone_id == "" || var.cloudflare_api_token != ""
+    error_message = "cloudflare_api_token must be set when cloudflare_zone_id is provided."
+  }
 }
 
 variable "cloudflare_zone_id" {
   description = "Cloudflare zone ID for managing DNS."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.cloudflare_zone_id == "" || var.domain_name != ""
+    error_message = "cloudflare_zone_id requires domain_name to be set."
+  }
 }
 
 variable "template_bucket_name" {
@@ -196,6 +206,18 @@ variable "worker_user_data" {
 
 variable "ssh_key_name" {
   description = "Optional EC2 key pair name to attach to instances for debugging."
+  type        = string
+  default     = ""
+}
+
+variable "root_volume_size" {
+  description = "Root EBS volume size (GiB) for both control-plane and worker instances."
+  type        = number
+  default     = 50
+}
+
+variable "root_volume_kms_key_id" {
+  description = "Optional KMS key ID/ARN to encrypt root volumes. Leave blank to use the AWS-managed key."
   type        = string
   default     = ""
 }

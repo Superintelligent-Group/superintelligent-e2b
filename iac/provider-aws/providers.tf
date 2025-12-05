@@ -3,5 +3,6 @@ provider "aws" {
 }
 
 provider "cloudflare" {
+  alias     = "managed"
   api_token = var.cloudflare_api_token
 }
