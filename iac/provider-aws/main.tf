@@ -53,7 +53,7 @@ module "vpc" {
   private_subnets = var.private_subnet_cidrs
 
   enable_nat_gateway   = true
-  single_nat_gateway   = true
+  single_nat_gateway   = var.single_nat_gateway
   enable_dns_hostnames = true
   enable_dns_support   = true
 

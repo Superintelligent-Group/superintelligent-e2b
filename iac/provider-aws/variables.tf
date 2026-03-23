@@ -104,6 +104,12 @@ variable "log_bucket_name" {
   default     = ""
 }
 
+variable "single_nat_gateway" {
+  description = "Use a single NAT gateway (cheaper for dev/staging) vs one per AZ (HA for production)."
+  type        = bool
+  default     = true
+}
+
 variable "enable_bucket_versioning" {
   description = "Enable versioning on artifact buckets."
   type        = bool
