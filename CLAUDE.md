@@ -289,3 +289,204 @@ make connect-orchestrator
 ### Logs
 - Local: Docker logs in `make local-infra`
 - Production: Grafana Loki or Nomad UI
+
+---
+
+## 🚧 AWS Deployment - In Progress
+
+### Current Status
+We are setting up E2B infrastructure on AWS. The Terraform code is complete but AWS account setup is in progress.
+
+### What Has Been Built (Terraform Code Ready)
+All AWS infrastructure Terraform is in `iac/provider-aws/`:
+
+| File | Purpose |
+|------|---------|
+| `main.tf` | Core infrastructure (VPC, ALB, ASG, S3, ECR, IAM) |
+| `data.tf` | RDS PostgreSQL + ElastiCache Redis |
+| `secrets.tf` | AWS Secrets Manager configuration |
+| `observability.tf` | CloudWatch logs, alarms, dashboard |
+| `autoscaling.tf` | Auto scaling policies |
+| `userdata.tf` | EC2 bootstrap script generation |
+| `scripts/control-plane-userdata.sh` | Control plane bootstrap |
+| `scripts/worker-userdata.sh` | Worker node bootstrap (Firecracker setup) |
+| `nomad/` | Nomad job definitions adapted for AWS |
+
+### User's AWS Setup Progress
+**Current Step: Step 1 - Create IAM Admin User**
+
+- [ ] **Step 1**: Create IAM admin user (DO NOT use root account for deployment)
+- [ ] **Step 2**: Install AWS CLI
+- [ ] **Step 3**: Configure AWS CLI with access keys
+- [ ] **Step 4**: Choose region and domain
+- [ ] **Step 5**: Create ACM certificate for SSL
+- [ ] **Step 6**: Find Ubuntu AMI ID for the region
+- [ ] **Step 7**: Create SSH key pair (optional)
+- [ ] **Step 8**: Create Terraform state backend (S3 + DynamoDB)
+- [ ] **Step 9**: Deploy infrastructure with Terraform
+- [ ] **Step 10**: Build and push Docker images to ECR
+- [ ] **Step 11**: Deploy Nomad jobs
+
+### Quick Resume Guide
+
+When resuming, check these items:
+
+1. **If AWS CLI not configured yet:**
+   ```bash
+   aws sts get-caller-identity
+   ```
+   If this fails, need to complete Steps 1-3.
+
+2. **If CLI works but no infrastructure:**
+   ```bash
+   cd iac/provider-aws
+   terraform init  # Will fail if state backend not created
+   ```
+   If fails, need Step 8 first.
+
+3. **If state backend exists:**
+   ```bash
+   cd iac/provider-aws
+   terraform plan
+   ```
+
+### AWS Setup - Detailed Steps
+
+#### Step 1: Create IAM Admin User
+1. Go to: https://console.aws.amazon.com/iam/
+2. Click **Users** → **Create user**
+3. Name: `e2b-admin`, check "Provide console access"
+4. Attach **AdministratorAccess** policy
+5. Create **Access Keys** for CLI (Security credentials tab)
+6. **SAVE THE ACCESS KEY AND SECRET!** (won't be shown again)
+
+#### Step 2-3: Install & Configure AWS CLI
+```powershell
+# Windows
+winget install Amazon.AWSCLI
+
+# Configure
+aws configure
+# Enter: Access Key, Secret Key, Region (us-east-1), Output (json)
+
+# Verify
+aws sts get-caller-identity
+```
+
+#### Step 4: Domain Decision
+Options:
+- Buy domain in Route 53
+- Use existing domain with Route 53 hosted zone
+- Use Cloudflare (set `cloudflare_api_token` and `cloudflare_zone_id`)
+
+#### Step 5: Create ACM Certificate
+1. Go to: https://console.aws.amazon.com/acm/
+2. **Make sure you're in your target region!**
+3. Request public certificate for your domain
+4. Use DNS validation
+5. Save the Certificate ARN
+
+#### Step 6: Get Ubuntu AMI ID
+```bash
+aws ec2 describe-images \
+  --owners 099720109477 \
+  --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
+  --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+  --output text \
+  --region us-east-1
+```
+
+#### Step 7: Create SSH Key (Optional)
+```bash
+aws ec2 create-key-pair --key-name e2b-key --query 'KeyMaterial' --output text --region us-east-1 > e2b-key.pem
+chmod 400 e2b-key.pem
+```
+
+#### Step 8: Create Terraform State Backend
+```bash
+cd iac/provider-aws/state
+terraform init
+terraform apply \
+  -var="aws_region=us-east-1" \
+  -var="state_bucket_name=e2b-terraform-state-UNIQUE-NAME" \
+  -var="lock_table_name=e2b-terraform-locks"
+```
+
+#### Step 9: Deploy Infrastructure
+```bash
+cd iac/provider-aws
+
+# Initialize with backend
+terraform init \
+  -backend-config="bucket=e2b-terraform-state-UNIQUE-NAME" \
+  -backend-config="key=terraform/e2b/state" \
+  -backend-config="region=us-east-1" \
+  -backend-config="dynamodb_table=e2b-terraform-locks"
+
+# Create terraform.tfvars with your config (see .env.aws.template)
+
+# Deploy
+terraform plan
+terraform apply
+```
+
+### Key Configuration Values to Collect
+Before deploying, gather these:
+
+| Item | Value | Status |
+|------|-------|--------|
+| AWS Account ID | (12-digit number) | ❌ Not collected |
+| AWS Region | `us-east-1` (recommended) | ❌ Not confirmed |
+| Domain name | e.g., `e2b.example.com` | ❌ Not decided |
+| ACM Certificate ARN | `arn:aws:acm:...` | ❌ Not created |
+| Ubuntu AMI ID | `ami-xxxxxxxx` | ❌ Not looked up |
+| Route 53 Zone ID | `Z...` (if using Route 53) | ❌ Not created |
+
+### AWS vs GCP Mapping
+| GCP | AWS | Status |
+|-----|-----|--------|
+| Cloud Storage | S3 | ✅ Terraform ready |
+| Artifact Registry | ECR | ✅ Terraform ready |
+| Cloud SQL | RDS PostgreSQL | ✅ Terraform ready |
+| Memorystore | ElastiCache Redis | ✅ Terraform ready |
+| Secret Manager | Secrets Manager | ✅ Terraform ready |
+| GKE + Nomad | EC2 + Nomad | ✅ Terraform ready |
+| Cloud Logging | CloudWatch | ✅ Terraform ready |
+
+### Files Created for AWS
+```
+iac/provider-aws/
+├── main.tf                    # Core infra (existing, enhanced)
+├── variables.tf               # Core variables (existing)
+├── data.tf                    # NEW: RDS + ElastiCache
+├── data-variables.tf          # NEW: Data layer variables
+├── secrets.tf                 # NEW: Secrets Manager
+├── secrets-variables.tf       # NEW: Secrets variables
+├── observability.tf           # NEW: CloudWatch
+├── observability-variables.tf # NEW: Observability variables
+├── autoscaling.tf             # NEW: Auto scaling policies
+├── autoscaling-variables.tf   # NEW: Scaling variables
+├── userdata.tf                # NEW: User data generation
+├── .env.aws.template          # NEW: Environment template
+├── SETUP-GUIDE.md             # NEW: Step-by-step setup
+├── README.md                  # UPDATED: Comprehensive docs
+├── scripts/
+│   ├── control-plane-userdata.sh  # NEW: CP bootstrap
+│   └── worker-userdata.sh         # NEW: Worker bootstrap
+└── nomad/
+    ├── main.tf                # NEW: Nomad job deployment
+    ├── variables.tf           # NEW: Nomad variables
+    └── jobs/
+        ├── api.hcl            # NEW: API job
+        ├── orchestrator.hcl   # NEW: Orchestrator job
+        ├── edge.hcl           # NEW: Client proxy job
+        ├── template-manager.hcl # NEW: Template manager
+        └── redis.hcl          # NEW: Redis job
+```
+
+### Estimated AWS Costs (Monthly)
+| Scenario | Config | Cost |
+|----------|--------|------|
+| Dev | 1 CP + 1 Worker, small RDS/Redis | ~$180-220 |
+| Staging | 2 CP + 2 Workers, medium | ~$400-500 |
+| Production | 3 CP + 5 Workers, multi-AZ | ~$1,000-1,500 |

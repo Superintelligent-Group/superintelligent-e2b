@@ -449,7 +449,7 @@ resource "aws_launch_template" "control_plane" {
   }
 
   vpc_security_group_ids = [aws_security_group.control_plane.id]
-  user_data              = base64encode(var.control_plane_user_data)
+  user_data              = base64encode(local.final_control_plane_userdata)
 
   block_device_mappings {
     device_name = "/dev/xvda"
@@ -483,7 +483,7 @@ resource "aws_launch_template" "worker" {
   }
 
   vpc_security_group_ids = [aws_security_group.workers.id]
-  user_data              = base64encode(var.worker_user_data)
+  user_data              = base64encode(local.final_worker_userdata)
 
   block_device_mappings {
     device_name = "/dev/xvda"

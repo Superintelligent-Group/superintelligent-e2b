@@ -1,71 +1,309 @@
-# AWS bootstrap for self-hosted E2B
+# AWS Self-Hosted E2B Infrastructure
 
-This folder provides an AWS-first Terraform scaffold that mirrors the Google Cloud flow documented in [`self-host.md`](../../self-host.md). It sets up the network, artifact buckets, ECR repositories, an ALB front door, and a worker IAM role so you can drop in the control-plane and worker jobs that the Makefile builds.
+This folder provides a complete AWS Terraform deployment for self-hosted E2B infrastructure. It mirrors the Google Cloud flow documented in [`self-host.md`](../../self-host.md) but uses native AWS services.
 
-## Layout
-- `state/` – one-time bootstrap for the Terraform remote state bucket and DynamoDB lock table (runs locally without a backend configured).
-- `versions.tf` – pins provider versions and declares the S3 backend (configure with `-backend-config`).
-- `providers.tf` – AWS + optional Cloudflare providers.
-- `variables.tf` – inputs aligned with `.env.template` (prefix, domain, bucket names, instance CIDRs, etc.).
-- `main.tf` – VPC + subnets, NAT, S3 artifact buckets, ECR repos, ALB with HTTPS and HTTP→HTTPS redirect, DNS records (Route 53 or Cloudflare), and a worker IAM role with access to the buckets/ECR/CloudWatch.
+## Architecture Overview
 
-## Usage
-1) **Create remote state**
-```sh
-cd iac/provider-aws/state
-terraform init
-terraform apply -var="aws_region=us-east-1" -var="state_bucket_name=<globally-unique-bucket>" \
-  -var="lock_table_name=e2b-terraform-locks" -var='tags={"project":"e2b"}'
+```
+                                    ┌─────────────────────────────────────────────────┐
+                                    │                    AWS Cloud                     │
+                                    │                                                  │
+    Internet ──────────────────────►│  ┌─────────────┐                                │
+                                    │  │     ALB     │                                │
+                                    │  │   (HTTPS)   │                                │
+                                    │  └──────┬──────┘                                │
+                                    │         │                                        │
+                                    │         ▼                                        │
+                                    │  ┌─────────────────────────────────────────┐    │
+                                    │  │         Control Plane (ASG)              │    │
+                                    │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐    │    │
+                                    │  │  │  Nomad  │ │ Consul  │ │  API    │    │    │
+                                    │  │  │ Server  │ │ Server  │ │ Service │    │    │
+                                    │  │  └─────────┘ └─────────┘ └─────────┘    │    │
+                                    │  └──────────────────┬──────────────────────┘    │
+                                    │                     │                            │
+                                    │         ┌───────────┴───────────┐                │
+                                    │         ▼                       ▼                │
+                                    │  ┌─────────────┐         ┌─────────────┐        │
+                                    │  │     RDS     │         │ ElastiCache │        │
+                                    │  │ PostgreSQL  │         │    Redis    │        │
+                                    │  └─────────────┘         └─────────────┘        │
+                                    │                                                  │
+                                    │  ┌─────────────────────────────────────────┐    │
+                                    │  │           Workers (ASG)                  │    │
+                                    │  │  ┌─────────┐ ┌─────────┐ ┌───────────┐  │    │
+                                    │  │  │ Nomad   │ │Firecrack│ │Orchestrat │  │    │
+                                    │  │  │ Client  │ │er VMs   │ │or         │  │    │
+                                    │  │  └─────────┘ └─────────┘ └───────────┘  │    │
+                                    │  └─────────────────────────────────────────┘    │
+                                    │                                                  │
+                                    │  ┌─────────────────────────────────────────┐    │
+                                    │  │              Storage (S3)                │    │
+                                    │  │  templates │ snapshots │ builds │ logs  │    │
+                                    │  └─────────────────────────────────────────┘    │
+                                    │                                                  │
+                                    │  ┌─────────┐  ┌─────────┐  ┌─────────────┐      │
+                                    │  │   ECR   │  │ Secrets │  │ CloudWatch  │      │
+                                    │  │         │  │ Manager │  │ (Logs/Alarms│      │
+                                    │  └─────────┘  └─────────┘  └─────────────┘      │
+                                    └─────────────────────────────────────────────────┘
 ```
 
-2) **Configure backend**
-Pass the backend config when initializing the main stack:
-```sh
-cd ..
+## What's Included
+
+### Core Infrastructure (`main.tf`)
+- **VPC & Networking**: VPC with public/private subnets, NAT Gateway, security groups
+- **Load Balancing**: Application Load Balancer with HTTPS, HTTP→HTTPS redirect
+- **Auto Scaling**: Separate ASGs for control plane and worker nodes
+- **Container Registry**: ECR repositories for E2B images
+- **Storage**: S3 buckets for templates, snapshots, builds, and logs
+- **DNS**: Route 53 or Cloudflare integration
+
+### Data Layer (`data.tf`)
+- **RDS PostgreSQL**: Managed PostgreSQL database with encryption, backups
+- **ElastiCache Redis**: Managed Redis cluster with TLS, auth token
+- Security groups and subnet groups
+
+### Secrets Management (`secrets.tf`)
+- **AWS Secrets Manager**: All sensitive configuration stored securely
+- Auto-generated passwords and tokens
+- IAM policies for secret access
+
+### Observability (`observability.tf`)
+- **CloudWatch Log Groups**: For all E2B services
+- **CloudWatch Alarms**: 5xx errors, latency, unhealthy hosts, RDS/Redis metrics
+- **CloudWatch Dashboard**: Overview of system health
+- **ALB Access Logs**: S3-based logging
+
+### Auto Scaling (`autoscaling.tf`)
+- **Step Scaling**: CPU-based scale up/down policies
+- **Target Tracking**: Alternative CPU and request count based scaling
+- **Scheduled Scaling**: Optional time-based scaling for predictable workloads
+
+### User Data Bootstrap Scripts (`scripts/`)
+- **Control Plane**: Installs Nomad server, Consul server, Docker, CloudWatch agent
+- **Workers**: Installs Firecracker, kernel tuning, Nomad client
+
+### Nomad Jobs (`nomad/`)
+- AWS-adapted versions of all E2B Nomad jobs
+- API, Orchestrator, Client Proxy, Template Manager, Redis
+
+## Prerequisites
+
+1. **AWS Account** with appropriate permissions
+2. **AWS CLI** configured with credentials
+3. **Terraform** >= 1.5.0
+4. **Domain name** with DNS management access
+5. **ACM Certificate** for your domain (in the same region as ALB)
+
+## Quick Start
+
+### 1. Create Remote State Infrastructure
+
+```bash
+cd iac/provider-aws/state
+
+terraform init
+terraform apply \
+  -var="aws_region=us-east-1" \
+  -var="state_bucket_name=e2b-terraform-state-YOURNAME" \
+  -var="lock_table_name=e2b-terraform-locks" \
+  -var='tags={"project":"e2b","env":"prod"}'
+```
+
+### 2. Configure Environment
+
+```bash
+cd iac/provider-aws
+
+# Copy the template
+cp .env.aws.template .env.aws.prod
+
+# Edit the configuration
+# Fill in: AWS_REGION, DOMAIN_NAME, ACM_CERTIFICATE_ARN, AMI IDs, etc.
+```
+
+### 3. Initialize Terraform
+
+```bash
 terraform init \
-  -backend-config="bucket=<globally-unique-bucket>" \
-  -backend-config="key=terraform/orchestration/state" \
+  -backend-config="bucket=e2b-terraform-state-YOURNAME" \
+  -backend-config="key=terraform/e2b/state" \
   -backend-config="region=us-east-1" \
   -backend-config="dynamodb_table=e2b-terraform-locks"
 ```
 
-3) **Plan/apply**
-Provide the CIDRs/availability zones and a certificate ARN from ACM. Bucket names default to `<prefix>-<env>-{templates|snapshots|builds|logs}` if you leave them blank. Supply AMI IDs, instance types, and scaling targets for control-plane and worker Auto Scaling Groups.
-```sh
+### 4. Deploy Infrastructure
+
+```bash
+# Plan the deployment
 terraform plan \
   -var="aws_region=us-east-1" \
-  -var="availability_zones=[\"us-east-1a\",\"us-east-1b\"]" \
-  -var="public_subnet_cidrs=[\"10.10.0.0/24\",\"10.10.1.0/24\"]" \
-  -var="private_subnet_cidrs=[\"10.10.10.0/24\",\"10.10.11.0/24\"]" \
+  -var="environment=prod" \
+  -var="domain_name=e2b.example.com" \
+  -var="acm_certificate_arn=arn:aws:acm:us-east-1:123456789:certificate/..." \
   -var="control_plane_ami_id=ami-xxxxxxxx" \
   -var="worker_ami_id=ami-yyyyyyyy" \
-  -var="domain_name=e2b.example.com" \
-  -var="acm_certificate_arn=<arn:aws:acm:...>" \
-  -var="create_route53_record=true" \
-  -var="route53_zone_id=<ZXXXXXXXXXXX>" \
-  -var='tags={"project":"e2b","env":"prod"}'
+  -var="availability_zones=[\"us-east-1a\",\"us-east-1b\"]" \
+  -var="public_subnet_cidrs=[\"10.10.0.0/24\",\"10.10.1.0/24\"]" \
+  -var="private_subnet_cidrs=[\"10.10.10.0/24\",\"10.10.11.0/24\"]"
+
+# Apply
 terraform apply
 ```
 
-If you use Cloudflare instead of Route 53, set `cloudflare_api_token` + `cloudflare_zone_id` and leave `create_route53_record=false`. Both values are required; otherwise Cloudflare is skipped.
+### 5. Build and Push Images
 
-## Next steps
-- Push the control-plane and worker images to the emitted ECR URLs (`ecr_repositories` output) using `make build-and-upload` with your AWS registry configured.
-- Point Makefile jobs at the emitted S3 buckets (`artifact_buckets` output) for templates, snapshots, builds, and logs.
-- Deploy Nomad/Consul jobs into the private subnets using the worker IAM role ARN (`worker_iam_role_arn`) and ALB/control-plane security groups (`api`, `control_plane`, `workers`) for inbound traffic. Use the ASG outputs to scale the control plane (`control_plane_autoscaling_group`) and workers (`worker_autoscaling_group`).
-- Pass the ALB DNS name (`alb_dns_name`) or your custom domain into clients via `E2B_DOMAIN`.
-- DNS on an existing zone: if your root zone is `superintelligent.group`, add an `A` alias record `e2b.superintelligent.group` in that hosted zone pointing to `alb_dns_name` (evaluate target health on). If using Cloudflare instead, add a `CNAME` named `e2b` to `alb_dns_name` with proxy off unless your certs and setup are Cloudflare-aware.
-- ACM: the certificate referenced by `acm_certificate_arn` must cover `e2b.superintelligent.group` and live in the same AWS region as the ALB.
-- Costs (rough, us-east-1 on-demand, 24/7): NAT ~$1.08/day (plus $0.045/GB data through NAT), ALB ~$0.73/day baseline (1 LCU; more with traffic), each c6a.large ~$1.63/day, 50 GiB gp3 root volume per node ~$0.13/day, S3 200 GiB Standard ~$0.15/day, ECR 20 GiB ~$0.07/day. Data transfer out, CloudWatch ingest, and DNS queries are extra—use the AWS Pricing Calculator with your exact counts/traffic.
-- Cost scenarios (approx, us-east-1, 24/7, on-demand; excludes data transfer out and heavy logs):
-  - Dev: 1× control plane + 1× worker (c6a.large), 2×50 GiB gp3, ALB, single NAT → ~$6/day.
-  - Base: 2× control plane + 2× workers, 4×50 GiB gp3 → ~$9–10/day.
-  - Busy: 3× control plane + 6× workers, 9×50 GiB gp3, ALB ~2 LCUs → ~$19–20/day.
-  These assume modest S3/ECR usage (~200 GiB / 20–40 GiB) and low CloudWatch ingest. NAT data processing ($0.045/GB) and internet egress can dominate at scale—model in the AWS Pricing Calculator with expected traffic.
+```bash
+# From project root
+# Configure ECR authentication
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ACCOUNT.dkr.ecr.us-east-1.amazonaws.com
 
-## Still to configure
-- **Data stores and queues:** This scaffold does not yet provision Postgres, Redis/ElastiCache, or ClickHouse/analytics. You need to stand those up (or point to existing instances) and feed the connection strings into your control-plane jobs.
-- **Secrets:** Secrets Manager/SSM Parameter Store wiring is intentionally absent; create secrets for database credentials, Cloudflare/Posthog/Supabase tokens, and inject them into the control-plane and worker user data or task definitions.
-- **User data / service bootstrap:** The EC2 launch templates accept `control_plane_user_data` and `worker_user_data`, but the defaults are empty. Provide cloud-init/systemd scripts that pull artifacts, register with Nomad/Consul, and start the E2B services. User data is base64-encoded automatically.
-- **Autoscaling policies:** The Auto Scaling Groups only pin `min`, `desired`, and `max` capacities. Add target-tracking or step policies based on CPU/queue depth to avoid manual resizing.
-- **Observability:** CloudWatch log groups/metrics/alarms are not created here. Attach log shipping (e.g., fluent-bit), ALB access log targets, and alarms for high 5xx/latency and node health.
+# Build and push (update Makefile with ECR URLs first)
+make build-and-upload
+```
+
+### 6. Deploy Nomad Jobs
+
+```bash
+cd iac/provider-aws/nomad
+
+terraform init
+terraform apply \
+  -var="aws_region=us-east-1" \
+  -var="environment=prod" \
+  -var="api_docker_image=ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/e2b:api-latest" \
+  -var="template_bucket_name=e2b-prod-templates" \
+  -var="build_bucket_name=e2b-prod-builds"
+```
+
+## Configuration Reference
+
+### Required Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `aws_region` | AWS region | `us-east-1` |
+| `domain_name` | Your domain | `e2b.example.com` |
+| `acm_certificate_arn` | ACM cert ARN | `arn:aws:acm:...` |
+| `control_plane_ami_id` | Ubuntu AMI for control plane | `ami-0c7217cdde317cfec` |
+| `worker_ami_id` | Ubuntu AMI for workers (Nitro) | `ami-0c7217cdde317cfec` |
+| `availability_zones` | AZs for subnets | `["us-east-1a","us-east-1b"]` |
+| `public_subnet_cidrs` | Public subnet CIDRs | `["10.10.0.0/24","10.10.1.0/24"]` |
+| `private_subnet_cidrs` | Private subnet CIDRs | `["10.10.10.0/24","10.10.11.0/24"]` |
+
+### Optional Variables
+
+See `variables.tf`, `data-variables.tf`, `secrets-variables.tf`, `observability-variables.tf`, and `autoscaling-variables.tf` for complete variable documentation.
+
+## File Structure
+
+```
+iac/provider-aws/
+├── main.tf                    # Core infrastructure (VPC, ALB, ASG, S3, ECR)
+├── variables.tf               # Core variables
+├── versions.tf                # Provider versions
+├── providers.tf               # AWS + Cloudflare providers
+├── data.tf                    # RDS PostgreSQL, ElastiCache Redis
+├── data-variables.tf          # Data layer variables
+├── secrets.tf                 # AWS Secrets Manager
+├── secrets-variables.tf       # Secrets variables
+├── observability.tf           # CloudWatch logs, alarms, dashboard
+├── observability-variables.tf # Observability variables
+├── autoscaling.tf             # Auto scaling policies
+├── autoscaling-variables.tf   # Auto scaling variables
+├── userdata.tf                # User data template generation
+├── .env.aws.template          # Environment configuration template
+├── README.md                  # This file
+├── state/                     # Remote state bootstrap
+│   ├── main.tf
+│   └── variables.tf
+├── scripts/                   # EC2 bootstrap scripts
+│   ├── control-plane-userdata.sh
+│   └── worker-userdata.sh
+└── nomad/                     # Nomad job definitions
+    ├── main.tf                # Job deployment
+    ├── variables.tf           # Job variables
+    └── jobs/
+        ├── api.hcl
+        ├── orchestrator.hcl
+        ├── edge.hcl
+        ├── template-manager.hcl
+        └── redis.hcl
+```
+
+## Cost Estimates
+
+Approximate monthly costs (us-east-1, on-demand pricing):
+
+| Scenario | Configuration | Est. Monthly Cost |
+|----------|--------------|-------------------|
+| **Dev** | 1 CP + 1 Worker (c6a.large), small RDS/Redis | ~$180-220 |
+| **Staging** | 2 CP + 2 Workers, medium RDS/Redis | ~$400-500 |
+| **Production** | 3 CP + 5 Workers, multi-AZ RDS/Redis | ~$1,000-1,500 |
+
+*Excludes data transfer, heavy S3 usage, and CloudWatch ingestion. Use AWS Pricing Calculator for accurate estimates.*
+
+## Outputs
+
+After `terraform apply`, you'll receive:
+
+| Output | Description |
+|--------|-------------|
+| `vpc_id` | VPC ID |
+| `alb_dns_name` | ALB DNS name for CNAME/alias |
+| `ecr_repositories` | ECR repository URLs |
+| `artifact_buckets` | S3 bucket names |
+| `rds_endpoint` | PostgreSQL endpoint |
+| `redis_endpoint` | Redis endpoint |
+| `secrets_arns` | Secrets Manager ARNs |
+| `dashboard_url` | CloudWatch dashboard URL |
+
+## Troubleshooting
+
+### Nomad/Consul not clustering
+- Check EC2 instance tags for `consul-cluster` and `nomad-server`
+- Verify security groups allow internal VPC traffic
+- Check CloudWatch logs at `/e2b/{env}/nomad` and `/e2b/{env}/consul`
+
+### Firecracker VMs not starting
+- Verify worker AMI is Nitro-capable
+- Check `kvm` and `nbd` kernel modules are loaded
+- Review orchestrator logs in CloudWatch
+
+### ALB health checks failing
+- Verify control plane instances are healthy in ASG
+- Check API service is running on correct port
+- Review ALB access logs in S3
+
+## Security Considerations
+
+1. **Network Isolation**: All data layer resources in private subnets
+2. **Encryption**: RDS and Redis encrypted at rest and in transit
+3. **IMDSv2**: Enforced on all EC2 instances
+4. **Secrets Manager**: All credentials stored securely
+5. **Security Groups**: Least-privilege ingress rules
+6. **IAM Roles**: Scoped permissions for each instance type
+
+## Upgrading
+
+1. Update Terraform variables as needed
+2. Run `terraform plan` to review changes
+3. Apply with `terraform apply`
+4. For Nomad job updates, use the `nomad/` module
+
+## External Dependencies
+
+The following must be provisioned separately:
+
+- **ClickHouse**: Analytics database (can use ClickHouse Cloud or self-hosted)
+- **Supabase**: Authentication (configure JWT secrets)
+- **PostHog**: Analytics (optional)
+- **LaunchDarkly**: Feature flags (optional)
+
+## Support
+
+For issues with this AWS deployment:
+1. Check CloudWatch logs for error messages
+2. Verify all required secrets are populated
+3. Review [GitHub Issues](https://github.com/anthropics/claude-code/issues)
