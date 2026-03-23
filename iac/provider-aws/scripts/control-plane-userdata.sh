@@ -11,21 +11,18 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Configuration (injected via Terraform templatefile)
 # -----------------------------------------------------------------------------
-export AWS_REGION="${aws_region}"
-export ENVIRONMENT="${environment}"
-export PREFIX="${prefix}"
-export DOMAIN_NAME="${domain_name}"
+AWS_REGION="${aws_region}"
+ENVIRONMENT="${environment}"
+PREFIX="${prefix}"
+DOMAIN_NAME="${domain_name}"
+ECR_REGISTRY="${ecr_registry}"
+SECRETS_PREFIX="${prefix}-${environment}"
+DATACENTER="${datacenter}"
+NOMAD_SERVER_COUNT="${nomad_server_count}"
+CONSUL_SERVER_COUNT="${consul_server_count}"
 
-# ECR Repository
-export ECR_REGISTRY="${ecr_registry}"
-
-# Secrets Manager paths
-export SECRETS_PREFIX="${prefix}-${environment}"
-
-# Nomad/Consul configuration
-export DATACENTER="${datacenter}"
-export NOMAD_SERVER_COUNT="${nomad_server_count}"
-export CONSUL_SERVER_COUNT="${consul_server_count}"
+export AWS_REGION ENVIRONMENT PREFIX DOMAIN_NAME ECR_REGISTRY
+export SECRETS_PREFIX DATACENTER NOMAD_SERVER_COUNT CONSUL_SERVER_COUNT
 
 # Logging
 exec > >(tee /var/log/e2b-bootstrap.log|logger -t e2b-bootstrap -s 2>/dev/console) 2>&1
@@ -284,18 +281,19 @@ EOF
 configure_ecr() {
     echo "[$(date)] Configuring ECR authentication..."
 
-    # Create ECR credential helper script
-    cat > /usr/local/bin/ecr-login.sh <<'ECREOF'
+    # Write a self-contained script that bakes in env vars (cron has no env)
+    cat > /usr/local/bin/ecr-login.sh <<ECREOF
 #!/bin/bash
-aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+set -e
+aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 ECREOF
     chmod +x /usr/local/bin/ecr-login.sh
 
     # Run initial login
     /usr/local/bin/ecr-login.sh
 
-    # Set up cron job to refresh ECR credentials every 6 hours
-    echo "0 */6 * * * root /usr/local/bin/ecr-login.sh" > /etc/cron.d/ecr-refresh
+    # Refresh ECR credentials every 6 hours (token expires every 12h)
+    echo "0 */6 * * * root /usr/local/bin/ecr-login.sh >> /var/log/ecr-login.log 2>&1" > /etc/cron.d/ecr-refresh
 
     echo "[$(date)] ECR authentication configured."
 }

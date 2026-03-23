@@ -175,9 +175,9 @@ variable "worker_ami_id" {
 }
 
 variable "worker_instance_type" {
-  description = "Instance type for worker nodes."
+  description = "Instance type for worker nodes. Must be Nitro-based for Firecracker. Recommended: c6a.metal or c6i.metal for bare-metal KVM, or c6a.2xlarge+ with nested virt."
   type        = string
-  default     = "c6a.large"
+  default     = "c6a.2xlarge"
 }
 
 variable "worker_min_size" {
@@ -211,9 +211,15 @@ variable "ssh_key_name" {
 }
 
 variable "root_volume_size" {
-  description = "Root EBS volume size (GiB) for both control-plane and worker instances."
+  description = "Root EBS volume size (GiB) for control-plane instances."
   type        = number
   default     = 50
+}
+
+variable "worker_root_volume_size" {
+  description = "Root EBS volume size (GiB) for worker instances. Workers need more disk for Firecracker images, templates, and snapshot cache."
+  type        = number
+  default     = 200
 }
 
 variable "root_volume_kms_key_id" {

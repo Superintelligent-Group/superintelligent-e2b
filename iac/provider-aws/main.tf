@@ -177,7 +177,11 @@ resource "aws_iam_role_policy" "worker_bucket_access" {
         Action = [
           "s3:GetObject",
           "s3:PutObject",
-          "s3:ListBucket"
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+          "s3:GetObjectVersion",
+          "s3:HeadObject"
         ],
         Resource = concat(
           [for bucket in aws_s3_bucket.artifact_buckets : bucket.arn],
@@ -395,7 +399,7 @@ resource "aws_lb_listener" "https" {
 
 resource "aws_security_group" "control_plane" {
   name        = "${var.prefix}-${var.environment}-control-plane"
-  description = "Allow control-plane instances to receive traffic from ALB and egress to the internet"
+  description = "Control-plane: ALB traffic + internal Nomad/Consul cluster communication"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
@@ -404,6 +408,15 @@ resource "aws_security_group" "control_plane" {
     to_port         = var.control_plane_target_port
     protocol        = "tcp"
     security_groups = [aws_security_group.api.id]
+  }
+
+  # Nomad/Consul cluster communication (RPC, Serf, gRPC) — within VPC
+  ingress {
+    description = "Internal cluster communication (Nomad/Consul)"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [module.vpc.vpc_cidr_block]
   }
 
   egress {
@@ -488,8 +501,10 @@ resource "aws_launch_template" "worker" {
   block_device_mappings {
     device_name = "/dev/xvda"
     ebs {
-      volume_size = var.root_volume_size
+      volume_size = var.worker_root_volume_size
       volume_type = "gp3"
+      iops        = 3000
+      throughput  = 250
       encrypted   = true
       kms_key_id  = var.root_volume_kms_key_id != "" ? var.root_volume_kms_key_id : null
     }
@@ -502,7 +517,10 @@ resource "aws_launch_template" "worker" {
 
   tag_specifications {
     resource_type = "instance"
-    tags          = merge(var.tags, { Name = "${var.prefix}-${var.environment}-worker" })
+    tags = merge(var.tags, {
+      Name       = "${var.prefix}-${var.environment}-worker"
+      "e2b-role" = "worker"
+    })
   }
 }
 
