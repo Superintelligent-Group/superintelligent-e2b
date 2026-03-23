@@ -510,6 +510,13 @@ resource "aws_launch_template" "worker" {
     }
   }
 
+  # Enable nested virtualization for Firecracker KVM support.
+  # Supported on C8i, M8i, R8i instances (AWS Nitro).
+  # For bare-metal instances (*.metal), this is not needed — KVM is native.
+  cpu_options {
+    nested_virtualization = var.worker_enable_nested_virt ? "enabled" : "disabled"
+  }
+
   metadata_options {
     http_tokens                 = "required"
     http_put_response_hop_limit = 2

@@ -175,9 +175,15 @@ variable "worker_ami_id" {
 }
 
 variable "worker_instance_type" {
-  description = "Instance type for worker nodes. Must be Nitro-based for Firecracker. Recommended: c6a.metal or c6i.metal for bare-metal KVM, or c6a.2xlarge+ with nested virt."
+  description = "Instance type for worker nodes. For Firecracker KVM: use C8i/M8i/R8i with nested virt enabled, or *.metal for bare-metal KVM."
   type        = string
-  default     = "c6a.2xlarge"
+  default     = "c8i.2xlarge"
+}
+
+variable "worker_enable_nested_virt" {
+  description = "Enable nested virtualization (KVM) for Firecracker. Required for C8i/M8i/R8i virtual instances. Not needed for bare-metal (*.metal)."
+  type        = bool
+  default     = true
 }
 
 variable "worker_min_size" {
