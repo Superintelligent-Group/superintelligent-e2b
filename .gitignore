@@ -2,10 +2,11 @@
 .idea
 .DS_Store
 .env*
-!.env.template
+!.env.aws.template
+!.env.gcp.template
 .last_used_env
 .tfplan.*
-terraform.tfvars
+*.tfvars
 terraform.tfstate
 terraform.tfstate.backup
 **/.tfplan.*
@@ -15,3 +16,4 @@ go.work.sum
 .infisical.json
 .vscode/mise-tools
 /packages/fc-kernels
+/packages/fc-versions

@@ -14,28 +14,35 @@ import (
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
-	"github.com/e2b-dev/infra/packages/api/internal/edge"
+	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/api/internal/metrics"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/evictor"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations"
+	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/memory"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/populate_redis"
 	redisbackend "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
-	featureflags "github.com/e2b-dev/infra/packages/shared/pkg/feature-flags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	e2bcatalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 const statusLogInterval = time.Second * 20
 
 var ErrNodeNotFound = errors.New("node not found")
+
+// SnapshotCacheInvalidator invalidates cached snapshot entries.
+type SnapshotCacheInvalidator interface {
+	Invalidate(ctx context.Context, sandboxID string)
+}
 
 type Orchestrator struct {
 	httpClient              *http.Client
@@ -49,13 +56,16 @@ type Orchestrator struct {
 	routingCatalog          e2bcatalog.SandboxesCatalog
 	sqlcDB                  *sqlcdb.Client
 	tel                     *telemetry.Client
-	clusters                *edge.Pool
+	clusters                *clusters.Pool
 	metricsRegistration     metric.Registration
 	createdSandboxesCounter metric.Int64Counter
 	teamMetricsObserver     *metrics.TeamObserver
 	accessTokenGenerator    *sandbox.AccessTokenGenerator
 	sandboxCounter          metric.Int64UpDownCounter
 	createdCounter          metric.Int64Counter
+	snapshotCache           SnapshotCacheInvalidator
+
+	snapshotUpsertSem *utils.AdjustableSemaphore
 }
 
 func New(
@@ -66,9 +76,11 @@ func New(
 	posthogClient *analyticscollector.PosthogClient,
 	redisClient redis.UniversalClient,
 	sqlcDB *sqlcdb.Client,
-	clusters *edge.Pool,
+	clusters *clusters.Pool,
 	featureFlags *featureflags.Client,
 	accessTokenGenerator *sandbox.AccessTokenGenerator,
+	snapshotCache SnapshotCacheInvalidator,
+	snapshotUpsertSem *utils.AdjustableSemaphore,
 ) (*Orchestrator, error) {
 	analyticsInstance, err := analyticscollector.NewAnalytics(
 		ctx,
@@ -83,14 +95,14 @@ func New(
 
 	var routingCatalog e2bcatalog.SandboxesCatalog
 	if redisClient != nil {
-		routingCatalog = e2bcatalog.NewRedisSandboxesCatalog(redisClient)
+		routingCatalog = e2bcatalog.NewRedisSandboxesCatalog(redisClient, featureFlags)
 	} else {
 		routingCatalog = e2bcatalog.NewMemorySandboxesCatalog()
 	}
 
 	// We will need to either use Redis or Consul's KV for storing active sandboxes to keep everything in sync,
 	// right now we load them from Orchestrator
-	meter := tel.MeterProvider.Meter("api.cache.sandbox")
+	meter := tel.MeterProvider.Meter("github.com/e2b-dev/infra/packages/api/internal/orchestrator")
 	sandboxCounter, err := telemetry.GetUpDownCounter(meter, telemetry.SandboxCountMeterName)
 	if err != nil {
 		logger.L().Error(ctx, "error getting counter", zap.Error(err))
@@ -122,35 +134,40 @@ func New(
 		accessTokenGenerator: accessTokenGenerator,
 		routingCatalog:       routingCatalog,
 		sqlcDB:               sqlcDB,
+		snapshotCache:        snapshotCache,
 		tel:                  tel,
 		clusters:             clusters,
 
 		sandboxCounter: sandboxCounter,
 		createdCounter: createdCounter,
+
+		snapshotUpsertSem: snapshotUpsertSem,
 	}
 
+	var reservationStorage sandbox.ReservationStorage
 	var sandboxStorage sandbox.Storage
-	memoryStorage := memory.NewStorage()
+	redisStorage := redisbackend.NewStorage(redisClient)
 
-	if redisClient != nil {
-		redisStorage := redisbackend.NewStorage(redisClient)
-		sandboxStorage = populate_redis.NewStorage(memoryStorage, redisStorage)
-	} else {
-		sandboxStorage = memoryStorage
+	switch config.SandboxStorageBackend {
+	case cfg.SandboxStorageBackendMemory:
+		reservationStorage = reservations.NewReservationStorage()
+		sandboxStorage = populate_redis.NewStorage(memory.NewStorage(), redisStorage)
+		logger.L().Info(ctx, "Using populate_redis sandbox storage backend")
+	case cfg.SandboxStorageBackendRedis:
+		reservationStorage = redisreservations.NewReservationStorage(redisClient)
+		sandboxStorage = redisStorage
+		logger.L().Info(ctx, "Using redis sandbox storage backend")
+	default:
+		return nil, fmt.Errorf("invalid sandbox storage backend: %s", config.SandboxStorageBackend)
 	}
-
-	reservationStorage := reservations.NewReservationStorage()
 
 	o.sandboxStore = sandbox.NewStore(
 		sandboxStorage,
 		reservationStorage,
-		[]sandbox.InsertCallback{
-			o.addToNode,
-		},
-		[]sandbox.InsertCallback{
-			o.observeTeamSandbox,
-			o.countersInsert,
-			o.analyticsInsert,
+		sandbox.Callbacks{
+			AddSandboxToRoutingTable: o.addSandboxToRoutingTable,
+			AsyncSandboxCounter:      o.sandboxCounterInsert,
+			AsyncNewlyCreatedSandbox: o.handleNewlyCreatedSandbox,
 		},
 	)
 
@@ -178,7 +195,6 @@ func New(
 		return nil, fmt.Errorf("failed to setup metrics: %w", err)
 	}
 
-	go o.reportLongRunningSandboxes(ctx)
 	go o.startStatusLogging(ctx)
 	go o.updateBestOfKConfig(ctx)
 
@@ -213,7 +229,6 @@ func (o *Orchestrator) startStatusLogging(ctx context.Context) {
 			}
 
 			logger.L().Info(ctx, "API internal status",
-				zap.Int("sandboxes_count", len(o.sandboxStore.Items(nil, []sandbox.State{sandbox.StateRunning}))),
 				zap.Int("nodes_count", o.nodes.Count()),
 				zap.Any("nodes", connectedNodes),
 			)
@@ -275,31 +290,15 @@ func (o *Orchestrator) updateBestOfKConfig(ctx context.Context) {
 }
 
 func getBestOfKConfig(ctx context.Context, featureFlagsClient *featureflags.Client) placement.BestOfKConfig {
-	k, err := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKSampleSize)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to get BestOfKSampleSize flag", zap.Error(err))
-		k = 3 // fallback to default
-	}
+	k := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKSampleSize)
 
-	maxOvercommitPercent, err := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKMaxOvercommit)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to get BestOfKMaxOvercommit flag", zap.Error(err))
-	}
+	maxOvercommitPercent := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKMaxOvercommit)
 
-	alphaPercent, err := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKAlpha)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to get BestOfKAlpha flag", zap.Error(err))
-	}
+	alphaPercent := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKAlpha)
 
-	canFit, err := featureFlagsClient.BoolFlag(ctx, featureflags.BestOfKCanFit)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to get BestOfKCanFit flag", zap.Error(err))
-	}
+	canFit := featureFlagsClient.BoolFlag(ctx, featureflags.BestOfKCanFitFlag)
 
-	tooManyStarting, err := featureFlagsClient.BoolFlag(ctx, featureflags.BestOfKTooManyStarting)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to get BestOfKTooManyStarting flag", zap.Error(err))
-	}
+	tooManyStarting := featureFlagsClient.BoolFlag(ctx, featureflags.BestOfKTooManyStartingFlag)
 
 	// Convert percentage to decimal
 	alpha := float64(alphaPercent) / 100.0

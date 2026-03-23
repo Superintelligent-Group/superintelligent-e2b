@@ -6,7 +6,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/constants"
-	"github.com/e2b-dev/infra/packages/api/internal/db/types"
+	"github.com/e2b-dev/infra/packages/auth/pkg/types"
 )
 
 func LimitResources(limits *types.TeamLimits, cpuCount, memoryMB *int32) (int64, int64, *api.APIError) {
@@ -19,6 +19,22 @@ func LimitResources(limits *types.TeamLimits, cpuCount, memoryMB *int32) (int64,
 			return 0, 0, &api.APIError{
 				Err:       fmt.Errorf("CPU count must be at least %d", constants.MinTemplateCPU),
 				ClientMsg: fmt.Sprintf("CPU count must be at least %d", constants.MinTemplateCPU),
+				Code:      http.StatusBadRequest,
+			}
+		}
+
+		if cpu > constants.MaxTemplateCPU {
+			return 0, 0, &api.APIError{
+				Err:       fmt.Errorf("CPU count must be at most %d", constants.MaxTemplateCPU),
+				ClientMsg: fmt.Sprintf("CPU count must be at most %d", constants.MaxTemplateCPU),
+				Code:      http.StatusBadRequest,
+			}
+		}
+
+		if cpu != 1 && cpu%2 != 0 {
+			return 0, 0, &api.APIError{
+				Err:       fmt.Errorf("CPU count must be 1 or an even number"),
+				ClientMsg: "CPU count must be 1 or an even number",
 				Code:      http.StatusBadRequest,
 			}
 		}

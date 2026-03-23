@@ -49,6 +49,8 @@ const (
 	OrchestratorProxyPoolSizeMeterCounterName          ObservableUpDownCounterType = "orchestrator.proxy.pool.size"
 
 	BuildCounterMeterName ObservableUpDownCounterType = "api.env.build.running"
+
+	TCPFirewallActiveConnections ObservableUpDownCounterType = "orchestrator.tcpfirewall.connections.active"
 )
 
 const (
@@ -62,13 +64,52 @@ const (
 	BuildStepDurationHistogramName  HistogramType = "template.build.step.duration"
 
 	// Sandbox timing histograms
-	WaitForEnvdDurationHistogramName HistogramType = "orchestrator.sandbox.envd.init.duration"
+	OrchestratorSandboxCreateDurationName HistogramType = "orchestrator.sandbox.create.duration"
+	WaitForEnvdDurationHistogramName      HistogramType = "orchestrator.sandbox.envd.init.duration"
+
+	// TCP Firewall histograms
+	TCPFirewallConnectionDurationHistogramName    HistogramType = "orchestrator.tcpfirewall.connection.duration"
+	TCPFirewallConnectionsPerSandboxHistogramName HistogramType = "orchestrator.tcpfirewall.connections.per_sandbox"
+
+	// Ingress proxy histograms
+	IngressProxyConnectionDurationHistogramName    HistogramType = "orchestrator.proxy.connection.duration"
+	IngressProxyConnectionsPerSandboxHistogramName HistogramType = "orchestrator.proxy.connections.per_sandbox"
 )
 
 const (
 	// Build result counters
 	BuildResultCounterName      CounterType = "template.build.result"
 	BuildCacheResultCounterName CounterType = "template.build.cache.result"
+
+	// TCP Firewall counters
+	TCPFirewallConnectionsTotal CounterType = "orchestrator.tcpfirewall.connections.total"
+	TCPFirewallErrorsTotal      CounterType = "orchestrator.tcpfirewall.errors.total"
+	TCPFirewallDecisionsTotal   CounterType = "orchestrator.tcpfirewall.decisions.total"
+
+	// Ingress proxy counters
+	IngressProxyConnectionsBlockedTotal CounterType = "orchestrator.proxy.connections.blocked.total"
+
+	// cmux counters
+	CmuxErrorsTotal CounterType = "orchestrator.cmux.errors.total"
+
+	// Firecracker net counters — global totals, no sandbox_id (low cardinality).
+	// All carry a direction=tx/rx attribute. Per-sandbox distributions are histograms below.
+	SandboxFCNetFails         CounterType = "orchestrator.sandbox.fc.net.fails"
+	SandboxFCNetNoAvailBuffer CounterType = "orchestrator.sandbox.fc.net.no_avail_buffer"
+	SandboxFCNetTapIOFails    CounterType = "orchestrator.sandbox.fc.net.tap_io_fails"
+)
+
+const (
+	// Firecracker net histograms — per-sandbox distribution per metrics flush, no sandbox_id.
+	// Firecracker serializes SharedIncMetric as per-flush deltas (default flush interval: 60 s).
+	// Symmetric TX/RX metrics carry a direction=tx/rx attribute; TX-only metrics always use direction=tx.
+	SandboxFCNetBytes                HistogramType = "orchestrator.sandbox.fc.net.bytes"
+	SandboxFCNetPackets              HistogramType = "orchestrator.sandbox.fc.net.packets"
+	SandboxFCNetCount                HistogramType = "orchestrator.sandbox.fc.net.count"
+	SandboxFCNetRateLimiterThrottled HistogramType = "orchestrator.sandbox.fc.net.rate_limiter_throttled"
+	// TX-only: no RX equivalent in Firecracker metrics.
+	SandboxFCNetRateLimiterEventCount HistogramType = "orchestrator.sandbox.fc.net.rate_limiter_event_count"
+	SandboxFCNetRemainingReqs         HistogramType = "orchestrator.sandbox.fc.net.remaining_reqs"
 )
 
 const (
@@ -95,6 +136,16 @@ var counterDesc = map[CounterType]string{
 	BuildCacheResultCounterName:     "Number of build cache results",
 	TeamSandboxCreated:              "Counter of started sandboxes for the team in the interval",
 	EnvdInitCalls:                   "Number of envd initialization calls",
+	TCPFirewallConnectionsTotal:     "Total number of TCP firewall connections processed",
+	TCPFirewallErrorsTotal:          "Total number of TCP firewall errors",
+	TCPFirewallDecisionsTotal:       "Total number of TCP firewall allow/block decisions",
+
+	IngressProxyConnectionsBlockedTotal: "Total number of ingress proxy connections blocked by connection limit",
+	CmuxErrorsTotal:                     "Total number of cmux connection multiplexer errors",
+
+	SandboxFCNetFails:         "Total Firecracker VMM errors transmitting or receiving data (direction=tx/rx)",
+	SandboxFCNetNoAvailBuffer: "Total Firecracker VMM events where no virtqueue buffer was available (direction=tx/rx)",
+	SandboxFCNetTapIOFails:    "Total Firecracker VMM TAP I/O failures (direction=tx/rx)",
 }
 
 var counterUnits = map[CounterType]string{
@@ -104,6 +155,16 @@ var counterUnits = map[CounterType]string{
 	BuildCacheResultCounterName:     "{layer}",
 	TeamSandboxCreated:              "{sandbox}",
 	EnvdInitCalls:                   "1",
+	TCPFirewallConnectionsTotal:     "{connection}",
+	TCPFirewallErrorsTotal:          "{error}",
+	TCPFirewallDecisionsTotal:       "{decision}",
+
+	IngressProxyConnectionsBlockedTotal: "{connection}",
+	CmuxErrorsTotal:                     "{error}",
+
+	SandboxFCNetFails:         "{error}",
+	SandboxFCNetNoAvailBuffer: "{event}",
+	SandboxFCNetTapIOFails:    "{error}",
 }
 
 var observableCounterDesc = map[ObservableCounterType]string{
@@ -133,6 +194,8 @@ var observableUpDownCounterDesc = map[ObservableUpDownCounterType]string{
 	OrchestratorProxyPoolConnectionsMeterCounterName:   "Open connections from the orchestrator proxy to sandboxes.",
 	OrchestratorProxyPoolSizeMeterCounterName:          "Size of the orchestrator proxy pool.",
 	BuildCounterMeterName:                              "Counter of running builds.",
+
+	TCPFirewallActiveConnections: "Number of currently active TCP firewall connections.",
 }
 
 var observableUpDownCounterUnits = map[ObservableUpDownCounterType]string{
@@ -144,6 +207,8 @@ var observableUpDownCounterUnits = map[ObservableUpDownCounterType]string{
 	OrchestratorProxyPoolConnectionsMeterCounterName:   "{connection}",
 	OrchestratorProxyPoolSizeMeterCounterName:          "{transport}",
 	BuildCounterMeterName:                              "{build}",
+
+	TCPFirewallActiveConnections: "{connection}",
 }
 
 var gaugeFloatDesc = map[GaugeFloatType]string{
@@ -237,19 +302,48 @@ func GetGaugeInt(meter metric.Meter, name GaugeIntType) (metric.Int64ObservableG
 }
 
 var histogramDesc = map[HistogramType]string{
-	BuildDurationHistogramName:       "Time taken to build a template",
-	BuildPhaseDurationHistogramName:  "Time taken to build each phase of a template",
-	BuildStepDurationHistogramName:   "Time taken to build each step of a template",
-	BuildRootfsSizeHistogramName:     "Size of the built template rootfs in bytes",
-	WaitForEnvdDurationHistogramName: "Time taken for Envd to initialize successfully",
+	BuildDurationHistogramName:            "Time taken to build a template",
+	BuildPhaseDurationHistogramName:       "Time taken to build each phase of a template",
+	BuildStepDurationHistogramName:        "Time taken to build each step of a template",
+	BuildRootfsSizeHistogramName:          "Size of the built template rootfs in bytes",
+	OrchestratorSandboxCreateDurationName: "Time taken to create a sandbox",
+	WaitForEnvdDurationHistogramName:      "Time taken for Envd to initialize successfully",
+
+	TCPFirewallConnectionDurationHistogramName:    "Duration of TCP firewall proxied connections",
+	TCPFirewallConnectionsPerSandboxHistogramName: "Number of active TCP firewall connections per sandbox",
+
+	IngressProxyConnectionDurationHistogramName:    "Duration of ingress proxy connections",
+	IngressProxyConnectionsPerSandboxHistogramName: "Number of active ingress proxy connections per sandbox",
+
+	// Firecracker net histograms (direction=tx/rx attribute; TX-only carry direction=tx)
+	SandboxFCNetBytes:                 "Distribution of Firecracker VMM bytes per metrics flush",
+	SandboxFCNetPackets:               "Distribution of Firecracker VMM packets per metrics flush",
+	SandboxFCNetCount:                 "Distribution of Firecracker VMM I/O operations per metrics flush",
+	SandboxFCNetRateLimiterThrottled:  "Distribution of Firecracker VMM ops throttled by rate limiter per metrics flush",
+	SandboxFCNetRateLimiterEventCount: "Distribution of Firecracker VMM TX rate limiter events per metrics flush",
+	SandboxFCNetRemainingReqs:         "Distribution of Firecracker VMM TX queue remaining-request events per metrics flush",
 }
 
 var histogramUnits = map[HistogramType]string{
-	BuildDurationHistogramName:       "ms",
-	BuildPhaseDurationHistogramName:  "ms",
-	BuildStepDurationHistogramName:   "ms",
-	BuildRootfsSizeHistogramName:     "{By}",
-	WaitForEnvdDurationHistogramName: "ms",
+	BuildDurationHistogramName:                    "ms",
+	BuildPhaseDurationHistogramName:               "ms",
+	BuildStepDurationHistogramName:                "ms",
+	BuildRootfsSizeHistogramName:                  "{By}",
+	OrchestratorSandboxCreateDurationName:         "ms",
+	WaitForEnvdDurationHistogramName:              "ms",
+	TCPFirewallConnectionDurationHistogramName:    "ms",
+	TCPFirewallConnectionsPerSandboxHistogramName: "{connection}",
+
+	IngressProxyConnectionDurationHistogramName:    "ms",
+	IngressProxyConnectionsPerSandboxHistogramName: "{connection}",
+
+	// Firecracker net histograms
+	SandboxFCNetBytes:                 "{By}",
+	SandboxFCNetPackets:               "{packet}",
+	SandboxFCNetCount:                 "{op}",
+	SandboxFCNetRateLimiterThrottled:  "{op}",
+	SandboxFCNetRateLimiterEventCount: "{event}",
+	SandboxFCNetRemainingReqs:         "{event}",
 }
 
 func GetHistogram(meter metric.Meter, name HistogramType) (metric.Int64Histogram, error) {
@@ -266,15 +360,6 @@ type TimerFactory struct {
 	duration metric.Int64Histogram
 	bytes    metric.Int64Counter
 	count    metric.Int64Counter
-}
-
-func (f *TimerFactory) Begin() *Stopwatch {
-	return &Stopwatch{
-		histogram: f.duration,
-		sum:       f.bytes,
-		count:     f.count,
-		start:     time.Now(),
-	}
 }
 
 func NewTimerFactory(
@@ -307,13 +392,41 @@ func NewTimerFactory(
 	return TimerFactory{duration, bytes, count}, nil
 }
 
+func (f *TimerFactory) Begin(kv ...attribute.KeyValue) *Stopwatch {
+	return &Stopwatch{
+		histogram: f.duration,
+		sum:       f.bytes,
+		count:     f.count,
+		start:     time.Now(),
+		kv:        kv,
+	}
+}
+
 type Stopwatch struct {
 	histogram  metric.Int64Histogram
 	sum, count metric.Int64Counter
 	start      time.Time
+	kv         []attribute.KeyValue
 }
 
-func (t Stopwatch) End(ctx context.Context, total int64, kv ...attribute.KeyValue) {
+const (
+	resultAttr        = "result"
+	resultTypeSuccess = "success"
+	resultTypeFailure = "failure"
+)
+
+func (t Stopwatch) Success(ctx context.Context, total int64, kv ...attribute.KeyValue) {
+	t.end(ctx, resultTypeSuccess, total, kv...)
+}
+
+func (t Stopwatch) Failure(ctx context.Context, total int64, kv ...attribute.KeyValue) {
+	t.end(ctx, resultTypeFailure, total, kv...)
+}
+
+func (t Stopwatch) end(ctx context.Context, result string, total int64, kv ...attribute.KeyValue) {
+	kv = append(kv, attribute.KeyValue{Key: resultAttr, Value: attribute.StringValue(result)})
+	kv = append(t.kv, kv...)
+
 	amount := time.Since(t.start).Milliseconds()
 	t.histogram.Record(ctx, amount, metric.WithAttributes(kv...))
 	t.sum.Add(ctx, total, metric.WithAttributes(kv...))

@@ -6,12 +6,21 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/e2b-dev/infra/packages/api/internal/db/types"
-	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
+	"github.com/e2b-dev/infra/packages/auth/pkg/types"
+	"github.com/e2b-dev/infra/packages/db/pkg/auth"
 )
 
-func GetTeamsByUser(ctx context.Context, db *sqlcdb.Client, userID uuid.UUID) ([]*types.TeamWithDefault, error) {
-	teams, err := db.GetTeamsWithUsersTeamsWithTier(ctx, userID)
+func GetTeamByID(ctx context.Context, db *authdb.Client, teamID uuid.UUID) (*types.Team, error) {
+	result, err := db.Read.GetTeamWithTierByTeamID(ctx, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get team by ID: %w", err)
+	}
+
+	return types.NewTeam(&result.Team, &result.TeamLimit), nil
+}
+
+func GetTeamsByUser(ctx context.Context, db *authdb.Client, userID uuid.UUID) ([]*types.TeamWithDefault, error) {
+	teams, err := db.Read.GetTeamsWithUsersTeamsWithTier(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("error when getting default team: %w", err)
 	}
@@ -20,7 +29,7 @@ func GetTeamsByUser(ctx context.Context, db *sqlcdb.Client, userID uuid.UUID) ([
 	for _, team := range teams {
 		teamsWithLimits = append(teamsWithLimits, &types.TeamWithDefault{
 			Team:      types.NewTeam(&team.Team, &team.TeamLimit),
-			IsDefault: team.UsersTeam.IsDefault,
+			IsDefault: team.IsDefault,
 		})
 	}
 

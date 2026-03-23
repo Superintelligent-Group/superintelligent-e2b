@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -10,49 +11,48 @@ import (
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 )
 
-type (
-	InsertCallback func(ctx context.Context, sbx Sandbox, created bool)
-	ItemsOption    func(*ItemsFilter)
+type InsertCallback func(ctx context.Context, sbx Sandbox)
+
+const (
+	StorageNameMemory        = "memory"
+	StorageNameRedis         = "redis"
+	StorageNamePopulateRedis = "populate_redis"
 )
 
-type ItemsFilter struct {
-	OnlyExpired bool
-}
-
-func NewItemsFilter() *ItemsFilter {
-	return &ItemsFilter{
-		OnlyExpired: false,
-	}
-}
-
 type ReservationStorage interface {
-	Reserve(ctx context.Context, teamID, sandboxID string, limit int) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error)
-	Release(ctx context.Context, teamID, sandboxID string) error
+	Reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error)
+	Release(ctx context.Context, teamID uuid.UUID, sandboxID string) error
 }
 
-type Storage interface {
+// TODO [ENG-3514]: Remove Name() and Sync() and nolint once migrated to Redis
+type Storage interface { //nolint: interfacebloat
+	Name() string
 	Add(ctx context.Context, sandbox Sandbox) error
-	Get(ctx context.Context, sandboxID string) (Sandbox, error)
-	Remove(ctx context.Context, sandboxID string) error
+	Get(ctx context.Context, teamID uuid.UUID, sandboxID string) (Sandbox, error)
+	Remove(ctx context.Context, teamID uuid.UUID, sandboxID string) error
 
-	Items(teamID *uuid.UUID, states []State, options ...ItemsOption) []Sandbox
+	TeamItems(ctx context.Context, teamID uuid.UUID, states []State) ([]Sandbox, error)
+	ExpiredItems(ctx context.Context) ([]Sandbox, error)
+	TeamsWithSandboxCount(ctx context.Context) (map[uuid.UUID]int64, error)
 
-	Update(ctx context.Context, sandboxID string, updateFunc func(sandbox Sandbox) (Sandbox, error)) (Sandbox, error)
-	StartRemoving(ctx context.Context, sandboxID string, stateAction StateAction) (alreadyDone bool, callback func(context.Context, error), err error)
-	WaitForStateChange(ctx context.Context, sandboxID string) error
+	Update(ctx context.Context, teamID uuid.UUID, sandboxID string, updateFunc func(sandbox Sandbox) (Sandbox, error)) (Sandbox, error)
+	StartRemoving(ctx context.Context, teamID uuid.UUID, sandboxID string, opts RemoveOpts) (Sandbox, bool, func(context.Context, error), error)
+	WaitForStateChange(ctx context.Context, teamID uuid.UUID, sandboxID string) error
 	Sync(sandboxes []Sandbox, nodeID string) []Sandbox
 }
 
-func WithOnlyExpired(isExpired bool) ItemsOption {
-	return func(f *ItemsFilter) {
-		f.OnlyExpired = isExpired
-	}
+type Callbacks struct {
+	// AddSandboxToRoutingTable should be called sync to prevent race conditions where we would know where to route the sandbox
+	AddSandboxToRoutingTable InsertCallback
+	// AsyncSandboxCounter should be called async to prevent blocking the main goroutine
+	AsyncSandboxCounter InsertCallback
+	// AsyncNewlyCreatedSandbox should be called async to prevent blocking the main goroutine
+	AsyncNewlyCreatedSandbox InsertCallback
 }
 
 type Store struct {
-	storage              Storage
-	insertCallbacks      []InsertCallback
-	insertAsyncCallbacks []InsertCallback
+	storage   Storage
+	callbacks Callbacks
 
 	reservations ReservationStorage
 }
@@ -60,16 +60,12 @@ type Store struct {
 func NewStore(
 	backend Storage,
 	reservations ReservationStorage,
-
-	insertCallbacks []InsertCallback,
-	insertAsyncCallbacks []InsertCallback,
+	callbacks Callbacks,
 ) *Store {
 	return &Store{
 		storage:      backend,
 		reservations: reservations,
-
-		insertCallbacks:      insertCallbacks,
-		insertAsyncCallbacks: insertAsyncCallbacks,
+		callbacks:    callbacks,
 	}
 }
 
@@ -87,38 +83,47 @@ func (s *Store) Add(ctx context.Context, sandbox Sandbox, newlyCreated bool) err
 	}
 
 	err := s.storage.Add(ctx, sandbox)
-	if err != nil {
-		return err
+	if err == nil {
+		// Count only newly added sandboxes to the store
+		s.callbacks.AddSandboxToRoutingTable(ctx, sandbox)
+		go s.callbacks.AsyncSandboxCounter(context.WithoutCancel(ctx), sandbox)
+	} else {
+		// TODO [ENG-3514]: Remove once migrated to Redis
+		// There's a race condition when the sandbox is added from node sync
+		// This should be fixed once the sync is improved
+		if !errors.Is(err, ErrAlreadyExists) {
+			return err
+		}
+
+		logger.L().Warn(ctx, "Sandbox already exists in cache", logger.WithSandboxID(sandbox.SandboxID))
 	}
 
-	// Ensure the team reservation is set - no limit
-	finishStart, _, err := s.reservations.Reserve(ctx, sandbox.TeamID.String(), sandbox.SandboxID, -1)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to reserve sandbox", zap.Error(err), logger.WithSandboxID(sandbox.SandboxID))
+	// TODO [ENG-3514]: Simplify once migrated to Redis
+	// Ensure the team reservation is set - no limit.
+	if s.storage.Name() != StorageNameRedis {
+		finishStart, _, err := s.reservations.Reserve(ctx, sandbox.TeamID, sandbox.SandboxID, -1)
+		if err != nil {
+			logger.L().Error(ctx, "Failed to reserve sandbox", zap.Error(err), logger.WithSandboxID(sandbox.SandboxID))
+		}
+
+		if finishStart != nil {
+			finishStart(sandbox, nil)
+		}
 	}
 
-	if finishStart != nil {
-		finishStart(sandbox, nil)
-	}
-
-	// Run callbacks
-	for _, callback := range s.insertCallbacks {
-		callback(ctx, sandbox, newlyCreated)
-	}
-
-	for _, callback := range s.insertAsyncCallbacks {
-		go callback(context.WithoutCancel(ctx), sandbox, newlyCreated)
+	if newlyCreated {
+		go s.callbacks.AsyncNewlyCreatedSandbox(context.WithoutCancel(ctx), sandbox)
 	}
 
 	return nil
 }
 
-func (s *Store) Get(ctx context.Context, sandboxID string) (Sandbox, error) {
-	return s.storage.Get(ctx, sandboxID)
+func (s *Store) Get(ctx context.Context, teamID uuid.UUID, sandboxID string) (Sandbox, error) {
+	return s.storage.Get(ctx, teamID, sandboxID)
 }
 
-func (s *Store) Remove(ctx context.Context, teamID, sandboxID string) {
-	err := s.storage.Remove(ctx, sandboxID)
+func (s *Store) Remove(ctx context.Context, teamID uuid.UUID, sandboxID string) {
+	err := s.storage.Remove(ctx, teamID, sandboxID)
 	if err != nil {
 		logger.L().Error(ctx, "Failed to remove sandbox from storage", zap.Error(err), logger.WithSandboxID(sandboxID))
 	}
@@ -129,20 +134,28 @@ func (s *Store) Remove(ctx context.Context, teamID, sandboxID string) {
 	}
 }
 
-func (s *Store) Items(teamID *uuid.UUID, states []State, options ...ItemsOption) []Sandbox {
-	return s.storage.Items(teamID, states, options...)
+func (s *Store) TeamItems(ctx context.Context, teamID uuid.UUID, states []State) ([]Sandbox, error) {
+	return s.storage.TeamItems(ctx, teamID, states)
 }
 
-func (s *Store) Update(ctx context.Context, sandboxID string, updateFunc func(sandbox Sandbox) (Sandbox, error)) (Sandbox, error) {
-	return s.storage.Update(ctx, sandboxID, updateFunc)
+func (s *Store) ExpiredItems(ctx context.Context) ([]Sandbox, error) {
+	return s.storage.ExpiredItems(ctx)
 }
 
-func (s *Store) StartRemoving(ctx context.Context, sandboxID string, stateAction StateAction) (alreadyDone bool, callback func(context.Context, error), err error) {
-	return s.storage.StartRemoving(ctx, sandboxID, stateAction)
+func (s *Store) TeamsWithSandboxes(ctx context.Context) (map[uuid.UUID]int64, error) {
+	return s.storage.TeamsWithSandboxCount(ctx)
 }
 
-func (s *Store) WaitForStateChange(ctx context.Context, sandboxID string) error {
-	return s.storage.WaitForStateChange(ctx, sandboxID)
+func (s *Store) Update(ctx context.Context, teamID uuid.UUID, sandboxID string, updateFunc func(sandbox Sandbox) (Sandbox, error)) (Sandbox, error) {
+	return s.storage.Update(ctx, teamID, sandboxID, updateFunc)
+}
+
+func (s *Store) StartRemoving(ctx context.Context, teamID uuid.UUID, sandboxID string, opts RemoveOpts) (Sandbox, bool, func(context.Context, error), error) {
+	return s.storage.StartRemoving(ctx, teamID, sandboxID, opts)
+}
+
+func (s *Store) WaitForStateChange(ctx context.Context, teamID uuid.UUID, sandboxID string) error {
+	return s.storage.WaitForStateChange(ctx, teamID, sandboxID)
 }
 
 func (s *Store) Sync(ctx context.Context, sandboxes []Sandbox, nodeID string) {
@@ -155,10 +168,22 @@ func (s *Store) Sync(ctx context.Context, sandboxes []Sandbox, nodeID string) {
 	}
 }
 
-func (s *Store) Reserve(ctx context.Context, teamID, sandboxID string, limit int) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error) {
-	return s.reservations.Reserve(ctx, teamID, sandboxID, limit)
+func (s *Store) Reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error) {
+	finishStart, waitForStart, err = s.reservations.Reserve(ctx, teamID, sandboxID, limit)
+	if err != nil {
+		if errors.Is(err, ErrAlreadyExists) {
+			// Try to get the sandbox from the storage if already exists
+			return nil, func(ctx context.Context) (Sandbox, error) {
+				return s.storage.Get(ctx, teamID, sandboxID)
+			}, nil
+		}
+
+		return nil, nil, err
+	}
+
+	return finishStart, waitForStart, nil
 }
 
-func (s *Store) Release(ctx context.Context, teamID, sandboxID string) error {
+func (s *Store) Release(ctx context.Context, teamID uuid.UUID, sandboxID string) error {
 	return s.reservations.Release(ctx, teamID, sandboxID)
 }

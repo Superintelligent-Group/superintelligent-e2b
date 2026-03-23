@@ -12,6 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/template"
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/tracking"
@@ -135,7 +136,11 @@ func newProxyClient(
 			}
 
 			if err != nil {
-				t.RequestLogger.Error(ctx, "sandbox error handler called", zap.Error(err))
+				if t.SandboxPort == uint64(consts.DefaultEnvdServerPort) {
+					t.RequestLogger.Error(ctx, "sandbox error handler called", zap.Error(err))
+				} else {
+					t.RequestLogger.Warn(ctx, "sandbox error handler called", zap.Error(err))
+				}
 			}
 
 			if t.DefaultToPortError {
@@ -163,7 +168,7 @@ func newProxyClient(
 			}
 
 			if r.StatusCode >= 500 {
-				t.RequestLogger.Error(
+				t.RequestLogger.Warn(
 					ctx,
 					"Reverse proxy error",
 					zap.Int("status_code", r.StatusCode),
@@ -206,7 +211,7 @@ func (p *ProxyClient) resetAllConnections() error {
 
 	for _, conn := range p.activeConnections.Items() {
 		err := conn.Reset()
-		if err != nil {
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, err)
 		}
 	}

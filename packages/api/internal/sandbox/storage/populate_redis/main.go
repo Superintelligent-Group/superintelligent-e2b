@@ -19,6 +19,8 @@ type PopulateRedisStorage struct {
 	redisBackend  *redis.Storage
 }
 
+func (m *PopulateRedisStorage) Name() string { return sandbox.StorageNamePopulateRedis }
+
 func (m *PopulateRedisStorage) Add(ctx context.Context, sandbox sandbox.Sandbox) error {
 	err := m.memoryBackend.Add(ctx, sandbox)
 	if err != nil {
@@ -33,17 +35,17 @@ func (m *PopulateRedisStorage) Add(ctx context.Context, sandbox sandbox.Sandbox)
 	return nil
 }
 
-func (m *PopulateRedisStorage) Get(ctx context.Context, sandboxID string) (sandbox.Sandbox, error) {
-	return m.memoryBackend.Get(ctx, sandboxID)
+func (m *PopulateRedisStorage) Get(ctx context.Context, teamID uuid.UUID, sandboxID string) (sandbox.Sandbox, error) {
+	return m.memoryBackend.Get(ctx, teamID, sandboxID)
 }
 
-func (m *PopulateRedisStorage) Remove(ctx context.Context, sandboxID string) error {
-	err := m.memoryBackend.Remove(ctx, sandboxID)
+func (m *PopulateRedisStorage) Remove(ctx context.Context, teamID uuid.UUID, sandboxID string) error {
+	err := m.memoryBackend.Remove(ctx, teamID, sandboxID)
 	if err != nil {
 		return err
 	}
 
-	err = m.redisBackend.Remove(ctx, sandboxID)
+	err = m.redisBackend.Remove(ctx, teamID, sandboxID)
 	if err != nil {
 		logger.L().Error(ctx, "failed to remove sandbox from redis", zap.Error(err), logger.WithSandboxID(sandboxID))
 	}
@@ -51,30 +53,38 @@ func (m *PopulateRedisStorage) Remove(ctx context.Context, sandboxID string) err
 	return nil
 }
 
-func (m *PopulateRedisStorage) Items(teamID *uuid.UUID, states []sandbox.State, options ...sandbox.ItemsOption) []sandbox.Sandbox {
-	return m.memoryBackend.Items(teamID, states, options...)
+func (m *PopulateRedisStorage) TeamItems(ctx context.Context, teamID uuid.UUID, states []sandbox.State) ([]sandbox.Sandbox, error) {
+	return m.memoryBackend.TeamItems(ctx, teamID, states)
 }
 
-func (m *PopulateRedisStorage) Update(ctx context.Context, sandboxID string, updateFunc func(sandbox sandbox.Sandbox) (sandbox.Sandbox, error)) (sandbox.Sandbox, error) {
-	sbx, err := m.memoryBackend.Update(ctx, sandboxID, updateFunc)
+func (m *PopulateRedisStorage) ExpiredItems(ctx context.Context) ([]sandbox.Sandbox, error) {
+	return m.memoryBackend.ExpiredItems(ctx)
+}
+
+func (m *PopulateRedisStorage) TeamsWithSandboxCount(ctx context.Context) (map[uuid.UUID]int64, error) {
+	return m.memoryBackend.TeamsWithSandboxCount(ctx)
+}
+
+func (m *PopulateRedisStorage) Update(ctx context.Context, teamID uuid.UUID, sandboxID string, updateFunc func(sandbox sandbox.Sandbox) (sandbox.Sandbox, error)) (sandbox.Sandbox, error) {
+	sbx, err := m.memoryBackend.Update(ctx, teamID, sandboxID, updateFunc)
 	if err != nil {
 		return sandbox.Sandbox{}, err
 	}
 
-	_, err = m.redisBackend.Update(ctx, sandboxID, updateFunc)
+	_, err = m.redisBackend.Update(ctx, teamID, sandboxID, updateFunc)
 	if err != nil {
-		logger.L().Error(ctx, "failed to update sandbox in redis", zap.Error(err))
+		logger.L().Error(ctx, "failed to update sandbox in redis", zap.Error(err), logger.WithSandboxID(sandboxID))
 	}
 
 	return sbx, nil
 }
 
-func (m *PopulateRedisStorage) StartRemoving(ctx context.Context, sandboxID string, stateAction sandbox.StateAction) (alreadyDone bool, callback func(context.Context, error), err error) {
-	return m.memoryBackend.StartRemoving(ctx, sandboxID, stateAction)
+func (m *PopulateRedisStorage) StartRemoving(ctx context.Context, teamID uuid.UUID, sandboxID string, opts sandbox.RemoveOpts) (sandbox.Sandbox, bool, func(context.Context, error), error) {
+	return m.memoryBackend.StartRemoving(ctx, teamID, sandboxID, opts)
 }
 
-func (m *PopulateRedisStorage) WaitForStateChange(ctx context.Context, sandboxID string) error {
-	return m.memoryBackend.WaitForStateChange(ctx, sandboxID)
+func (m *PopulateRedisStorage) WaitForStateChange(ctx context.Context, teamID uuid.UUID, sandboxID string) error {
+	return m.memoryBackend.WaitForStateChange(ctx, teamID, sandboxID)
 }
 
 func (m *PopulateRedisStorage) Sync(sandboxes []sandbox.Sandbox, nodeID string) []sandbox.Sandbox {

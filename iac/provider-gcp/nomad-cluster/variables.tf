@@ -57,19 +57,7 @@ variable "build_image_family" {
   default = "e2b-orch"
 }
 
-variable "build_cluster_size" {
-  type = number
-}
-
-variable "build_machine_type" {
-  type = string
-}
-
-variable "build_cluster_root_disk_size_gb" {
-  type = number
-}
-
-variable "edge_api_port" {
+variable "client_proxy_health_port" {
   type = object({
     name = string
     port = number
@@ -77,7 +65,7 @@ variable "edge_api_port" {
   })
 }
 
-variable "edge_proxy_port" {
+variable "client_proxy_port" {
   type = object({
     name = string
     port = number
@@ -118,16 +106,65 @@ variable "client_cluster_name" {
   default = "orch-client"
 }
 
-variable "client_cluster_size" {
-  type = number
+variable "client_clusters_config" {
+  description = "Client cluster configurations"
+  type = map(object({
+    cluster_size = number
+    autoscaler = optional(object({
+      size_max      = optional(number)
+      cpu_target    = optional(number)
+      memory_target = optional(number)
+    }))
+    machine = object({
+      type             = string
+      min_cpu_platform = string
+    })
+    boot_disk = object({
+      disk_type = string
+      size_gb   = number
+    })
+    cache_disks = object({
+      disk_type = string
+      size_gb   = number
+      count     = number
+    })
+    hugepages_percentage   = optional(number)
+    network_interface_type = optional(string)
+    node_labels            = optional(list(string), [])
+  }))
 }
 
-variable "client_cluster_size_max" {
-  type = number
+variable "build_cluster_name" {
+  type    = string
+  default = "orch-build"
 }
 
-variable "client_machine_type" {
-  type = string
+variable "build_clusters_config" {
+  description = "Build cluster configurations"
+  type = map(object({
+    cluster_size = number
+    autoscaler = optional(object({
+      size_max      = optional(number)
+      cpu_target    = optional(number)
+      memory_target = optional(number)
+    }))
+    machine = object({
+      type             = string
+      min_cpu_platform = string
+    })
+    boot_disk = object({
+      disk_type = string
+      size_gb   = number
+    })
+    cache_disks = object({
+      disk_type = string
+      size_gb   = number
+      count     = number
+    })
+    hugepages_percentage   = optional(number)
+    network_interface_type = optional(string)
+    node_labels            = optional(list(string), [])
+  }))
 }
 
 variable "gcp_project_id" {
@@ -143,8 +180,7 @@ variable "gcp_zone" {
 }
 
 variable "network_name" {
-  type    = string
-  default = "default"
+  type = string
 }
 
 variable "google_service_account_email" {
@@ -264,7 +300,7 @@ variable "filestore_cache_capacity_gb" {
   default = 0
 }
 
-variable "min_cpu_platform" {
+variable "filestore_nfs_version" {
   type = string
 }
 
@@ -287,19 +323,10 @@ variable "loki_node_pool" {
   description = "The name of the Nomad pool."
   type        = string
 }
+
 variable "orchestrator_node_pool" {
   description = "The name of the Nomad pool."
   type        = string
-}
-
-variable "build_base_hugepages_percentage" {
-  description = "The percentage of memory to use for preallocated hugepages."
-  type        = number
-}
-
-variable "orchestrator_base_hugepages_percentage" {
-  description = "The percentage of memory to use for preallocated hugepages."
-  type        = number
 }
 
 variable "api_use_nat" {
@@ -316,20 +343,41 @@ variable "api_nat_min_ports_per_vm" {
   type = number
 }
 
-variable "build_cluster_cache_disk_count" {
-  type = number
-
-  validation {
-    condition     = var.build_cluster_cache_disk_count > 0
-    error_message = "Must include at least 1 build cluster cache disk"
-  }
+# Boot disk type variables
+variable "api_boot_disk_type" {
+  description = "The GCE boot disk type for the API machines."
+  type        = string
 }
 
-variable "client_cluster_cache_disk_count" {
-  type = number
+variable "server_boot_disk_type" {
+  description = "The GCE boot disk type for the control server machines."
+  type        = string
+}
 
-  validation {
-    condition     = var.client_cluster_cache_disk_count > 0
-    error_message = "Must include at least 1 client cluster cache disk"
-  }
+variable "server_boot_disk_size_gb" {
+  description = "The GCE boot disk size in GB for the control server machines."
+  type        = number
+}
+
+variable "clickhouse_boot_disk_type" {
+  description = "The GCE boot disk type for the ClickHouse machines."
+  type        = string
+}
+
+variable "loki_boot_disk_type" {
+  description = "The GCE boot disk type for the Loki machines."
+  type        = string
+}
+
+variable "persistent_volume_types" {
+  description = "Persistent volume mount information"
+  type = map(object({
+    local_mount_path = string
+    nfs_location     = string
+    nfs_mount_opts   = string
+  }))
+}
+
+variable "additional_api_paths_handled_by_ingress" {
+  type = list(string)
 }

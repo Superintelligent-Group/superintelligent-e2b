@@ -45,7 +45,7 @@ func NewTeamObserver(ctx context.Context, sandboxStore *sandbox.Store) (*TeamObs
 	}
 
 	// Setup team sandbox metrics
-	meter := meterProvider.Meter("api.team.metrics")
+	meter := meterProvider.Meter("github.com/e2b-dev/infra/packages/api/internal/metrics")
 
 	teamSandboxMaxGauge, err := telemetry.GetGaugeInt(meter, telemetry.TeamSandboxRunningGaugeName)
 	if err != nil {
@@ -76,22 +76,14 @@ func NewTeamObserver(ctx context.Context, sandboxStore *sandbox.Store) (*TeamObs
 func (so *TeamObserver) Start(store *sandbox.Store) (err error) {
 	// Register callbacks for team sandbox metrics
 	so.registration, err = so.meter.RegisterCallback(
-		func(_ context.Context, obs metric.Observer) error {
-			sbxs := store.Items(nil, []sandbox.State{sandbox.StateRunning})
-			sbxsPerTeam := make(map[string]int64)
-			for _, sbx := range sbxs {
-				teamID := sbx.TeamID.String()
-				if _, ok := sbxsPerTeam[teamID]; !ok {
-					sbxsPerTeam[teamID] = 0
-				}
-
-				sbxsPerTeam[teamID]++
+		func(ctx context.Context, obs metric.Observer) error {
+			teams, err := store.TeamsWithSandboxes(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get teams with sandboxes: %w", err)
 			}
 
-			// Reset the max for the new interval to the current counts
-			// Observe the max concurrent sandbox counts for each team
-			for teamID, count := range sbxsPerTeam {
-				obs.ObserveInt64(so.teamSandboxRunning, count, metric.WithAttributes(attribute.String("team_id", teamID)))
+			for teamID, count := range teams {
+				obs.ObserveInt64(so.teamSandboxRunning, count, metric.WithAttributes(attribute.String("team_id", teamID.String())))
 			}
 
 			return nil
@@ -105,16 +97,13 @@ func (so *TeamObserver) Start(store *sandbox.Store) (err error) {
 	return nil
 }
 
-func (so *TeamObserver) Add(ctx context.Context, teamID uuid.UUID, created bool) {
-	teamIDStr := teamID.String()
+func (so *TeamObserver) Add(ctx context.Context, teamID uuid.UUID) {
 	// Count started only if the sandbox was created
-	if created {
-		attributes := []attribute.KeyValue{
-			attribute.String("team_id", teamIDStr),
-		}
-
-		so.teamSandboxesCreated.Add(ctx, 1, metric.WithAttributes(attributes...))
+	attributes := []attribute.KeyValue{
+		attribute.String("team_id", teamID.String()),
 	}
+
+	so.teamSandboxesCreated.Add(ctx, 1, metric.WithAttributes(attributes...))
 }
 
 func (so *TeamObserver) Close(ctx context.Context) error {

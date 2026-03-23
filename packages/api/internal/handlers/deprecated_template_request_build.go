@@ -10,10 +10,13 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	"github.com/e2b-dev/infra/packages/api/internal/db/types"
 	"github.com/e2b-dev/infra/packages/api/internal/template"
-	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	"github.com/e2b-dev/infra/packages/db/dberrors"
+	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
+	"github.com/e2b-dev/infra/packages/auth/pkg/types"
+	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
+	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/templates"
@@ -23,9 +26,9 @@ func (a *APIStore) PostTemplates(c *gin.Context) {
 	ctx := c.Request.Context()
 	span := trace.SpanFromContext(ctx)
 
-	userID := a.GetUserID(c)
+	userID := auth.MustGetUserID(c)
 
-	body, err := utils.ParseBody[api.TemplateBuildRequest](ctx, c)
+	body, err := ginutils.ParseBody[api.TemplateBuildRequest](ctx, c)
 	if err != nil {
 		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err))
 		telemetry.ReportCriticalError(ctx, "invalid request body", err)
@@ -66,6 +69,7 @@ func (a *APIStore) PostTemplates(c *gin.Context) {
 		TemplateID: template.TemplateID,
 		BuildID:    template.BuildID,
 		Aliases:    template.Aliases,
+		Names:      template.Names,
 		Public:     false,
 	})
 }
@@ -74,9 +78,9 @@ func (a *APIStore) PostTemplatesTemplateID(c *gin.Context, rawTemplateID api.Tem
 	ctx := c.Request.Context()
 	span := trace.SpanFromContext(ctx)
 
-	userID := a.GetUserID(c)
+	userID := auth.MustGetUserID(c)
 
-	body, err := utils.ParseBody[api.TemplateBuildRequest](ctx, c)
+	body, err := ginutils.ParseBody[api.TemplateBuildRequest](ctx, c)
 	if err != nil {
 		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err))
 		telemetry.ReportCriticalError(ctx, "invalid request body", err)
@@ -84,13 +88,15 @@ func (a *APIStore) PostTemplatesTemplateID(c *gin.Context, rawTemplateID api.Tem
 		return
 	}
 
-	templateID, err := id.CleanTemplateID(rawTemplateID)
+	identifier, _, err := id.ParseName(rawTemplateID)
 	if err != nil {
 		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid template ID: %s", rawTemplateID))
 		telemetry.ReportCriticalError(c.Request.Context(), "invalid template ID", err)
 
 		return
 	}
+	// For old templates, this should be always the templateID
+	templateID := identifier
 	span.SetAttributes(telemetry.WithTemplateID(templateID))
 
 	team, apiErr := a.GetTeam(ctx, c, body.TeamID)
@@ -142,6 +148,7 @@ func (a *APIStore) PostTemplatesTemplateID(c *gin.Context, rawTemplateID api.Tem
 		TemplateID: template.TemplateID,
 		BuildID:    template.BuildID,
 		Aliases:    template.Aliases,
+		Names:      template.Names,
 		Public:     templateDB.Public,
 	})
 }
@@ -153,22 +160,52 @@ func (a *APIStore) buildTemplate(
 	templateID api.TemplateID,
 	body api.TemplateBuildRequest,
 ) (*template.RegisterBuildResponse, *api.APIError) {
+	firecrackerVersion := a.featureFlags.StringFlag(ctx, featureflags.BuildFirecrackerVersion)
+
+	var alias *string
+	var tags []string
+
+	if body.Alias != nil {
+		aliasIdentifier, aliasTag, err := id.ParseName(*body.Alias)
+		if err != nil {
+			return nil, &api.APIError{
+				Code:      http.StatusBadRequest,
+				ClientMsg: fmt.Sprintf("Invalid alias: %s", err),
+				Err:       err,
+			}
+		}
+
+		aliasValue := id.ExtractAlias(aliasIdentifier)
+		alias = &aliasValue
+		if aliasTag != nil {
+			tags, err = id.ValidateAndDeduplicateTags([]string{*aliasTag})
+			if err != nil {
+				return nil, &api.APIError{
+					Code:      http.StatusBadRequest,
+					ClientMsg: fmt.Sprintf("Invalid tag: %s", err),
+					Err:       err,
+				}
+			}
+		}
+	}
+
 	// Create the build
 	data := template.RegisterBuildData{
-		ClusterID:          utils.WithClusterFallback(team.ClusterID),
+		ClusterID:          clusters.WithClusterFallback(team.ClusterID),
 		TemplateID:         templateID,
 		UserID:             &userID,
 		Team:               team,
 		Dockerfile:         body.Dockerfile,
-		Alias:              body.Alias,
+		Alias:              alias,
+		Tags:               tags,
 		StartCmd:           body.StartCmd,
 		ReadyCmd:           body.ReadyCmd,
 		CpuCount:           body.CpuCount,
 		MemoryMB:           body.MemoryMB,
 		Version:            templates.TemplateV1Version,
 		KernelVersion:      a.config.DefaultKernelVersion,
-		FirecrackerVersion: a.config.DefaultFirecrackerVersion,
+		FirecrackerVersion: firecrackerVersion,
 	}
 
-	return template.RegisterBuild(ctx, a.templateBuildsCache, a.sqlcDB, data)
+	return template.RegisterBuild(ctx, a.templateCache, a.sqlcDB, data)
 }

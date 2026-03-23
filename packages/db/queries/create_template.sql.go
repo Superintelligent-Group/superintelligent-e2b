@@ -8,13 +8,13 @@ package queries
 import (
 	"context"
 
-	"github.com/e2b-dev/infra/packages/db/types"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/google/uuid"
 )
 
 const createOrUpdateTemplate = `-- name: CreateOrUpdateTemplate :exec
-INSERT INTO "public"."envs"(id, team_id, created_by, updated_at, public, cluster_id)
-VALUES ($1, $2, $3, NOW(),FALSE, $4)
+INSERT INTO "public"."envs"(id, team_id, created_by, updated_at, public, cluster_id, source)
+VALUES ($1, $2, $3, NOW(), FALSE, $4, 'template')
 ON CONFLICT (id) DO UPDATE
 SET updated_at  = NOW(),
     build_count = envs.build_count + 1
@@ -41,7 +41,6 @@ const createTemplateBuild = `-- name: CreateTemplateBuild :exec
 INSERT INTO "public"."env_builds" (
     id,
     updated_at,
-    env_id,
     status,
     ram_mb,
     vcpu,
@@ -56,7 +55,6 @@ INSERT INTO "public"."env_builds" (
     $1,
     NOW(),
     $2,
-    'waiting',
     $3,
     $4,
     $5,
@@ -71,7 +69,7 @@ INSERT INTO "public"."env_builds" (
 
 type CreateTemplateBuildParams struct {
 	BuildID            uuid.UUID
-	TemplateID         string
+	Status             types.BuildStatus
 	RamMb              int64
 	Vcpu               int64
 	KernelVersion      string
@@ -86,7 +84,7 @@ type CreateTemplateBuildParams struct {
 func (q *Queries) CreateTemplateBuild(ctx context.Context, arg CreateTemplateBuildParams) error {
 	_, err := q.db.Exec(ctx, createTemplateBuild,
 		arg.BuildID,
-		arg.TemplateID,
+		arg.Status,
 		arg.RamMb,
 		arg.Vcpu,
 		arg.KernelVersion,
@@ -101,20 +99,30 @@ func (q *Queries) CreateTemplateBuild(ctx context.Context, arg CreateTemplateBui
 }
 
 const invalidateUnstartedTemplateBuilds = `-- name: InvalidateUnstartedTemplateBuilds :exec
-UPDATE "public"."env_builds"
-SET status  = 'failed',
-    reason = $1,
-    updated_at = NOW(),
-    finished_at = NOW()
-WHERE env_id = $2 AND status = 'waiting'
+WITH invalidated AS (
+    UPDATE "public"."env_builds" eb
+    SET status = 'failed',
+        reason = $1,
+        updated_at = NOW(),
+        finished_at = NOW()
+    FROM "public"."env_build_assignments" eba
+    WHERE eba.build_id = eb.id
+        AND eba.env_id = $2
+        AND eba.tag = ANY($3::text[])
+        AND eb.status_group = 'pending'
+    RETURNING eb.id
+)
+DELETE FROM public.active_template_builds
+WHERE build_id IN (SELECT id FROM invalidated)
 `
 
 type InvalidateUnstartedTemplateBuildsParams struct {
 	Reason     types.BuildReason
 	TemplateID string
+	Tags       []string
 }
 
 func (q *Queries) InvalidateUnstartedTemplateBuilds(ctx context.Context, arg InvalidateUnstartedTemplateBuildsParams) error {
-	_, err := q.db.Exec(ctx, invalidateUnstartedTemplateBuilds, arg.Reason, arg.TemplateID)
+	_, err := q.db.Exec(ctx, invalidateUnstartedTemplateBuilds, arg.Reason, arg.TemplateID, arg.Tags)
 	return err
 }

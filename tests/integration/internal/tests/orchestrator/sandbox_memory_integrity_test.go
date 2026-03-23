@@ -50,7 +50,6 @@ echo "Total memory: ${TOTAL_MEM_MB} MB"
 echo "Used memory before tmpfs mount: ${USED_MEM_MB} MB"
 echo "Free memory before tmpfs mount: ${FREE_MEM_MB} MB"
 echo "Memory to use in integrity test (%d%% of free, min 64MB): ${MEM_MB} MB"
-swapoff -a
 mount -t tmpfs -o size=${MEM_MB}M tmpfs /mnt
 /usr/bin/time -v dd if=/dev/urandom of="%s" bs=1M count=${MEM_MB}
 USED_MEM_MB_AFTER=$(free -m | awk '/^Mem:/ {print $3}')
@@ -94,6 +93,42 @@ echo "Used memory after tmpfs mount and file fill: ${USED_MEM_MB_AFTER} MB"
 		}
 	})
 
+	t.Run("write after read survives pause", func(t *testing.T) {
+		t.Parallel()
+
+		sbx := utils.SetupSandboxWithCleanup(t, c, utils.WithAutoPause(false))
+		sbxId := sbx.SandboxID
+		envdClient := setup.GetEnvdClient(t, t.Context())
+
+		exec := func(cmd string) string {
+			t.Helper()
+			out, err := utils.ExecCommandAsRootWithOutput(t, t.Context(), sbx, envdClient, "bash", "-c", cmd)
+			require.NoError(t, err)
+
+			return strings.TrimSpace(out)
+		}
+		pause := func() {
+			t.Helper()
+			resp, err := c.PostSandboxesSandboxIDPauseWithResponse(t.Context(), sbxId, setup.WithAPIKey())
+			require.NoError(t, err)
+			require.Equal(t, http.StatusNoContent, resp.StatusCode())
+		}
+		resume := func() {
+			t.Helper()
+			r, err := c.PostSandboxesSandboxIDResumeWithResponse(t.Context(), sbxId, api.PostSandboxesSandboxIDResumeJSONRequestBody{}, setup.WithAPIKey())
+			require.NoError(t, err)
+			require.Equal(t, http.StatusCreated, r.StatusCode())
+		}
+
+		exec(`echo -n A > /tmp/v`)
+		pause()
+		resume()
+		exec(`cat /tmp/v > /dev/null && echo -n B > /tmp/v`)
+		pause()
+		resume()
+		assert.Equal(t, "B", exec(`cat /tmp/v`))
+	})
+
 	t.Run("stress-ng verify", func(t *testing.T) {
 		t.Parallel()
 
@@ -104,10 +139,6 @@ echo "Used memory after tmpfs mount and file fill: ${USED_MEM_MB_AFTER} MB"
 
 		installCmd := `apt-get update && apt-get install -y stress-ng time`
 		err := utils.ExecCommandAsRoot(t, t.Context(), sbx, envdClient, "bash", "-c", installCmd)
-		require.NoError(t, err)
-
-		disableSwapCmd := `swapoff -a`
-		err = utils.ExecCommandAsRoot(t, t.Context(), sbx, envdClient, "bash", "-c", disableSwapCmd)
 		require.NoError(t, err)
 
 		// get 80% size of the free memory and use it as the vm-bytes

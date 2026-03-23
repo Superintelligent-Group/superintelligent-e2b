@@ -1,23 +1,19 @@
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
 
+AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
+GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
+
+HOSTNAME := $(shell hostname 2> /dev/null || hostnamectl hostname 2> /dev/null)
+$(if $(HOSTNAME),,$(error Failed to determine hostname: both 'hostname' and 'hostnamectl' failed))
+
 .PHONY: init
 init:
 	brew install protobuf
 
-openapi := ../../spec/openapi-hyperloop.yml
-codegen := go tool github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen
-
 .PHONY: generate
 generate:
-	@echo "Generating..."
-	docker build -t proto-gen -f generate.Dockerfile .
-	docker run --rm -v .:/workspace -v ./../shared/pkg/grpc:/shared/pkg/grpc proto-gen
-	@echo "Generating hyperloop api..."
-	$(codegen) -old-config-style -generate gin --package api $(openapi) > ../shared/pkg/http/hyperloop/api.gen.go
-	$(codegen) -old-config-style -generate types --package api $(openapi) > ../shared/pkg/http/hyperloop/types.gen.go
-	$(codegen) -old-config-style -generate spec --package api $(openapi) > ../shared/pkg/http/hyperloop/spec.gen.go
-	@echo "Done"
+	go generate ./...
 
 .PHONY: build
 build:
@@ -58,19 +54,35 @@ endef
 .PHONY: run-local
 run-local:
 	$(call setup_local_env)
-	NODE_ID=$$(hostname) ./bin/orchestrator
+	mkdir -p ./.data/test-volume
+	NODE_ID=$(HOSTNAME) ./bin/orchestrator
 
 .PHONY: upload/clean-nfs-cache
 upload/clean-nfs-cache:
-	./upload-clean-nfs-cache.sh $(GCP_PROJECT_ID)
+	chmod +x ./bin/clean-nfs-cache
+ifeq ($(PROVIDER),aws)
+	aws s3 cp ./bin/clean-nfs-cache "s3://${AWS_BUCKET_PREFIX}fc-env-pipeline/clean-nfs-cache" --profile ${AWS_PROFILE} --cache-control "no-cache, max-age=0"
+else
+	gsutil -h "Cache-Control:no-cache, max-age=0" cp ./bin/clean-nfs-cache "gs://${GCP_BUCKET_PREFIX}fc-env-pipeline/clean-nfs-cache"
+endif
 
 .PHONY: upload/orchestrator
 upload/orchestrator:
-	./upload-orchestrator.sh $(GCP_PROJECT_ID)
+	chmod +x ./bin/orchestrator
+ifeq ($(PROVIDER),aws)
+	aws s3 cp ./bin/orchestrator "s3://${AWS_BUCKET_PREFIX}fc-env-pipeline/orchestrator" --profile ${AWS_PROFILE} --cache-control "no-cache, max-age=0"
+else
+	gsutil -h "Cache-Control:no-cache, max-age=0" cp ./bin/orchestrator "gs://${GCP_BUCKET_PREFIX}fc-env-pipeline/orchestrator"
+endif
 
 .PHONY: upload/template-manager
 upload/template-manager:
-	./upload-template-manager.sh $(GCP_PROJECT_ID)
+	chmod +x ./bin/orchestrator
+ifeq ($(PROVIDER),aws)
+	aws s3 cp ./bin/orchestrator "s3://${AWS_BUCKET_PREFIX}fc-env-pipeline/template-manager" --profile ${AWS_PROFILE} --cache-control "no-cache, max-age=0"
+else
+	gsutil -h "Cache-Control:no-cache, max-age=0" cp ./bin/orchestrator "gs://${GCP_BUCKET_PREFIX}fc-env-pipeline/template-manager"
+endif
 
 .PHONY: build-and-upload/clean-nfs-cache
 build-and-upload/clean-nfs-cache: build upload/clean-nfs-cache
@@ -81,13 +93,6 @@ build-and-upload/orchestrator: build upload/orchestrator
 .PHONY: build-and-upload/template-manager
 build-and-upload/template-manager: build upload/template-manager
 
-.PHONY: mock
-mock:
-	sudo TEMPLATE_BUCKET_NAME=$(TEMPLATE_BUCKET_NAME) CONSUL_TOKEN=$(CONSUL_TOKEN) NODE_ID="testclient" go run cmd/mock-sandbox/mock.go -template 5wzg6c91u51yaebviysf -build "f0370054-b669-eeee-b33b-573d5287c6ef" -alive 1 -count 2
-
-.PHONY: mock-snapshot
-mock-snapshot:
-	sudo TEMPLATE_BUCKET_NAME=$(TEMPLATE_BUCKET_NAME) CONSUL_TOKEN=$(CONSUL_TOKEN) NODE_ID="testclient" go run cmd/mock-snapshot/mock.go  -template 5wzg6c91u51yaebviysf -build "f0370054-b669-4d7e-b33b-573d5287c6ef" -alive 1 -count 1
 
 .PHONY: test
 test:
@@ -107,19 +112,23 @@ test-docker:
 
 .PHONY: build-template
 build-template:
-	sudo -E TEMPLATE_BUCKET_NAME=$(TEMPLATE_BUCKET_NAME) \
+	TEMPLATE_BUCKET_NAME=$(TEMPLATE_BUCKET_NAME) \
 	GOOGLE_SERVICE_ACCOUNT_BASE64=$(GOOGLE_SERVICE_ACCOUNT_BASE64) \
 	DOCKER_AUTH_BASE64=$(DOCKER_AUTH_BASE64) \
 	GCP_PROJECT_ID=$(GCP_PROJECT_ID) \
 	GCP_DOCKER_REPOSITORY_NAME=$(GCP_DOCKER_REPOSITORY_NAME) \
 	GCP_REGION=$(GCP_REGION) \
 	ENVIRONMENT=local \
-	go run cmd/build-template/main.go \
+	go run cmd/create-build/main.go \
 	-template $(TEMPLATE_ID) \
-	-build $(BUILD_ID) \
+	-to-build $(BUILD_ID) \
 	-kernel $(KERNEL_VERSION) \
 	-firecracker $(FIRECRACKER_VERSION)
 
 .PHONY: migrate
 migrate:
-	./upload-envs.sh /mnt/disks/fc-envs/v1 $(TEMPLATE_BUCKET_NAME)
+	./scripts/upload-envs.sh /mnt/disks/fc-envs/v1 $(TEMPLATE_BUCKET_NAME)
+
+.PHONY: lint
+lint:
+	golangci-lint run --fix ./...

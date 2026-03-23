@@ -2,8 +2,10 @@ package utils
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,9 +15,11 @@ import (
 )
 
 type SandboxConfig struct {
+	templateID          string
 	metadata            api.SandboxMetadata
 	timeout             int32
 	autoPause           bool
+	autoResume          *api.SandboxAutoResumeConfig
 	network             *api.SandboxNetworkConfig
 	allowInternetAccess *bool
 	secure              *bool
@@ -25,9 +29,7 @@ type SandboxOption func(config *SandboxConfig)
 
 func WithMetadata(metadata api.SandboxMetadata) SandboxOption {
 	return func(config *SandboxConfig) {
-		for key, value := range metadata {
-			config.metadata[key] = value
-		}
+		maps.Copy(config.metadata, metadata)
 	}
 }
 
@@ -49,6 +51,12 @@ func WithAutoPause(autoPause bool) SandboxOption {
 	}
 }
 
+func WithAutoResume(enabled bool) SandboxOption {
+	return func(config *SandboxConfig) {
+		config.autoResume = &api.SandboxAutoResumeConfig{Enabled: enabled}
+	}
+}
+
 func WithSecure(secure bool) SandboxOption {
 	return func(config *SandboxConfig) {
 		config.secure = &secure
@@ -64,6 +72,12 @@ func WithNetwork(network *api.SandboxNetworkConfig) SandboxOption {
 func WithAllowInternetAccess(allow bool) SandboxOption {
 	return func(config *SandboxConfig) {
 		config.allowInternetAccess = &allow
+	}
+}
+
+func WithTemplateID(templateID string) SandboxOption {
+	return func(config *SandboxConfig) {
+		config.templateID = templateID
 	}
 }
 
@@ -86,28 +100,51 @@ func SetupSandboxWithCleanup(t *testing.T, c *api.ClientWithResponses, options .
 		option(&config)
 	}
 
-	createSandboxResponse, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
-		TemplateID:          setup.SandboxTemplateID,
-		Timeout:             &config.timeout,
-		Metadata:            &config.metadata,
-		AutoPause:           &config.autoPause,
-		Network:             config.network,
-		AllowInternetAccess: config.allowInternetAccess,
-		Secure:              config.secure,
-	}, setup.WithAPIKey())
+	templateID := config.templateID
+	if templateID == "" {
+		templateID = setup.SandboxTemplateID
+	}
 
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusCreated, createSandboxResponse.StatusCode())
-	require.NotNil(t, createSandboxResponse.JSON201)
+	for range 10 { // retry up to 10 times, but only in case of 429
+		createSandboxResponse, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
+			TemplateID:          templateID,
+			Timeout:             &config.timeout,
+			Metadata:            &config.metadata,
+			AutoPause:           &config.autoPause,
+			AutoResume:          config.autoResume,
+			Network:             config.network,
+			AllowInternetAccess: config.allowInternetAccess,
+			Secure:              config.secure,
+		}, setup.WithAPIKey())
+		require.NoError(t, err)
 
-	t.Cleanup(func() {
-		if t.Failed() {
-			t.Logf("Response: %s", string(createSandboxResponse.Body))
+		if createSandboxResponse.StatusCode() == http.StatusTooManyRequests {
+			t.Logf("Sandbox creation failed with status code %d, retrying...", createSandboxResponse.StatusCode())
+			time.Sleep(time.Second * 5)
+
+			continue
 		}
-		TeardownSandbox(t, c, createSandboxResponse.JSON201.SandboxID)
-	})
 
-	return createSandboxResponse.JSON201
+		if createSandboxResponse.StatusCode() != http.StatusCreated {
+			t.Logf("Sandbox creation failed status=%d body=%s", createSandboxResponse.StatusCode(), string(createSandboxResponse.Body))
+			t.Logf("Sandbox creation=%+v", *createSandboxResponse)
+		}
+
+		require.Equal(t, http.StatusCreated, createSandboxResponse.StatusCode())
+		sbx := createSandboxResponse.JSON201
+		require.NotNil(t, sbx)
+
+		t.Cleanup(func() {
+			TeardownSandbox(t, c, sbx.SandboxID)
+		})
+
+		return sbx
+	}
+
+	t.Logf("Sandbox creation failed after 10 retries")
+	t.FailNow()
+
+	return nil
 }
 
 // TeardownSandbox kills the sandbox with the given ID

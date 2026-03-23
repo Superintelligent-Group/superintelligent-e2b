@@ -9,9 +9,40 @@ import (
 	"context"
 	"time"
 
-	"github.com/e2b-dev/infra/packages/db/types"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/google/uuid"
 )
+
+const failTemplateBuildAndDeactivate = `-- name: FailTemplateBuildAndDeactivate :exec
+WITH deactivated AS (
+    DELETE FROM public.active_template_builds WHERE build_id = $5
+)
+UPDATE "public"."env_builds"
+SET status = $1,
+    finished_at = $2,
+    reason = $3,
+    version = $4
+WHERE id = $5
+`
+
+type FailTemplateBuildAndDeactivateParams struct {
+	Status     types.BuildStatus
+	FinishedAt *time.Time
+	Reason     types.BuildReason
+	Version    *string
+	BuildID    uuid.UUID
+}
+
+func (q *Queries) FailTemplateBuildAndDeactivate(ctx context.Context, arg FailTemplateBuildAndDeactivateParams) error {
+	_, err := q.db.Exec(ctx, failTemplateBuildAndDeactivate,
+		arg.Status,
+		arg.FinishedAt,
+		arg.Reason,
+		arg.Version,
+		arg.BuildID,
+	)
+	return err
+}
 
 const updateEnvBuildStatus = `-- name: UpdateEnvBuildStatus :exec
 UPDATE "public"."env_builds"
@@ -19,16 +50,15 @@ SET status = $1,
     finished_at = $2,
     reason = $3,
     version = $4
-WHERE id = $5 AND env_id = $6
+WHERE id = $5
 `
 
 type UpdateEnvBuildStatusParams struct {
-	Status     string
+	Status     types.BuildStatus
 	FinishedAt *time.Time
 	Reason     types.BuildReason
 	Version    *string
 	BuildID    uuid.UUID
-	TemplateID string
 }
 
 func (q *Queries) UpdateEnvBuildStatus(ctx context.Context, arg UpdateEnvBuildStatusParams) error {
@@ -38,7 +68,6 @@ func (q *Queries) UpdateEnvBuildStatus(ctx context.Context, arg UpdateEnvBuildSt
 		arg.Reason,
 		arg.Version,
 		arg.BuildID,
-		arg.TemplateID,
 	)
 	return err
 }

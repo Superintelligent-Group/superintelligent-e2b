@@ -11,7 +11,7 @@ jobs:
     outputs:
       modules: ${{ steps.set-modules.outputs.modules }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: set-modules
         run: echo "modules=$(go list -m -json | jq -s '.' | jq -c '[.[].Dir]')" >> $GITHUB_OUTPUT
 
@@ -23,11 +23,14 @@ jobs:
         modules: ${{ fromJSON(needs.detect-modules.outputs.modules) }}
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Setup Go
         uses: ./.github/actions/go-setup-cache
         with:
-          job_key: lint-${{ matrix.modules }}
+          cache-dependency-paths: |
+            go.work
+            ${{ matrix.modules }}/go.mod
+            ${{ matrix.modules }}/go.sum
 
       - name: Parse .tool-versions
         uses: wistia/parse-tool-versions@v2.1.1

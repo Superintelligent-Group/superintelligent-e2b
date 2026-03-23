@@ -35,10 +35,12 @@ func (s *statsWrapper) TagConn(ctx context.Context, _ *stats.ConnTagInfo) contex
 func (s *statsWrapper) HandleRPC(ctx context.Context, rs stats.RPCStats) {
 	// Check if the context contains noTraceKey, and trace only when its
 	// not present.
-	_, ok := ctx.Value(noTraceKey{}).(struct{})
-	if !ok {
-		s.statsHandler.HandleRPC(ctx, rs)
+	_, skip := ctx.Value(noTraceKey{}).(struct{})
+	if skip {
+		return
 	}
+
+	s.statsHandler.HandleRPC(ctx, rs)
 }
 
 // TagRPC implements per-RPC context management.

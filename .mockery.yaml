@@ -7,15 +7,80 @@ packages:
           filename: mocks.go
           pkgname: filesystemconnectmocks
 
+  github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator:
+    interfaces:
+      ChunkServiceClient:
+        config:
+          dir: packages/shared/pkg/grpc/orchestrator/mocks
+          filename: mockchunkserviceclient.go
+          pkgname: orchestratormocks
+      ChunkService_ReadAtBuildSeekableClient:
+        config:
+          dir: packages/shared/pkg/grpc/orchestrator/mocks
+          filename: mockchunkservicereadatbuildseekableclient.go
+          pkgname: orchestratormocks
+      ChunkService_ReadAtBuildSeekableServer:
+        config:
+          dir: packages/shared/pkg/grpc/orchestrator/mocks
+          filename: mockchunkservicereadatbuildseekableserver.go
+          pkgname: orchestratormocks
+      ChunkService_GetBuildBlobClient:
+        config:
+          dir: packages/shared/pkg/grpc/orchestrator/mocks
+          filename: mockchunkservicegetbuildblobclient.go
+          pkgname: orchestratormocks
+      ChunkService_GetBuildBlobServer:
+        config:
+          dir: packages/shared/pkg/grpc/orchestrator/mocks
+          filename: mockchunkservicegetbuildblobserver.go
+          pkgname: orchestratormocks
+
   github.com/e2b-dev/infra/packages/shared/pkg/storage:
     interfaces:
-      ObjectProvider:
+      featureFlagsClient:
+        config:
+          dir: packages/shared/pkg/storage/mocks
+          filename: mockfeatureflagsclient.go
+          pkgname: storagemocks
+          structname: MockFeatureFlagsClient
+      Blob:
         config:
           dir: packages/shared/pkg/storage/mocks
           filename: mockobjectprovider.go
           pkgname: storagemocks
-      SeekableObjectProvider:
+      Seekable:
         config:
           dir: packages/shared/pkg/storage/mocks
           filename: mockseekableobjectprovider.go
           pkgname: storagemocks
+      StorageProvider:
+        config:
+          dir: packages/shared/pkg/storage/mocks/provider
+          filename: mockstorageprovider.go
+          pkgname: providermocks
+
+
+  io:
+    interfaces:
+      Reader:
+        config:
+          dir: packages/shared/pkg/storage/mocks
+          filename: mockioreader.go
+          pkgname: storagemocks
+
+  github.com/e2b-dev/infra/packages/shared/pkg/utils:
+    interfaces:
+      fileOps:
+        config:
+          dir: packages/shared/pkg/utils
+          filename: mocks_test.go
+          pkgname: utils
+
+  github.com/e2b-dev/infra/packages/api/internal/handlers:
+    interfaces:
+      featureFlagsClient:
+        config:
+          dir: packages/api/internal/handlers/mocks
+          filename: mockfeatureflagsclient.go
+          pkgname: handlersmocks
+          structname: MockFeatureFlagsClient

@@ -17,7 +17,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
+	"github.com/e2b-dev/infra/packages/shared/pkg/connlimit"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/pool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -141,6 +143,12 @@ func assertStreamError(t *testing.T, resp *http.Response) {
 func newTestProxy(t *testing.T, getDestination func(r *http.Request) (*pool.Destination, error)) (*Proxy, uint, error) {
 	t.Helper()
 
+	return newTestProxyWithConnLimit(t, getDestination, nil)
+}
+
+func newTestProxyWithConnLimit(t *testing.T, getDestination func(r *http.Request) (*pool.Destination, error), connLimitConfig *ConnectionLimitConfig) (*Proxy, uint, error) {
+	t.Helper()
+
 	// Find a free port for the proxy
 	var lisCfg net.ListenConfig
 	l, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -155,6 +163,7 @@ func newTestProxy(t *testing.T, getDestination func(r *http.Request) (*pool.Dest
 		SandboxProxyRetries,
 		20*time.Second, // Short idle timeout
 		getDestination,
+		connLimitConfig,
 		false,
 	)
 
@@ -167,6 +176,7 @@ func newTestProxy(t *testing.T, getDestination func(r *http.Request) (*pool.Dest
 }
 
 func TestProxyRoutesToTargetServer(t *testing.T) {
+	t.Parallel()
 	var lisCfg net.ListenConfig
 	listener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -187,7 +197,9 @@ func TestProxyRoutesToTargetServer(t *testing.T) {
 
 	proxy, port, err := newTestProxy(t, getDestination)
 	require.NoError(t, err)
-	defer proxy.Close()
+	t.Cleanup(func() {
+		proxy.Close()
+	})
 
 	assert.Equal(t, uint64(0), proxy.TotalPoolConnections())
 	assert.Equal(t, uint64(0), backend.RequestCount())
@@ -202,6 +214,124 @@ func TestProxyRoutesToTargetServer(t *testing.T) {
 
 	assert.Equal(t, uint64(1), backend.RequestCount(), "backend should have been called once")
 	assert.Equal(t, uint64(1), proxy.TotalPoolConnections(), "proxy should have established one connection")
+}
+
+func TestProxyResumePermissionDeniedErrorTemplate(t *testing.T) {
+	t.Parallel()
+
+	getDestination := func(*http.Request) (*pool.Destination, error) {
+		return nil, NewErrSandboxResumePermissionDenied("test-sandbox")
+	}
+
+	proxy, port, err := newTestProxy(t, getDestination)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		proxy.Close()
+	})
+
+	t.Run("json for non-browser", func(t *testing.T) {
+		t.Parallel()
+		proxyURL := fmt.Sprintf("http://127.0.0.1:%d/hello", port)
+		resp, err := httpGet(t, proxyURL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = resp.Body.Close()
+		})
+
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+
+		var response struct {
+			SandboxID string `json:"sandboxId"`
+			Message   string `json:"message"`
+			Code      int    `json:"code"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&response)
+		require.NoError(t, err)
+		require.Equal(t, "test-sandbox", response.SandboxID)
+		require.Equal(t, "This sandbox can't be resumed with the credentials provided. Check your access token and try again.", response.Message)
+		require.Equal(t, http.StatusForbidden, response.Code)
+	})
+
+	t.Run("html for browser", func(t *testing.T) {
+		t.Parallel()
+		proxyURL := fmt.Sprintf("http://127.0.0.1:%d/hello", port)
+		headers := http.Header{
+			"User-Agent": {"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+		}
+
+		resp, err := httpGetWithHeaders(t, proxyURL, headers)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = resp.Body.Close()
+		})
+
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Contains(t, string(body), "Unable to Resume Sandbox")
+		assert.Contains(t, string(body), "test-sandbox")
+	})
+}
+
+func TestProxyTeamSandboxLimitError(t *testing.T) {
+	t.Parallel()
+
+	getDestination := func(*http.Request) (*pool.Destination, error) {
+		return nil, NewErrSandboxResourceExhausted("test-sandbox", "rate limit hit")
+	}
+
+	proxy, port, err := newTestProxy(t, getDestination)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		proxy.Close()
+	})
+
+	t.Run("json for non-browser", func(t *testing.T) {
+		t.Parallel()
+		proxyURL := fmt.Sprintf("http://127.0.0.1:%d/hello", port)
+		resp, err := httpGet(t, proxyURL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = resp.Body.Close()
+		})
+
+		require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+
+		var response struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&response)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusTooManyRequests, response.Code)
+		require.Equal(t, "rate limit hit", response.Message)
+	})
+
+	t.Run("html for browser", func(t *testing.T) {
+		t.Parallel()
+		proxyURL := fmt.Sprintf("http://127.0.0.1:%d/hello", port)
+		headers := http.Header{
+			"User-Agent": {"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+		}
+
+		resp, err := httpGetWithHeaders(t, proxyURL, headers)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = resp.Body.Close()
+		})
+
+		require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Contains(t, string(body), "Sandbox Limit Reached")
+		assert.Contains(t, string(body), "rate limit hit")
+	})
 }
 
 func httpGet(t *testing.T, proxyURL string) (*http.Response, error) {
@@ -283,6 +413,7 @@ func (l *instrumentedListener) Accept() (net.Conn, error) {
 }
 
 func TestProxyReusesConnections(t *testing.T) {
+	t.Parallel()
 	var lisCfg net.ListenConfig
 	listener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -328,6 +459,7 @@ func TestProxyReusesConnections(t *testing.T) {
 }
 
 func TestProxyCloseIdleConnectionsFromPool(t *testing.T) {
+	t.Parallel()
 	var lisCfg net.ListenConfig
 	listener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -370,6 +502,7 @@ func TestProxyCloseIdleConnectionsFromPool(t *testing.T) {
 }
 
 func TestProxyResetAliveConnectionsFromPool(t *testing.T) {
+	t.Parallel()
 	var lisCfg net.ListenConfig
 
 	listener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -444,6 +577,7 @@ func TestProxyResetAliveConnectionsFromPool(t *testing.T) {
 
 // This is a test that verify that the proxy reuse fails when the backend changes.
 func TestProxyReuseConnectionsWhenBackendChangesFails(t *testing.T) {
+	t.Parallel()
 	// Create first backend
 	var lisCfg net.ListenConfig
 	listener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -516,6 +650,7 @@ func TestProxyReuseConnectionsWhenBackendChangesFails(t *testing.T) {
 }
 
 func TestProxyDoesNotReuseConnectionsWhenBackendChanges(t *testing.T) {
+	t.Parallel()
 	// Create first backend
 	var lisCfg net.ListenConfig
 	listener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -598,6 +733,7 @@ func TestProxyDoesNotReuseConnectionsWhenBackendChanges(t *testing.T) {
 // TestProxyRetriesOnDelayedBackendStartup simulates the scenario where a backend
 // server starts up after the initial connection attempt (like envd port forwarding delay).
 func TestProxyRetriesOnDelayedBackendStartup(t *testing.T) {
+	t.Parallel()
 	var lisCfg net.ListenConfig
 	tempListener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -689,6 +825,7 @@ type data struct {
 // The internal and masked server both return a constant string. The proxy, when masked,
 // should return the "internal" server and not "masked" server.
 func TestChangeResponseHeader(t *testing.T) {
+	t.Parallel()
 	proxyPort := uint16(30092)
 	internalPort := uint64(30090)
 	maskedPort := uint16(30091)
@@ -713,7 +850,7 @@ func TestChangeResponseHeader(t *testing.T) {
 			IncludeSandboxIdInProxyErrorLogger: true,
 			MaskRequestHost:                    utils.ToPtr(maskedHost),
 		}, nil
-	}, false)
+	}, nil, false)
 
 	go func() {
 		err = proxy.ListenAndServe(t.Context())
@@ -781,10 +918,9 @@ func TestChangeResponseHeader(t *testing.T) {
 	}
 
 	require.NotNil(t, rsp, "response should not be nil")
-	assert.Equal(t, 200, rsp.StatusCode)
-
 	body, err := io.ReadAll(rsp.Body)
 	require.NoError(t, err)
+	require.Equal(t, 200, rsp.StatusCode, string(body))
 
 	var data data
 	err = json.Unmarshal(body, &data)
@@ -794,4 +930,101 @@ func TestChangeResponseHeader(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("127.0.0.1:%d", maskedPort), data.Host)
 	assert.Equal(t, "test123", data.Headers.Get("E2b-Testing"))
 	assert.Equal(t, fmt.Sprintf("127.0.0.1:%d", proxyPort), data.Headers.Get("X-Forwarded-Host"))
+}
+
+func TestConnectionLimitBlocksExcessConnections(t *testing.T) {
+	t.Parallel()
+
+	var lisCfg net.ListenConfig
+	listener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	backend, err := newTestBackend(listener, "backend-limited")
+	require.NoError(t, err)
+	defer backend.Close()
+
+	getDestination := func(*http.Request) (*pool.Destination, error) {
+		return &pool.Destination{
+			Url:           backend.url,
+			SandboxId:     "test-sandbox",
+			RequestLogger: logger.NewNopLogger(),
+			ConnectionKey: backend.id,
+		}, nil
+	}
+
+	const maxConns = 2
+	const holdDelay = 2 * time.Second
+
+	var acquiredCount atomic.Int64
+	var releasedCount atomic.Int64
+	var blockedCount atomic.Int64
+
+	connLimitConfig := &ConnectionLimitConfig{
+		Limiter:     connlimit.NewConnectionLimiter(),
+		GetMaxLimit: func(context.Context) int { return maxConns },
+		OnConnectionAcquired: func(_ context.Context, _ int64) {
+			acquiredCount.Add(1)
+		},
+		OnConnectionReleased: func(_ context.Context, _ int64) {
+			releasedCount.Add(1)
+		},
+		OnConnectionBlocked: func(_ context.Context) {
+			blockedCount.Add(1)
+		},
+	}
+
+	proxy, port, err := newTestProxyWithConnLimit(t, getDestination, connLimitConfig)
+	require.NoError(t, err)
+	defer proxy.Close()
+
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d/hello", port)
+
+	// Hold maxConns connections open by delaying body write on the backend.
+	// Each request returns 200 headers immediately, but keeps the proxy handler
+	// busy for holdDelay while the backend writes the body.
+	// We must read the full body to keep the client connection alive,
+	// otherwise closing the body releases the proxy handler early.
+	var wg errgroup.Group
+	for range maxConns {
+		wg.Go(func() error {
+			resp, reqErr := httpGetWithBodyWriteDelay(t, proxyURL, holdDelay)
+			if reqErr != nil {
+				return reqErr
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			}
+
+			// Block until the backend finishes writing the delayed body,
+			// keeping the proxy handler (and connection slot) occupied.
+			_, err := io.ReadAll(resp.Body)
+
+			return err
+		})
+	}
+
+	// Give the held requests a moment to be proxied and acquire their slots.
+	time.Sleep(500 * time.Millisecond)
+
+	// The next request should be blocked (429).
+	blockedResp, err := httpGet(t, proxyURL)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusTooManyRequests, blockedResp.StatusCode, "request over limit should get 429")
+	blockedResp.Body.Close()
+
+	assert.Equal(t, int64(maxConns), acquiredCount.Load(), "OnConnectionAcquired should have been called for each acquired slot")
+	assert.Equal(t, int64(1), blockedCount.Load(), "OnConnectionBlocked should have been called once")
+
+	// Wait for the held connections to finish naturally.
+	err = wg.Wait()
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(maxConns), releasedCount.Load(), "OnConnectionReleased should have been called for each released slot")
+
+	// After releasing, a new request should succeed.
+	resp, err := httpGet(t, proxyURL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assertBackendOutput(t, backend, resp)
 }

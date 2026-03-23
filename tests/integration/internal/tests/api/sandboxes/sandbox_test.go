@@ -14,6 +14,7 @@ import (
 )
 
 func TestSandboxCreate(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -40,6 +41,7 @@ func TestSandboxCreate(t *testing.T) {
 }
 
 func TestSandboxResumeUnknownSandbox(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -61,10 +63,11 @@ func TestSandboxResumeUnknownSandbox(t *testing.T) {
 	})
 
 	assert.Equal(t, http.StatusNotFound, sbxResume.StatusCode())
-	assert.JSONEq(t, "{\"code\":404,\"message\":\"Sandbox can't be resumed, no snapshot found\"}", string(sbxResume.Body))
+	assert.Contains(t, string(sbxResume.Body), "doesn't exist or you don't have access to it")
 }
 
 func TestSandboxResumeWithSecuredEnvd(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -97,6 +100,7 @@ func TestSandboxResumeWithSecuredEnvd(t *testing.T) {
 }
 
 func TestSandboxPauseNonFound(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 

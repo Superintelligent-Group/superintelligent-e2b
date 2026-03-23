@@ -14,6 +14,7 @@ import (
 )
 
 func TestTeamMetrics(t *testing.T) {
+	t.Parallel()
 	c := setup.GetAPIClient()
 
 	// Create multiple sandboxes to generate team metrics
@@ -62,18 +63,19 @@ func TestTeamMetrics(t *testing.T) {
 }
 
 func TestTeamMetricsWithTimeRange(t *testing.T) {
+	t.Parallel()
 	c := setup.GetAPIClient()
 
 	// Create a sandbox to generate metrics
 	utils.SetupSandboxWithCleanup(t, c)
+	maxDuration := 25 * time.Second
 
 	// Test with custom time range (last hour)
 	now := time.Now()
 	start := now.Add(-1 * time.Hour).Unix()
-	end := now.Unix()
+	end := now.Add(maxDuration).Unix()
 	var metrics []api.TeamMetric
 
-	maxDuration := 15 * time.Second
 	tick := 500 * time.Millisecond
 
 	require.Eventually(t, func() bool {
@@ -104,6 +106,7 @@ func TestTeamMetricsWithTimeRange(t *testing.T) {
 }
 
 func TestTeamMetricsEmpty(t *testing.T) {
+	t.Parallel()
 	c := setup.GetAPIClient()
 
 	db := setup.GetTestDBClient(t)
@@ -124,6 +127,7 @@ func TestTeamMetricsEmpty(t *testing.T) {
 }
 
 func TestTeamMetricsInvalidDate(t *testing.T) {
+	t.Parallel()
 	c := setup.GetAPIClient()
 
 	// Test getting metrics for a time range where no sandboxes existed

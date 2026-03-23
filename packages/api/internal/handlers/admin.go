@@ -9,18 +9,25 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
-	"github.com/e2b-dev/infra/packages/api/internal/utils"
+	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
 func (a *APIStore) GetNodes(c *gin.Context) {
-	ctx := c.Request.Context()
-	result := a.orchestrator.AdminNodes(ctx)
+	result, err := a.orchestrator.AdminNodes()
+	if err != nil {
+		telemetry.ReportCriticalError(c.Request.Context(), "error when getting nodes", err)
+		a.sendAPIStoreError(c, http.StatusInternalServerError, "Error when getting nodes")
+
+		return
+	}
+
 	c.JSON(http.StatusOK, result)
 }
 
 func (a *APIStore) GetNodesNodeID(c *gin.Context, nodeID api.NodeID, params api.GetNodesNodeIDParams) {
-	clusterID := utils.WithClusterFallback(params.ClusterID)
+	clusterID := clusters.WithClusterFallback(params.ClusterID)
 	result, err := a.orchestrator.AdminNodeDetail(clusterID, nodeID)
 	if err != nil {
 		if errors.Is(err, orchestrator.ErrNodeNotFound) {
@@ -41,7 +48,7 @@ func (a *APIStore) GetNodesNodeID(c *gin.Context, nodeID api.NodeID, params api.
 func (a *APIStore) PostNodesNodeID(c *gin.Context, nodeId api.NodeID) {
 	ctx := c.Request.Context()
 
-	body, err := utils.ParseBody[api.PostNodesNodeIDJSONRequestBody](ctx, c)
+	body, err := ginutils.ParseBody[api.PostNodesNodeIDJSONRequestBody](ctx, c)
 	if err != nil {
 		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Error when parsing request: %s", err))
 
@@ -50,8 +57,8 @@ func (a *APIStore) PostNodesNodeID(c *gin.Context, nodeId api.NodeID) {
 		return
 	}
 
-	clusterID := utils.WithClusterFallback(body.ClusterID)
-	node := a.orchestrator.GetNodeByIDOrNomadShortID(clusterID, nodeId)
+	clusterID := clusters.WithClusterFallback(body.ClusterID)
+	node := a.orchestrator.GetNode(clusterID, nodeId)
 	if node == nil {
 		c.Status(http.StatusNotFound)
 

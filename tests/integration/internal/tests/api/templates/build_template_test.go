@@ -1,7 +1,13 @@
 package api_templates
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -24,11 +30,16 @@ const (
 
 type BuildLogHandler func(alias string, entry api.BuildLogEntry)
 
+// PreBuildFunc is called after the template build is requested but before it is started.
+// It receives the templateID, allowing callers to upload files or perform other setup.
+type PreBuildFunc func(tb testing.TB, ctx context.Context, templateID string)
+
 func buildTemplate(
 	tb testing.TB,
-	templateAlias string,
+	templateName string,
 	data api.TemplateBuildStartV2,
 	logHandler BuildLogHandler,
+	preBuildFns ...PreBuildFunc,
 ) bool {
 	tb.Helper()
 
@@ -39,13 +50,18 @@ func buildTemplate(
 
 	// Request build
 	resp, err := c.PostV3TemplatesWithResponse(ctx, api.TemplateBuildRequestV3{
-		Alias:    templateAlias,
+		Name:     utils.ToPtr(templateName),
 		CpuCount: utils.ToPtr[int32](2),
 		MemoryMB: utils.ToPtr[int32](1024),
 	}, setup.WithAPIKey(), setup.WithTestsUserAgent())
 	require.NoError(tb, err)
 	require.Equal(tb, http.StatusAccepted, resp.StatusCode())
 	require.NotNil(tb, resp.JSON202)
+
+	// Run pre-build hooks (e.g. file uploads for COPY steps)
+	for _, fn := range preBuildFns {
+		fn(tb, ctx, resp.JSON202.TemplateID)
+	}
 
 	// Start build
 	startResp, err := c.PostV2TemplatesTemplateIDBuildsBuildIDWithResponse(
@@ -84,7 +100,7 @@ func buildTemplate(
 
 		offset += len(statusResp.JSON200.LogEntries)
 		for _, entry := range statusResp.JSON200.LogEntries {
-			logHandler(templateAlias, entry)
+			logHandler(templateName, entry)
 		}
 
 		switch statusResp.JSON200.Status {
@@ -211,7 +227,140 @@ func TestTemplateBuildENV(t *testing.T) {
 					},
 					{
 						Type: "RUN",
-						Args: utils.ToPtr([]string{"[[ \"$PATH\" == *:/my/path ]] || exit 1"}),
+						Args: utils.ToPtr([]string{"[[ \"$PATH\" == *:/my/path* ]] || exit 1"}),
+					},
+				}),
+			},
+		},
+		{
+			name:         "ENV with PEM-style dashes",
+			templateName: "test-ubuntu-env-pem-dashes",
+			buildConfig: api.TemplateBuildStartV2{
+				Force:     utils.ToPtr(ForceBaseBuild),
+				FromImage: utils.ToPtr("ubuntu:22.04"),
+				Steps: utils.ToPtr([]api.TemplateStep{
+					{
+						Type:  "ENV",
+						Force: utils.ToPtr(true),
+						Args:  utils.ToPtr([]string{"PEM_HEADER", "-----BEGIN DATA-----"}),
+					},
+					{
+						Type: "RUN",
+						Args: utils.ToPtr([]string{"[[ \"$PEM_HEADER\" == \"-----BEGIN DATA-----\" ]] || exit 1"}),
+					},
+				}),
+			},
+		},
+		{
+			name:         "ENV with double quotes",
+			templateName: "test-ubuntu-env-quotes",
+			buildConfig: api.TemplateBuildStartV2{
+				Force:     utils.ToPtr(ForceBaseBuild),
+				FromImage: utils.ToPtr("ubuntu:22.04"),
+				Steps: utils.ToPtr([]api.TemplateStep{
+					{
+						Type:  "ENV",
+						Force: utils.ToPtr(true),
+						Args:  utils.ToPtr([]string{"QUOTED_VAR", `say "hello"`}),
+					},
+					{
+						Type: "RUN",
+						Args: utils.ToPtr([]string{`[[ "$QUOTED_VAR" == 'say "hello"' ]] || exit 1`}),
+					},
+				}),
+			},
+		},
+		{
+			name:         "ENV with single quotes",
+			templateName: "test-ubuntu-env-single-quotes",
+			buildConfig: api.TemplateBuildStartV2{
+				Force:     utils.ToPtr(ForceBaseBuild),
+				FromImage: utils.ToPtr("ubuntu:22.04"),
+				Steps: utils.ToPtr([]api.TemplateStep{
+					{
+						Type:  "ENV",
+						Force: utils.ToPtr(true),
+						Args:  utils.ToPtr([]string{"SINGLE_QUOTED", "it's working"}),
+					},
+					{
+						Type: "RUN",
+						Args: utils.ToPtr([]string{`[[ "$SINGLE_QUOTED" == "it's working" ]] || exit 1`}),
+					},
+				}),
+			},
+		},
+		{
+			name:         "ENV with backslashes",
+			templateName: "test-ubuntu-env-backslash",
+			buildConfig: api.TemplateBuildStartV2{
+				Force:     utils.ToPtr(ForceBaseBuild),
+				FromImage: utils.ToPtr("ubuntu:22.04"),
+				Steps: utils.ToPtr([]api.TemplateStep{
+					{
+						Type:  "ENV",
+						Force: utils.ToPtr(true),
+						Args:  utils.ToPtr([]string{"PATH_VAR", `path\to\file`}),
+					},
+					{
+						Type: "RUN",
+						Args: utils.ToPtr([]string{`[[ "$PATH_VAR" == 'path\to\file' ]] || exit 1`}),
+					},
+				}),
+			},
+		},
+		{
+			name:         "ENV with multiline value",
+			templateName: "test-ubuntu-env-multiline",
+			buildConfig: api.TemplateBuildStartV2{
+				Force:     utils.ToPtr(ForceBaseBuild),
+				FromImage: utils.ToPtr("ubuntu:22.04"),
+				Steps: utils.ToPtr([]api.TemplateStep{
+					{
+						Type:  "ENV",
+						Force: utils.ToPtr(true),
+						Args:  utils.ToPtr([]string{"MULTILINE", "line1\nline2\nline3"}),
+					},
+					{
+						Type: "RUN",
+						Args: utils.ToPtr([]string{`[[ $(echo "$MULTILINE" | wc -l) -eq 3 ]] || exit 1`}),
+					},
+				}),
+			},
+		},
+		{
+			name:         "ENV blocks command substitution with backticks",
+			templateName: "test-ubuntu-env-backticks",
+			buildConfig: api.TemplateBuildStartV2{
+				Force:     utils.ToPtr(ForceBaseBuild),
+				FromImage: utils.ToPtr("ubuntu:22.04"),
+				Steps: utils.ToPtr([]api.TemplateStep{
+					{
+						Type:  "ENV",
+						Force: utils.ToPtr(true),
+						Args:  utils.ToPtr([]string{"LITERAL_CMD", "`echo pwned`"}),
+					},
+					{
+						Type: "RUN",
+						Args: utils.ToPtr([]string{`[[ "$LITERAL_CMD" == '` + "`echo pwned`" + `' ]] || exit 1`}),
+					},
+				}),
+			},
+		},
+		{
+			name:         "ENV blocks command substitution with dollar paren",
+			templateName: "test-ubuntu-env-dollarparen",
+			buildConfig: api.TemplateBuildStartV2{
+				Force:     utils.ToPtr(ForceBaseBuild),
+				FromImage: utils.ToPtr("ubuntu:22.04"),
+				Steps: utils.ToPtr([]api.TemplateStep{
+					{
+						Type:  "ENV",
+						Force: utils.ToPtr(true),
+						Args:  utils.ToPtr([]string{"LITERAL_CMD2", "$(echo pwned)"}),
+					},
+					{
+						Type: "RUN",
+						Args: utils.ToPtr([]string{`[[ "$LITERAL_CMD2" == '$(echo pwned)' ]] || exit 1`}),
 					},
 				}),
 			},
@@ -869,4 +1018,142 @@ func TestTemplateBuildWithDifferentSourceImages(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTemplateBuildInstalledPackagesAvailable(t *testing.T) {
+	t.Parallel()
+
+	// Test that packages installed by provision.sh are available during template build
+	packages := []string{
+		"systemd",
+		"systemd-sysv",
+		"openssh-server",
+		"sudo",
+		"chrony",
+		"socat",
+		"curl",
+		"ca-certificates",
+		"fuse3",
+		"iptables",
+		"git",
+	}
+
+	steps := make([]api.TemplateStep, 0, len(packages))
+	for _, pkg := range packages {
+		steps = append(steps, api.TemplateStep{
+			Type: "RUN",
+			Args: utils.ToPtr([]string{
+				"dpkg-query -W -f='${Status}' " + pkg + " | grep -q 'install ok installed'",
+			}),
+		})
+	}
+
+	buildConfig := api.TemplateBuildStartV2{
+		Force:     utils.ToPtr(ForceBaseBuild),
+		FromImage: utils.ToPtr("ubuntu:22.04"),
+		Steps:     utils.ToPtr(steps),
+	}
+
+	assert.True(t, buildTemplate(t, "test-ubuntu-packages-available", buildConfig, defaultBuildLogHandler(t)))
+}
+
+func createTarWithFile(tb testing.TB, fileName string, content string) []byte {
+	tb.Helper()
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	err := tw.WriteHeader(&tar.Header{
+		Name: fileName,
+		Mode: 0o644,
+		Size: int64(len(content)),
+	})
+	require.NoError(tb, err)
+
+	_, err = tw.Write([]byte(content))
+	require.NoError(tb, err)
+	require.NoError(tb, tw.Close())
+	require.NoError(tb, gw.Close())
+
+	return buf.Bytes()
+}
+
+func computeSHA256Hex(data []byte) string {
+	h := sha256.Sum256(data)
+
+	return fmt.Sprintf("%x", h[:])
+}
+
+// uploadFileForTemplate gets a signed upload URL for the given template and hash,
+// then uploads the data to that URL.
+func uploadFileForTemplate(
+	tb testing.TB,
+	ctx context.Context,
+	templateID string,
+	hash string,
+	data []byte,
+) {
+	tb.Helper()
+
+	c := setup.GetAPIClient()
+
+	// Get the signed upload URL
+	resp, err := c.GetTemplatesTemplateIDFilesHashWithResponse(
+		ctx,
+		templateID,
+		hash,
+		setup.WithAPIKey(),
+		setup.WithTestsUserAgent(),
+	)
+	require.NoError(tb, err)
+	require.Equal(tb, http.StatusCreated, resp.StatusCode(), string(resp.Body))
+	require.NotNil(tb, resp.JSON201)
+	require.NotNil(tb, resp.JSON201.Url, "Expected a signed upload URL")
+
+	// Upload the tar data to the signed URL
+	uploadReq, err := http.NewRequestWithContext(ctx, http.MethodPut, *resp.JSON201.Url, bytes.NewReader(data))
+	require.NoError(tb, err)
+	uploadReq.Header.Set("Content-Type", "application/octet-stream")
+
+	uploadResp, err := http.DefaultClient.Do(uploadReq)
+	require.NoError(tb, err)
+	defer uploadResp.Body.Close()
+	io.ReadAll(uploadResp.Body)
+
+	require.Less(tb, uploadResp.StatusCode, 300, "Upload failed with status %d", uploadResp.StatusCode)
+}
+
+func TestTemplateBuildCOPY(t *testing.T) {
+	t.Parallel()
+
+	fileContent := "Hello from COPY!"
+	tarData := createTarWithFile(t, "hello.txt", fileContent)
+	filesHash := computeSHA256Hex(tarData)
+
+	buildConfig := api.TemplateBuildStartV2{
+		Force:     utils.ToPtr(ForceBaseBuild),
+		FromImage: utils.ToPtr("ubuntu:24.04"),
+		Steps: utils.ToPtr([]api.TemplateStep{
+			{
+				Type:      "COPY",
+				Force:     utils.ToPtr(true),
+				Args:      utils.ToPtr([]string{".", "/app/"}),
+				FilesHash: utils.ToPtr(filesHash),
+			},
+			{
+				Type: "RUN",
+				Args: utils.ToPtr([]string{
+					fmt.Sprintf(`cat /app/hello.txt | grep '%s'`, fileContent),
+				}),
+			},
+		}),
+	}
+
+	assert.True(t, buildTemplate(t, "test-ubuntu-copy", buildConfig, defaultBuildLogHandler(t),
+		func(tb testing.TB, ctx context.Context, templateID string) {
+			tb.Helper()
+			uploadFileForTemplate(tb, ctx, templateID, filesHash, tarData)
+		},
+	))
 }

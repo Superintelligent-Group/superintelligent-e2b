@@ -7,11 +7,9 @@ import (
 	"math/rand"
 	"sync"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
+	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 )
 
 // BestOfKConfig holds the configuration parameters for the placement algorithm
@@ -104,23 +102,13 @@ func (b *BestOfK) UpdateConfig(config BestOfKConfig) {
 	b.config = config
 }
 
-func (b *BestOfK) excludeNode(err error) bool {
-	st, ok := status.FromError(err)
-	// If the node is just exhausted, keep it
-	if ok && st.Code() == codes.ResourceExhausted {
-		return false
-	}
-
-	return true
-}
-
 // chooseNode selects the best node for placing a VM with the given quota
-func (b *BestOfK) chooseNode(_ context.Context, nodes []*nodemanager.Node, excludedNodes map[string]struct{}, resources nodemanager.SandboxResources) (bestNode *nodemanager.Node, err error) {
+func (b *BestOfK) chooseNode(_ context.Context, nodes []*nodemanager.Node, excludedNodes map[string]struct{}, resources nodemanager.SandboxResources, buildMachineInfo machineinfo.MachineInfo, filterByLabels bool, requiredLabels []string) (bestNode *nodemanager.Node, err error) {
 	// Fix the config, we want to dynamically update it
 	config := b.getConfig()
 
 	// Filter eligible nodes
-	candidates := b.sample(nodes, config, excludedNodes, resources)
+	candidates := b.sample(nodes, config, excludedNodes, resources, buildMachineInfo, filterByLabels, requiredLabels)
 
 	// Find the best node among candidates
 	bestScore := math.MaxFloat64
@@ -143,10 +131,11 @@ func (b *BestOfK) chooseNode(_ context.Context, nodes []*nodemanager.Node, exclu
 }
 
 // sample returns up to k items chosen uniformly from those passing ok.
-func (b *BestOfK) sample(items []*nodemanager.Node, config BestOfKConfig, excludedNodes map[string]struct{}, resources nodemanager.SandboxResources) []*nodemanager.Node {
+func (b *BestOfK) sample(items []*nodemanager.Node, config BestOfKConfig, excludedNodes map[string]struct{}, resources nodemanager.SandboxResources, buildMachineInfo machineinfo.MachineInfo, filterByLabels bool, requiredLabels []string) []*nodemanager.Node {
 	if config.K <= 0 || len(items) == 0 {
 		return nil
 	}
+
 	indices := make([]int, len(items))
 	for i := range indices {
 		indices[i] = i
@@ -173,6 +162,16 @@ func (b *BestOfK) sample(items []*nodemanager.Node, config BestOfKConfig, exclud
 
 		// If the node is not ready, skip it
 		if n.Status() != api.NodeStatusReady {
+			continue
+		}
+
+		// Skip if node is not CPU compatible
+		if !isNodeCPUCompatible(n, buildMachineInfo) {
+			continue
+		}
+
+		// Skip if node doesn't have the required labels
+		if filterByLabels && !isNodeLabelsCompatible(n, requiredLabels) {
 			continue
 		}
 

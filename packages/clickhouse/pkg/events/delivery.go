@@ -12,7 +12,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/clickhouse/pkg/batcher"
 	"github.com/e2b-dev/infra/packages/shared/pkg/events"
-	flags "github.com/e2b-dev/infra/packages/shared/pkg/feature-flags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
@@ -47,21 +47,12 @@ type ClickhouseDelivery struct {
 	conn    driver.Conn
 }
 
-func NewDefaultClickhouseSandboxEventsDelivery(ctx context.Context, conn driver.Conn, featureFlags *flags.Client) (*ClickhouseDelivery, error) {
-	maxBatchSize := 100
-	if val, err := featureFlags.IntFlag(ctx, flags.ClickhouseBatcherMaxBatchSize); err == nil {
-		maxBatchSize = val
-	}
+func NewDefaultClickhouseSandboxEventsDelivery(ctx context.Context, conn driver.Conn, featureFlags *featureflags.Client) (*ClickhouseDelivery, error) {
+	maxBatchSize := featureFlags.IntFlag(ctx, featureflags.ClickhouseBatcherMaxBatchSize)
 
-	maxDelay := 1 * time.Second
-	if val, err := featureFlags.IntFlag(ctx, flags.ClickhouseBatcherMaxDelay); err == nil {
-		maxDelay = time.Duration(val) * time.Millisecond
-	}
+	maxDelay := time.Duration(featureFlags.IntFlag(ctx, featureflags.ClickhouseBatcherMaxDelay)) * time.Millisecond
 
-	batcherQueueSize := 1000
-	if val, err := featureFlags.IntFlag(ctx, flags.ClickhouseBatcherQueueSize, flags.SandboxContext("clickhouse-batcher")); err == nil {
-		batcherQueueSize = val
-	}
+	batcherQueueSize := featureFlags.IntFlag(ctx, featureflags.ClickhouseBatcherQueueSize, featureflags.SandboxContext("clickhouse-batcher"))
 
 	return NewClickhouseSandboxEventsDelivery(
 		ctx, conn, batcher.BatcherOptions{
@@ -123,8 +114,6 @@ func (c *ClickhouseDelivery) Publish(_ context.Context, _ string, event events.S
 }
 
 func (c *ClickhouseDelivery) Close(context.Context) error {
-	defer c.conn.Close()
-
 	return c.batcher.Stop()
 }
 

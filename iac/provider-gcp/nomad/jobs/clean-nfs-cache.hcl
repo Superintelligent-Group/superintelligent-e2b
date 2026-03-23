@@ -19,8 +19,15 @@ job "filestore-cleanup" {
         task "filestore-cleanup" {
           driver = "raw_exec"
 
+          resources {
+              memory = 2048 // in MB
+          }
+
           env {
             NODE_ID = "$${node.unique.name}"
+            %{ if launch_darkly_api_key != "" }
+                LAUNCH_DARKLY_API_KEY         = "${launch_darkly_api_key}"
+            %{ endif }
           }
 
           config {
@@ -30,9 +37,11 @@ job "filestore-cleanup" {
                     "--disk-usage-target-percent=${max_disk_usage_target}",
                     "--files-per-loop=${files_per_loop}",
                     "--deletions-per-loop=${deletions_per_loop}",
-                    %{ if otel_collector_endpoint != "" }
-                    "--otel-collector-endpoint=${otel_collector_endpoint}",
-                    %{ endif }
+                    "--max-concurrent-stat=${max_concurrent_stat}",
+                    "--max-concurrent-scan=${max_concurrent_scan}",
+                    "--max-concurrent-delete=${max_concurrent_delete}",
+                    "--max-retries=${max_retries}",
+                    "--otel-collector-endpoint=${otel_collector_grpc_endpoint}",
                     "${nfs_cache_mount_path}",
                 ]
             }

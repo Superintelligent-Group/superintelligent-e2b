@@ -7,7 +7,7 @@ package queries
 import (
 	"time"
 
-	"github.com/e2b-dev/infra/packages/db/types"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -23,6 +23,14 @@ type AccessToken struct {
 	AccessTokenLength     int32
 	AccessTokenMaskPrefix string
 	AccessTokenMaskSuffix string
+}
+
+type ActiveTemplateBuild struct {
+	BuildID    uuid.UUID
+	TeamID     uuid.UUID
+	TemplateID string
+	Tags       []string
+	CreatedAt  time.Time
 }
 
 type Addon struct {
@@ -46,6 +54,18 @@ type AuthUser struct {
 	Email string
 }
 
+type BillingSandboxLog struct {
+	SandboxID       string
+	EnvID           string
+	Vcpu            int64
+	RamMb           int64
+	TotalDiskSizeMb int64
+	StartedAt       time.Time
+	StoppedAt       *time.Time
+	CreatedAt       time.Time
+	TeamID          uuid.UUID
+}
+
 type Cluster struct {
 	ID                 uuid.UUID
 	Endpoint           string
@@ -67,12 +87,15 @@ type Env struct {
 	TeamID        uuid.UUID
 	CreatedBy     *uuid.UUID
 	ClusterID     *uuid.UUID
+	Source        string
 }
 
 type EnvAlias struct {
 	Alias       string
 	IsRenamable bool
 	EnvID       string
+	Namespace   *string
+	ID          uuid.UUID
 }
 
 type EnvBuild struct {
@@ -80,7 +103,7 @@ type EnvBuild struct {
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	FinishedAt         *time.Time
-	Status             string
+	Status             types.BuildStatus
 	Dockerfile         *string
 	StartCmd           *string
 	Vcpu               int64
@@ -89,7 +112,7 @@ type EnvBuild struct {
 	TotalDiskSizeMb    *int64
 	KernelVersion      string
 	FirecrackerVersion string
-	EnvID              string
+	EnvID              *string
 	EnvdVersion        *string
 	ReadyCmd           *string
 	ClusterNodeID      *string
@@ -100,6 +123,22 @@ type EnvBuild struct {
 	CpuModel           *string
 	CpuModelName       *string
 	CpuFlags           []string
+	StatusGroup        types.BuildStatusGroup
+	TeamID             *uuid.UUID
+}
+
+type EnvBuildAssignment struct {
+	ID        uuid.UUID
+	EnvID     string
+	BuildID   uuid.UUID
+	Tag       string
+	Source    string
+	CreatedAt pgtype.Timestamptz
+}
+
+type EnvDefault struct {
+	EnvID       string
+	Description *string
 }
 
 type Snapshot struct {
@@ -118,16 +157,27 @@ type Snapshot struct {
 	Config              *types.PausedSandboxConfig
 }
 
+type SnapshotTemplate struct {
+	EnvID        string
+	SandboxID    string
+	CreatedAt    pgtype.Timestamptz
+	OriginNodeID *string
+	BuildID      *uuid.UUID
+}
+
 type Team struct {
-	ID            uuid.UUID
-	CreatedAt     time.Time
-	IsBlocked     bool
-	Name          string
-	Tier          string
-	Email         string
-	IsBanned      bool
-	BlockedReason *string
-	ClusterID     *uuid.UUID
+	ID                      uuid.UUID
+	CreatedAt               time.Time
+	IsBlocked               bool
+	Name                    string
+	Tier                    string
+	Email                   string
+	IsBanned                bool
+	BlockedReason           *string
+	ClusterID               *uuid.UUID
+	SandboxSchedulingLabels []string
+	Slug                    string
+	ProfilePictureUrl       *string
 }
 
 type TeamApiKey struct {
@@ -169,6 +219,13 @@ type Tier struct {
 	ConcurrentTemplateBuilds int64
 }
 
+type User struct {
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	ID        uuid.UUID
+	Email     string
+}
+
 type UsersTeam struct {
 	ID        int64
 	UserID    uuid.UUID
@@ -176,4 +233,13 @@ type UsersTeam struct {
 	IsDefault bool
 	AddedBy   *uuid.UUID
 	CreatedAt pgtype.Timestamp
+	UuidID    uuid.UUID
+}
+
+type Volume struct {
+	ID         uuid.UUID
+	TeamID     uuid.UUID
+	Name       string
+	VolumeType string
+	CreatedAt  pgtype.Timestamptz
 }

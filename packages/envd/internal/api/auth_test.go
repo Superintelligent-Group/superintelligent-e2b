@@ -13,8 +13,12 @@ import (
 )
 
 func TestKeyGenerationAlgorithmIsStable(t *testing.T) {
+	t.Parallel()
 	apiToken := "secret-access-token"
-	api := &API{accessToken: &apiToken}
+	secureToken := &SecureToken{}
+	err := secureToken.Set([]byte(apiToken))
+	require.NoError(t, err)
+	api := &API{accessToken: secureToken}
 
 	path := "/path/to/demo.txt"
 	username := "root"
@@ -34,8 +38,12 @@ func TestKeyGenerationAlgorithmIsStable(t *testing.T) {
 }
 
 func TestKeyGenerationAlgorithmWithoutExpirationIsStable(t *testing.T) {
+	t.Parallel()
 	apiToken := "secret-access-token"
-	api := &API{accessToken: &apiToken}
+	secureToken := &SecureToken{}
+	err := secureToken.Set([]byte(apiToken))
+	require.NoError(t, err)
+	api := &API{accessToken: secureToken}
 
 	path := "/path/to/resource.txt"
 	username := "user"

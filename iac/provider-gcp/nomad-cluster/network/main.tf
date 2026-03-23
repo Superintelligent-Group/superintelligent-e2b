@@ -2,7 +2,7 @@ terraform {
   required_providers {
     cloudflare = {
       source  = "cloudflare/cloudflare"
-      version = "4.19.0"
+      version = "4.52.5"
     }
   }
 }
@@ -18,12 +18,24 @@ provider "cloudflare" {
 locals {
   domain_map = { for d in var.additional_domains : replace(d, ".", "-") => d }
 
-  parts        = split(".", var.domain_name)
-  is_subdomain = length(local.parts) > 2
-  // Take everything except last 2 parts
-  subdomain = local.is_subdomain ? join(".", slice(local.parts, 0, length(local.parts) - 2)) : ""
-  // Take last 2 parts (1 dot)
-  root_domain = local.is_subdomain ? join(".", slice(local.parts, length(local.parts) - 2, length(local.parts))) : var.domain_name
+  // All domains (primary + additional)
+  domains = toset(concat(var.additional_domains, [var.domain_name]))
+
+  // Extract root domain (Cloudflare zone) and prefix from each domain.
+  // e.g. "sub.example.com" -> root_domain = "example.com", prefix = "sub"
+  //      "example.dev"     -> root_domain = "example.dev", prefix = ""
+  domain_parts = { for d in local.domains : d => split(".", d) }
+  domain_info = {
+    for d, parts in local.domain_parts : d => {
+      root_domain = length(parts) >= 2 ? join(".", slice(parts, length(parts) - 2, length(parts))) : d
+      prefix      = join(".", slice(parts, 0, max(length(parts) - 2, 0)))
+    }
+  }
+
+  // Primary domain parsing
+  is_subdomain = local.domain_info[var.domain_name].prefix != ""
+  subdomain    = local.domain_info[var.domain_name].prefix
+  root_domain  = local.domain_info[var.domain_name].root_domain
 
   backends = {
     session = {
@@ -44,7 +56,7 @@ locals {
       protocol                        = "HTTP"
       port                            = var.api_port.port
       port_name                       = var.api_port.name
-      timeout_sec                     = 65
+      timeout_sec                     = 80
       connection_draining_timeout_sec = 1
       http_health_check = {
         request_path       = var.api_port.health_path
@@ -64,10 +76,8 @@ locals {
         request_path = var.docker_reverse_proxy_port.health_path
         port         = var.docker_reverse_proxy_port.port
       }
-      # TODO: (2025-10-01) - this should be only api instance group, but keeping this here for a migration period (at least until 2025-10-15)
       groups = [
         { group = var.api_instance_group },
-        { group = var.build_instance_group },
       ]
     }
     nomad = {
@@ -81,20 +91,6 @@ locals {
         port         = var.nomad_port
       }
       groups = [{ group = var.server_instance_group }]
-    }
-    consul = {
-      protocol                        = "HTTP"
-      port                            = 80
-      port_name                       = "consul"
-      timeout_sec                     = 10
-      connection_draining_timeout_sec = 1
-      http_health_check = {
-        request_path = "/v1/status/peers"
-        port         = 8500
-      }
-      groups = [
-        { group = var.server_instance_group }
-      ]
     }
   }
   health_checked_backends = { for backend_index, backend_value in local.backends : backend_index => backend_value }
@@ -247,7 +243,7 @@ resource "google_certificate_manager_certificate_map_entry" "subdomains_map_entr
 # Load balancers
 resource "google_compute_url_map" "orch_map" {
   name            = "${var.prefix}orch-map"
-  default_service = google_compute_backend_service.default["nomad"].self_link
+  default_service = google_compute_backend_service.default["session"].self_link
 
   host_rule {
     hosts        = concat(["api.${var.domain_name}"], [for d in var.additional_domains : "api.${d}"])
@@ -265,11 +261,6 @@ resource "google_compute_url_map" "orch_map" {
   }
 
   host_rule {
-    hosts        = concat(["consul.${var.domain_name}"], [for d in var.additional_domains : "consul.${d}"])
-    path_matcher = "consul-paths"
-  }
-
-  host_rule {
     hosts        = concat(["*.${var.domain_name}"], [for d in var.additional_domains : "*.${d}"])
     path_matcher = "session-paths"
   }
@@ -277,6 +268,15 @@ resource "google_compute_url_map" "orch_map" {
   path_matcher {
     name            = "api-paths"
     default_service = google_compute_backend_service.default["api"].self_link
+
+    dynamic "path_rule" {
+      for_each = length(var.additional_api_paths_handled_by_ingress) > 0 ? [{}] : []
+
+      content {
+        paths   = var.additional_api_paths_handled_by_ingress
+        service = google_compute_backend_service.ingress.self_link
+      }
+    }
 
     dynamic "path_rule" {
       for_each = var.additional_api_path_rules
@@ -312,11 +312,6 @@ resource "google_compute_url_map" "orch_map" {
         }
       }
     }
-  }
-
-  path_matcher {
-    name            = "consul-paths"
-    default_service = google_compute_backend_service.default["consul"].self_link
   }
 }
 
@@ -457,6 +452,7 @@ resource "google_compute_firewall" "default-hc" {
 
   dynamic "allow" {
     for_each = local.health_checked_backends
+
     content {
       protocol = "tcp"
       ports    = [allow.value["http_health_check"].port]
@@ -573,7 +569,7 @@ resource "google_compute_security_policy_rule" "api-throttling-api-key" {
     }
 
     rate_limit_threshold {
-      count        = 1200
+      count        = 1800
       interval_sec = 10
     }
   }
@@ -668,19 +664,6 @@ resource "google_compute_security_policy_rule" "sandbox-throttling-ip" {
   }
 
   description = "Requests to sandboxes from IP address"
-}
-
-resource "google_compute_security_policy_rule" "disable-consul" {
-  security_policy = google_compute_security_policy.default["consul"].name
-  action          = "deny(403)"
-  priority        = "1"
-  description     = "Disable all requests to Consul"
-  match {
-    versioned_expr = "SRC_IPS_V1"
-    config {
-      src_ip_ranges = ["*"]
-    }
-  }
 }
 
 resource "google_compute_security_policy" "disable-bots-log-collector" {

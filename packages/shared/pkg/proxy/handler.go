@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -12,7 +13,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/template"
 )
 
-func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Destination, error)) http.HandlerFunc {
+func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Destination, error), connLimitConfig *ConnectionLimitConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		d, err := getDestination(r)
@@ -28,6 +29,13 @@ func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Dest
 		if errors.Is(err, ErrInvalidHost) {
 			logger.L().Warn(ctx, "invalid host", zap.String("host", r.Host))
 			http.Error(w, "Invalid host", http.StatusBadRequest)
+
+			return
+		}
+
+		if errors.Is(err, ErrInvalidSandboxID) {
+			logger.L().Warn(ctx, "invalid sandbox ID", zap.String("host", r.Host))
+			http.Error(w, "Invalid sandbox ID", http.StatusBadRequest)
 
 			return
 		}
@@ -52,6 +60,44 @@ func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Dest
 			if err != nil {
 				logger.L().Error(ctx, "failed to handle sandbox not found error", zap.Error(err), logger.WithSandboxID(notFoundErr.SandboxId))
 				http.Error(w, "Failed to handle sandbox not found error", http.StatusInternalServerError)
+
+				return
+			}
+
+			return
+		}
+
+		var resumeDeniedErr *SandboxResumePermissionDeniedError
+		if errors.As(err, &resumeDeniedErr) {
+			logger.L().Warn(ctx, "sandbox resume permission denied",
+				zap.String("host", r.Host),
+				logger.WithSandboxID(resumeDeniedErr.SandboxId))
+
+			err := template.
+				NewSandboxResumePermissionDeniedError(resumeDeniedErr.SandboxId, r.Host).
+				HandleError(w, r)
+			if err != nil {
+				logger.L().Error(ctx, "failed to handle sandbox resume permission denied error", zap.Error(err), logger.WithSandboxID(resumeDeniedErr.SandboxId))
+				http.Error(w, "Failed to handle sandbox resume permission denied error", http.StatusInternalServerError)
+
+				return
+			}
+
+			return
+		}
+
+		var resourceExhaustedErr *SandboxResourceExhaustedError
+		if errors.As(err, &resourceExhaustedErr) {
+			logger.L().Warn(ctx, "team sandbox limit reached",
+				zap.String("host", r.Host),
+				logger.WithSandboxID(resourceExhaustedErr.SandboxId))
+
+			err := template.
+				NewTeamSandboxLimitError(resourceExhaustedErr.SandboxId, r.Host, resourceExhaustedErr.Message).
+				HandleError(w, r)
+			if err != nil {
+				logger.L().Error(ctx, "failed to handle team sandbox limit error", zap.Error(err), logger.WithSandboxID(resourceExhaustedErr.SandboxId))
+				http.Error(w, "Failed to handle team sandbox limit error", http.StatusInternalServerError)
 
 				return
 			}
@@ -98,6 +144,46 @@ func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Dest
 			http.Error(w, fmt.Sprintf("Unexpected error when routing request: %s", err), http.StatusInternalServerError)
 
 			return
+		}
+
+		// Connection limiting
+		if connLimitConfig != nil {
+			maxLimit := connLimitConfig.GetMaxLimit(ctx)
+			count, acquired := connLimitConfig.Limiter.TryAcquire(d.SandboxId, maxLimit)
+			if !acquired {
+				logger.L().Warn(ctx, "sandbox too many incoming connections",
+					zap.String("host", r.Host),
+					logger.WithSandboxID(d.SandboxId),
+					zap.Int("connection_limit", maxLimit))
+
+				if connLimitConfig.OnConnectionBlocked != nil {
+					connLimitConfig.OnConnectionBlocked(ctx)
+				}
+
+				err := template.
+					NewSandboxTooManyConnectionsError(d.SandboxId, r.Host, maxLimit).
+					HandleError(w, r)
+				if err != nil {
+					logger.L().Error(ctx, "failed to handle too many connections error", zap.Error(err), logger.WithSandboxID(d.SandboxId))
+					http.Error(w, "Failed to handle too many connections error", http.StatusInternalServerError)
+
+					return
+				}
+
+				return
+			}
+
+			start := time.Now()
+			defer func() {
+				connLimitConfig.Limiter.Release(d.SandboxId)
+				if connLimitConfig.OnConnectionReleased != nil {
+					connLimitConfig.OnConnectionReleased(ctx, time.Since(start).Milliseconds())
+				}
+			}()
+
+			if connLimitConfig.OnConnectionAcquired != nil {
+				connLimitConfig.OnConnectionAcquired(ctx, count)
+			}
 		}
 
 		d.RequestLogger.Debug(ctx, "proxying request")

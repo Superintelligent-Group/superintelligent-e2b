@@ -21,6 +21,7 @@ import (
 )
 
 func TestSandboxProxyWorkingPort(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -37,8 +38,8 @@ func TestSandboxProxyWorkingPort(t *testing.T) {
 			Args: []string{"-m", "http.server", fmt.Sprintf("%d", port)},
 		},
 	})
-	setup.SetSandboxHeader(serverReq.Header(), sbx.SandboxID)
-	setup.SetUserHeader(serverReq.Header(), "user")
+	setup.SetSandboxHeader(t, serverReq.Header(), sbx.SandboxID)
+	setup.SetUserHeader(t, serverReq.Header(), "user")
 	serverStream, err := envdClient.ProcessClient.Start(serverCtx, serverReq)
 	require.NoError(t, err)
 	defer func() {
@@ -66,6 +67,7 @@ func TestSandboxProxyWorkingPort(t *testing.T) {
 }
 
 func TestSandboxProxyClosedPort(t *testing.T) {
+	t.Parallel()
 	c := setup.GetAPIClient()
 	sbx := utils.SetupSandboxWithCleanup(t, c)
 

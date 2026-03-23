@@ -7,14 +7,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	"github.com/e2b-dev/infra/packages/api/internal/auth"
-	"github.com/e2b-dev/infra/packages/api/internal/db/types"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	featureflags "github.com/e2b-dev/infra/packages/shared/pkg/feature-flags"
+	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
+	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
@@ -24,13 +25,23 @@ const maxSandboxMetricsCount = 100
 func (a *APIStore) getSandboxesMetrics(
 	ctx context.Context,
 	teamID uuid.UUID,
+	clusterID uuid.UUID,
 	sandboxIDs []string,
-) (map[string]api.SandboxMetric, error) {
+) (map[string]api.SandboxMetric, *api.APIError) {
 	ctx, span := tracer.Start(ctx, "fetch-sandboxes-metrics")
 	defer span.End()
 
 	for i, id := range sandboxIDs {
-		sandboxIDs[i] = utils.ShortID(id)
+		short, err := utils.ShortID(id)
+		if err != nil {
+			return nil, &api.APIError{
+				Code:      http.StatusBadRequest,
+				ClientMsg: "Invalid sandbox ID",
+				Err:       err,
+			}
+		}
+
+		sandboxIDs[i] = short
 	}
 
 	telemetry.SetAttributes(ctx,
@@ -38,12 +49,8 @@ func (a *APIStore) getSandboxesMetrics(
 		attribute.Int("sandboxes.count", len(sandboxIDs)),
 	)
 
-	metricsReadFlag, err := a.featureFlags.BoolFlag(ctx, featureflags.MetricsReadFlagName)
-	if err != nil {
-		logger.L().Error(ctx, "error getting metrics read feature flag, soft failing", zap.Error(err))
-	}
-
 	// Get metrics for all sandboxes
+	metricsReadFlag := a.featureFlags.BoolFlag(ctx, featureflags.MetricsReadFlag)
 	if !metricsReadFlag {
 		logger.L().Debug(ctx, "sandbox metrics read feature flag is disabled")
 		// If we are not reading from ClickHouse, we can return an empty map
@@ -51,38 +58,28 @@ func (a *APIStore) getSandboxesMetrics(
 		return make(map[string]api.SandboxMetric), nil
 	}
 
-	metrics, err := a.clickhouseStore.QueryLatestMetrics(ctx, sandboxIDs, teamID.String())
-	if err != nil {
-		logger.L().Error(ctx, "Error fetching sandbox metrics from ClickHouse",
-			logger.WithTeamID(teamID.String()),
-			zap.Error(err),
-		)
-
-		return nil, fmt.Errorf("error querying metrics: %w", err)
-	}
-
-	apiMetrics := make(map[string]api.SandboxMetric)
-	for _, m := range metrics {
-		apiMetrics[m.SandboxID] = api.SandboxMetric{
-			Timestamp:     m.Timestamp,
-			TimestampUnix: m.Timestamp.Unix(),
-			CpuUsedPct:    float32(m.CPUUsedPercent),
-			CpuCount:      int32(m.CPUCount),
-			MemTotal:      int64(m.MemTotal),
-			MemUsed:       int64(m.MemUsed),
-			DiskTotal:     int64(m.DiskTotal),
-			DiskUsed:      int64(m.DiskUsed),
+	cluster, found := a.clusters.GetClusterById(clusterID)
+	if !found {
+		return nil, &api.APIError{
+			Code:      http.StatusInternalServerError,
+			ClientMsg: "cluster not found for sandbox metrics",
+			Err:       fmt.Errorf("cluster not found for sandbox metrics, cluster id: %s", clusterID.String()),
 		}
 	}
 
-	return apiMetrics, nil
+	metrics, apiErr := cluster.GetResources().GetSandboxesMetrics(ctx, teamID.String(), sandboxIDs)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	return metrics, nil
 }
 
 func (a *APIStore) GetSandboxesMetrics(c *gin.Context, params api.GetSandboxesMetricsParams) {
 	ctx := c.Request.Context()
 	telemetry.ReportEvent(ctx, "list running instances with metrics")
 
-	team := c.Value(auth.TeamContextKey).(*types.Team)
+	team := auth.MustGetTeamInfo(c)
 
 	if len(params.SandboxIds) > maxSandboxMetricsCount {
 		logger.L().Error(ctx, "Too many sandboxes requested", zap.Int("requested_count", len(params.SandboxIds)), zap.Int("max_count", maxSandboxMetricsCount), logger.WithTeamID(team.ID.String()))
@@ -96,10 +93,18 @@ func (a *APIStore) GetSandboxesMetrics(c *gin.Context, params api.GetSandboxesMe
 	properties := a.posthog.GetPackageToPosthogProperties(&c.Request.Header)
 	a.posthog.CreateAnalyticsTeamEvent(ctx, team.ID.String(), "listed running instances with metrics", properties)
 
-	sandboxesWithMetrics, err := a.getSandboxesMetrics(ctx, team.ID, params.SandboxIds)
-	if err != nil {
-		telemetry.ReportCriticalError(ctx, "error fetching metrics for sandboxes", err)
-		a.sendAPIStoreError(c, http.StatusInternalServerError, fmt.Sprintf("Error returning metrics for sandboxes for team '%s'", team.ID))
+	// Build the context for feature flags
+	ctx = featureflags.AddToContext(
+		ctx,
+		ldcontext.NewBuilder(team.ID.String()).
+			Kind(featureflags.TeamKind).
+			Build(),
+	)
+
+	sandboxesWithMetrics, apiErr := a.getSandboxesMetrics(ctx, team.ID, clusters.WithClusterFallback(team.ClusterID), params.SandboxIds)
+	if apiErr != nil {
+		telemetry.ReportCriticalError(ctx, "error fetching sandboxes metrics", apiErr.Err)
+		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
 		return
 	}

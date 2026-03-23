@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGetTargetFromRequest(t *testing.T) {
+func TestGetTargetFromRequest(t *testing.T) { //nolint:tparallel // cannot call t.Setenv with t.Parallel
 	t.Setenv("ENVIRONMENT", "local")
 
 	getTargetFromRequest := GetTargetFromRequest(true)
@@ -109,6 +109,24 @@ func TestGetTargetFromRequest(t *testing.T) {
 			wantPort: 8080,
 		},
 		{
+			name: "headers: invalid sandbox id with colon",
+			host: "localhost:1234",
+			headers: http.Header{
+				headerSandboxID:   []string{"sbx:123"},
+				headerSandboxPort: []string{"8080"},
+			},
+			wantErrIs: ErrInvalidSandboxID,
+		},
+		{
+			name: "headers: invalid sandbox id with uppercase",
+			host: "localhost:1234",
+			headers: http.Header{
+				headerSandboxID:   []string{"SBX_UPPER"},
+				headerSandboxPort: []string{"8080"},
+			},
+			wantErrIs: ErrInvalidSandboxID,
+		},
+		{
 			name: "headers: missing sandbox id",
 			host: "localhost:1234",
 			headers: http.Header{
@@ -128,6 +146,7 @@ func TestGetTargetFromRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			req := &http.Request{
 				Host:   tt.host,
 				Header: tt.headers,

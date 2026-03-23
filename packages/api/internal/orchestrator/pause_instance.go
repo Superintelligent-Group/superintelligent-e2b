@@ -7,13 +7,14 @@ import (
 	"time"
 
 	"github.com/gogo/status"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"google.golang.org/grpc/codes"
 
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
-	"github.com/e2b-dev/infra/packages/db/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -26,45 +27,18 @@ func (PauseQueueExhaustedError) Error() string {
 	return "The pause queue is exhausted"
 }
 
-func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node, sbx sandbox.Sandbox) (err error) {
+func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node, sbx sandbox.Sandbox) error {
 	ctx, span := tracer.Start(ctx, "pause-sandbox")
 	defer span.End()
 
-	snapshotConfig := queries.UpsertSnapshotParams{
-		// Used if there's no snapshot for this sandbox yet
-		TemplateID:     id.Generate(),
-		TeamID:         sbx.TeamID,
-		BaseTemplateID: sbx.BaseTemplateID,
-		SandboxID:      sbx.SandboxID,
-		StartedAt:      pgtype.Timestamptz{Time: sbx.StartTime, Valid: true},
-		Vcpu:           sbx.VCpu,
-		RamMb:          sbx.RamMB,
-		// We don't know this information
-		FreeDiskSizeMb:      0,
-		TotalDiskSizeMb:     &sbx.TotalDiskSizeMB,
-		Metadata:            sbx.Metadata,
-		KernelVersion:       sbx.KernelVersion,
-		FirecrackerVersion:  sbx.FirecrackerVersion,
-		EnvdVersion:         &sbx.EnvdVersion,
-		Secure:              sbx.EnvdAccessToken != nil,
-		AllowInternetAccess: sbx.AllowInternetAccess,
-		AutoPause:           sbx.AutoPause,
-		Config: &types.PausedSandboxConfig{
-			Version: types.PausedSandboxConfigVersion,
-			Network: sbx.Network,
-		},
-		OriginNodeID: utils.ToPtr(node.ID),
-		Status:       string(types.BuildStatusSnapshotting),
-	}
-
-	result, err := o.sqlcDB.UpsertSnapshot(ctx, snapshotConfig)
+	result, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node))
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error inserting snapshot for env", err)
 
 		return err
 	}
 
-	err = snapshotInstance(ctx, o, node, sbx, result.TemplateID, result.BuildID.String())
+	err = snapshotInstance(ctx, node, sbx, result.TemplateID, result.BuildID.String())
 	if errors.Is(err, PauseQueueExhaustedError{}) {
 		telemetry.ReportCriticalError(ctx, "pause queue exhausted", err)
 
@@ -79,11 +53,10 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node,
 
 	now := time.Now()
 	err = o.sqlcDB.UpdateEnvBuildStatus(ctx, queries.UpdateEnvBuildStatusParams{
-		Status:     string(types.BuildStatusSuccess),
+		Status:     types.BuildStatusSuccess,
 		FinishedAt: &now,
 		Reason:     types.BuildReason{},
 		BuildID:    result.BuildID,
-		TemplateID: result.TemplateID,
 	})
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error pausing sandbox", err)
@@ -91,21 +64,18 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node,
 		return fmt.Errorf("error pausing sandbox: %w", err)
 	}
 
+	o.snapshotCache.Invalidate(context.WithoutCancel(ctx), sbx.SandboxID)
+
 	return nil
 }
 
-func snapshotInstance(ctx context.Context, orch *Orchestrator, node *nodemanager.Node, sbx sandbox.Sandbox, templateID, buildID string) error {
+func snapshotInstance(ctx context.Context, node *nodemanager.Node, sbx sandbox.Sandbox, templateID, buildID string) error {
 	childCtx, childSpan := tracer.Start(ctx, "snapshot-instance")
 	defer childSpan.End()
 
-	client, childCtx, err := orch.GetClient(childCtx, sbx.ClusterID, sbx.NodeID)
-	if err != nil {
-		return fmt.Errorf("failed to get client '%s': %w", sbx.NodeID, err)
-	}
-
-	_, err = client.Sandbox.Pause(
-		node.GetSandboxDeleteCtx(childCtx, sbx.SandboxID, sbx.ExecutionID),
-		&orchestrator.SandboxPauseRequest{
+	client, childCtx := node.GetSandboxDeleteCtx(childCtx, sbx.SandboxID, sbx.ExecutionID)
+	_, err := client.Sandbox.Pause(
+		childCtx, &orchestrator.SandboxPauseRequest{
 			SandboxId:  sbx.SandboxID,
 			TemplateId: templateID,
 			BuildId:    buildID,
@@ -130,6 +100,59 @@ func snapshotInstance(ctx context.Context, orch *Orchestrator, node *nodemanager
 	return fmt.Errorf("failed to pause sandbox '%s': %w", sbx.SandboxID, err)
 }
 
-func (o *Orchestrator) WaitForStateChange(ctx context.Context, sandboxID string) error {
-	return o.sandboxStore.WaitForStateChange(ctx, sandboxID)
+func (o *Orchestrator) WaitForStateChange(ctx context.Context, teamID uuid.UUID, sandboxID string) error {
+	return o.sandboxStore.WaitForStateChange(ctx, teamID, sandboxID)
+}
+
+func buildUpsertSnapshotParams(sbx sandbox.Sandbox, node *nodemanager.Node) queries.UpsertSnapshotParams {
+	machineInfo := node.MachineInfo()
+
+	metadata := types.JSONBStringMap(sbx.Metadata)
+	if metadata == nil {
+		metadata = types.JSONBStringMap{}
+	}
+
+	return queries.UpsertSnapshotParams{
+		// Used if there's no snapshot for this sandbox yet
+		TemplateID:     id.Generate(),
+		TeamID:         sbx.TeamID,
+		BaseTemplateID: sbx.BaseTemplateID,
+		SandboxID:      sbx.SandboxID,
+		StartedAt:      pgtype.Timestamptz{Time: sbx.StartTime, Valid: true},
+		Vcpu:           sbx.VCpu,
+		RamMb:          sbx.RamMB,
+		// We don't know this information
+		FreeDiskSizeMb:      0,
+		TotalDiskSizeMb:     &sbx.TotalDiskSizeMB,
+		Metadata:            metadata,
+		KernelVersion:       sbx.KernelVersion,
+		FirecrackerVersion:  sbx.FirecrackerVersion,
+		EnvdVersion:         &sbx.EnvdVersion,
+		Secure:              sbx.EnvdAccessToken != nil,
+		AllowInternetAccess: sbx.AllowInternetAccess,
+		AutoPause:           sbx.AutoPause,
+		Config: &types.PausedSandboxConfig{
+			Version:      types.PausedSandboxConfigVersion,
+			Network:      sbx.Network,
+			AutoResume:   sbx.AutoResume,
+			VolumeMounts: sbx.VolumeMounts,
+		},
+		OriginNodeID:    node.ID,
+		Status:          types.BuildStatusSnapshotting,
+		CpuArchitecture: utils.ToPtr(machineInfo.CPUArchitecture),
+		CpuFamily:       utils.ToPtr(machineInfo.CPUFamily),
+		CpuModel:        utils.ToPtr(machineInfo.CPUModel),
+		CpuModelName:    utils.ToPtr(machineInfo.CPUModelName),
+		CpuFlags:        machineInfo.CPUFlags,
+	}
+}
+
+// throttledUpsertSnapshot runs UpsertSnapshot gated by the snapshot upsert semaphore.
+func (o *Orchestrator) throttledUpsertSnapshot(ctx context.Context, params queries.UpsertSnapshotParams) (queries.UpsertSnapshotRow, error) {
+	if err := o.snapshotUpsertSem.Acquire(ctx, 1); err != nil {
+		return queries.UpsertSnapshotRow{}, err
+	}
+	defer o.snapshotUpsertSem.Release(1)
+
+	return o.sqlcDB.UpsertSnapshot(ctx, params)
 }

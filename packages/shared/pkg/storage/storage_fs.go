@@ -1,79 +1,108 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
-type FileSystemStorageProvider struct {
-	basePath string
-	opened   map[string]*os.File
+type fsStorage struct {
+	basePath  string
+	uploadURL string // base URL for local upload endpoint (e.g. "http://localhost:5008")
+	hmacKey   []byte // HMAC key for signing upload tokens
 }
 
-var _ StorageProvider = (*FileSystemStorageProvider)(nil)
+var _ StorageProvider = (*fsStorage)(nil)
 
-type FileSystemStorageObjectProvider struct {
+type fsObject struct {
 	path string
 }
 
 var (
-	_ SeekableObjectProvider = (*FileSystemStorageObjectProvider)(nil)
-	_ ObjectProvider         = (*FileSystemStorageObjectProvider)(nil)
+	_ Seekable        = (*fsObject)(nil)
+	_ Blob            = (*fsObject)(nil)
+	_ StreamingReader = (*fsObject)(nil)
 )
 
-func NewFileSystemStorageProvider(basePath string) (*FileSystemStorageProvider, error) {
-	return &FileSystemStorageProvider{
-		basePath: basePath,
-		opened:   make(map[string]*os.File),
-	}, nil
+type fsRangeReadCloser struct {
+	io.Reader
+
+	file *os.File
 }
 
-func (fs *FileSystemStorageProvider) DeleteObjectsWithPrefix(_ context.Context, prefix string) error {
-	filePath := fs.getPath(prefix)
+func (r *fsRangeReadCloser) Close() error {
+	return r.file.Close()
+}
+
+func newFileSystemStorage(cfg StorageConfig) *fsStorage {
+	return &fsStorage{
+		basePath:  cfg.GetLocalBasePath(),
+		uploadURL: cfg.uploadBaseURL,
+		hmacKey:   cfg.hmacKey,
+	}
+}
+
+func (s *fsStorage) DeleteObjectsWithPrefix(_ context.Context, prefix string) error {
+	filePath := s.getPath(prefix)
 
 	return os.RemoveAll(filePath)
 }
 
-func (fs *FileSystemStorageProvider) GetDetails() string {
-	return fmt.Sprintf("[Local file storage, base path set to %s]", fs.basePath)
+func (s *fsStorage) GetDetails() string {
+	return fmt.Sprintf("[Local file storage, base path set to %s]", s.basePath)
 }
 
-func (fs *FileSystemStorageProvider) UploadSignedURL(_ context.Context, _ string, _ time.Duration) (string, error) {
-	return "", fmt.Errorf("file system storage does not support signed URLs")
+func (s *fsStorage) UploadSignedURL(_ context.Context, path string, ttl time.Duration) (string, error) {
+	if s.uploadURL == "" || s.hmacKey == nil {
+		return "", fmt.Errorf("file system storage does not support signed URLs (no local upload endpoint configured)")
+	}
+
+	expires := time.Now().Add(ttl).Unix()
+	token := ComputeUploadHMAC(s.hmacKey, path, expires)
+
+	u := fmt.Sprintf("%s/upload?path=%s&expires=%d&token=%s",
+		s.uploadURL, url.QueryEscape(path), expires, url.QueryEscape(token))
+
+	return u, nil
 }
 
-func (fs *FileSystemStorageProvider) OpenSeekableObject(_ context.Context, path string, _ SeekableObjectType) (SeekableObjectProvider, error) {
-	dir := filepath.Dir(fs.getPath(path))
+func (s *fsStorage) OpenSeekable(_ context.Context, path string, _ SeekableObjectType) (Seekable, error) {
+	dir := filepath.Dir(s.getPath(path))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
-	return &FileSystemStorageObjectProvider{
-		path: fs.getPath(path),
+	return &fsObject{
+		path: s.getPath(path),
 	}, nil
 }
 
-func (fs *FileSystemStorageProvider) OpenObject(_ context.Context, path string, _ ObjectType) (ObjectProvider, error) {
-	dir := filepath.Dir(fs.getPath(path))
+func (s *fsStorage) OpenBlob(_ context.Context, path string, _ ObjectType) (Blob, error) {
+	dir := filepath.Dir(s.getPath(path))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
-	return &FileSystemStorageObjectProvider{
-		path: fs.getPath(path),
+	return &fsObject{
+		path: s.getPath(path),
 	}, nil
 }
 
-func (fs *FileSystemStorageProvider) getPath(path string) string {
-	return filepath.Join(fs.basePath, path)
+func (s *fsStorage) getPath(path string) string {
+	return filepath.Join(s.basePath, path)
 }
 
-func (f *FileSystemStorageObjectProvider) WriteTo(_ context.Context, dst io.Writer) (int64, error) {
-	handle, err := f.getHandle(true)
+func (o *fsObject) WriteTo(_ context.Context, dst io.Writer) (int64, error) {
+	handle, err := o.getHandle(true)
 	if err != nil {
 		return 0, err
 	}
@@ -83,20 +112,32 @@ func (f *FileSystemStorageObjectProvider) WriteTo(_ context.Context, dst io.Writ
 	return io.Copy(dst, handle)
 }
 
-func (f *FileSystemStorageObjectProvider) WriteFromFileSystem(_ context.Context, path string) error {
-	handle, err := f.getHandle(false)
+func (o *fsObject) Put(_ context.Context, data []byte) error {
+	handle, err := o.getHandle(false)
 	if err != nil {
 		return err
 	}
 	defer handle.Close()
 
-	src, err := os.Open(path)
+	_, err = io.Copy(handle, bytes.NewReader(data))
+
+	return err
+}
+
+func (o *fsObject) StoreFile(_ context.Context, path string) error {
+	r, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %w", path, err)
+	}
+	defer r.Close()
+
+	handle, err := o.getHandle(false)
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer handle.Close()
 
-	_, err = io.Copy(handle, src)
+	_, err = io.Copy(handle, r)
 	if err != nil {
 		return err
 	}
@@ -104,20 +145,20 @@ func (f *FileSystemStorageObjectProvider) WriteFromFileSystem(_ context.Context,
 	return nil
 }
 
-func (f *FileSystemStorageObjectProvider) Write(_ context.Context, data []byte) (int, error) {
-	handle, err := f.getHandle(false)
+func (o *fsObject) OpenRangeReader(_ context.Context, off, length int64) (io.ReadCloser, error) {
+	f, err := o.getHandle(true)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	defer handle.Close()
 
-	count, err := handle.Write(data)
-
-	return count, err
+	return &fsRangeReadCloser{
+		Reader: io.NewSectionReader(f, off, length),
+		file:   f,
+	}, nil
 }
 
-func (f *FileSystemStorageObjectProvider) ReadAt(_ context.Context, buff []byte, off int64) (n int, err error) {
-	handle, err := f.getHandle(true)
+func (o *fsObject) ReadAt(_ context.Context, buff []byte, off int64) (n int, err error) {
+	handle, err := o.getHandle(true)
 	if err != nil {
 		return 0, err
 	}
@@ -126,8 +167,8 @@ func (f *FileSystemStorageObjectProvider) ReadAt(_ context.Context, buff []byte,
 	return handle.ReadAt(buff, off)
 }
 
-func (f *FileSystemStorageObjectProvider) Exists(_ context.Context) (bool, error) {
-	_, err := os.Stat(f.path)
+func (o *fsObject) Exists(_ context.Context) (bool, error) {
+	_, err := os.Stat(o.path)
 	if os.IsNotExist(err) {
 		return false, nil
 	}
@@ -135,8 +176,8 @@ func (f *FileSystemStorageObjectProvider) Exists(_ context.Context) (bool, error
 	return err == nil, err
 }
 
-func (f *FileSystemStorageObjectProvider) Size(_ context.Context) (int64, error) {
-	handle, err := f.getHandle(true)
+func (o *fsObject) Size(_ context.Context) (int64, error) {
+	handle, err := o.getHandle(true)
 	if err != nil {
 		return 0, err
 	}
@@ -150,13 +191,34 @@ func (f *FileSystemStorageObjectProvider) Size(_ context.Context) (int64, error)
 	return fileInfo.Size(), nil
 }
 
-func (f *FileSystemStorageObjectProvider) Delete(_ context.Context) error {
-	return os.Remove(f.path)
+func (o *fsObject) Delete(_ context.Context) error {
+	return os.Remove(o.path)
 }
 
-func (f *FileSystemStorageObjectProvider) getHandle(checkExistence bool) (*os.File, error) {
+func ComputeUploadHMAC(key []byte, path string, expires int64) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(path))
+	mac.Write([]byte{0}) // delimiter to prevent path/expires boundary ambiguity
+	mac.Write([]byte(strconv.FormatInt(expires, 10)))
+
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// ValidateUploadToken validates an HMAC token for a local upload URL.
+// Exported so that the upload handler in the orchestrator can use it.
+func ValidateUploadToken(key []byte, path string, expires int64, token string) bool {
+	if time.Now().Unix() > expires {
+		return false
+	}
+
+	expected := ComputeUploadHMAC(key, path, expires)
+
+	return hmac.Equal([]byte(expected), []byte(token))
+}
+
+func (o *fsObject) getHandle(checkExistence bool) (*os.File, error) {
 	if checkExistence {
-		info, err := os.Stat(f.path)
+		info, err := os.Stat(o.path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil, ErrObjectNotExist
@@ -166,11 +228,11 @@ func (f *FileSystemStorageObjectProvider) getHandle(checkExistence bool) (*os.Fi
 		}
 
 		if info.IsDir() {
-			return nil, fmt.Errorf("path %s is a directory", f.path)
+			return nil, fmt.Errorf("path %s is a directory", o.path)
 		}
 	}
 
-	handle, err := os.OpenFile(f.path, os.O_RDWR|os.O_CREATE, 0o644)
+	handle, err := os.OpenFile(o.path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}

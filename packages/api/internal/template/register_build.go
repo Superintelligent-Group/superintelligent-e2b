@@ -11,12 +11,12 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
-	"github.com/e2b-dev/infra/packages/api/internal/db/types"
 	"github.com/e2b-dev/infra/packages/api/internal/team"
+	"github.com/e2b-dev/infra/packages/auth/pkg/types"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
-	"github.com/e2b-dev/infra/packages/db/dberrors"
+	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
+	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
-	dbtypes "github.com/e2b-dev/infra/packages/db/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -33,6 +33,7 @@ type RegisterBuildData struct {
 	Team               *types.Team
 	Dockerfile         string
 	Alias              *string
+	Tags               []string
 	StartCmd           *string
 	ReadyCmd           *string
 	CpuCount           *int32
@@ -46,27 +47,42 @@ type RegisterBuildResponse struct {
 	TemplateID string
 	BuildID    string
 	Aliases    []string
+	Names      []string
+	Tags       []string
 }
 
 func RegisterBuild(
 	ctx context.Context,
-	templateBuildsCache *templatecache.TemplatesBuildCache,
+	templateCache *templatecache.TemplateCache,
 	db *sqlcdb.Client,
 	data RegisterBuildData,
 ) (*RegisterBuildResponse, *api.APIError) {
 	ctx, span := tracer.Start(ctx, "register build")
 	defer span.End()
 
-	// Limit concurrent template builds
-	teamBuilds := templateBuildsCache.GetRunningBuildsForTeam(data.Team.ID)
+	// Add default tag if no tags are present
+	tags := data.Tags
+	if len(tags) == 0 {
+		tags = []string{id.DefaultTag}
+	}
 
-	// Exclude the current build if it's a rebuild (it will be cancelled)
-	teamBuildsExcludingCurrent := gutils.Filter(teamBuilds, func(item templatecache.TemplateBuildInfo) bool {
-		return item.TemplateID != data.TemplateID
+	// This is a simple implementation of concurrency limit
+	// It does not guarantee that the limit is not exceeded, but it should be good enough for now (considering overall low number of total builds)
+	otherBuildCount, err := db.GetInProgressTemplateBuildsByTeam(ctx, queries.GetInProgressTemplateBuildsByTeamParams{
+		TeamID:            data.Team.ID,
+		ExcludeTemplateID: data.TemplateID,
+		ExcludeTags:       tags,
 	})
+	if err != nil {
+		return nil, &api.APIError{
+			Err:       err,
+			ClientMsg: fmt.Sprintf("Error when checking concurrent builds: %s", err),
+			Code:      http.StatusInternalServerError,
+		}
+	}
 
 	totalConcurrentTemplateBuilds := data.Team.Limits.BuildConcurrency
-	if len(teamBuildsExcludingCurrent) >= int(totalConcurrentTemplateBuilds) {
+	if otherBuildCount >= totalConcurrentTemplateBuilds {
 		telemetry.ReportError(ctx, "team has reached max concurrent template builds", nil, telemetry.WithTeamID(data.Team.ID.String()), attribute.Int64("total.concurrent_template_builds", totalConcurrentTemplateBuilds))
 
 		return nil, &api.APIError{
@@ -103,6 +119,9 @@ func RegisterBuild(
 	if data.Alias != nil {
 		telemetry.SetAttributes(ctx, attribute.String("env.alias", *data.Alias))
 	}
+	if len(tags) > 0 {
+		telemetry.SetAttributes(ctx, attribute.StringSlice("env.tags", tags))
+	}
 	if data.StartCmd != nil {
 		telemetry.SetAttributes(ctx, attribute.String("env.start_cmd", *data.StartCmd))
 	}
@@ -124,20 +143,6 @@ func RegisterBuild(
 		telemetry.ReportCriticalError(ctx, "error when getting CPU and RAM", apiError.Err)
 
 		return nil, apiError
-	}
-
-	var alias string
-	if data.Alias != nil {
-		alias, err = id.CleanTemplateID(*data.Alias)
-		if err != nil {
-			telemetry.ReportCriticalError(ctx, "invalid alias", err)
-
-			return nil, &api.APIError{
-				Err:       err,
-				ClientMsg: fmt.Sprintf("Invalid alias: %s", *data.Alias),
-				Code:      http.StatusBadRequest,
-			}
-		}
 	}
 
 	// Start a transaction to prevent partial updates
@@ -176,15 +181,16 @@ func RegisterBuild(
 	}
 	telemetry.ReportEvent(ctx, "created or update template")
 
-	// Mark the previous not started builds as failed
+	// Mark the previous not started builds as failed and remove their active-build rows
 	err = client.InvalidateUnstartedTemplateBuilds(ctx, queries.InvalidateUnstartedTemplateBuildsParams{
 		Reason: dbtypes.BuildReason{
 			Message: "The build was canceled because it was superseded by a newer one.",
 		},
 		TemplateID: data.TemplateID,
+		Tags:       tags,
 	})
 	if err != nil {
-		telemetry.ReportCriticalError(ctx, "error when updating env", err)
+		telemetry.ReportCriticalError(ctx, "error when invalidating unstarted builds", err, attribute.StringSlice("tags", tags))
 
 		return nil, &api.APIError{
 			Err:       err,
@@ -195,9 +201,10 @@ func RegisterBuild(
 	telemetry.ReportEvent(ctx, "marked previous builds as failed")
 
 	// Insert the new build
+	// TODO(ENG-3469): Switch to dbtypes.BuildStatusPending once all consumers are migrated.
 	err = client.CreateTemplateBuild(ctx, queries.CreateTemplateBuildParams{
 		BuildID:            buildID,
-		TemplateID:         data.TemplateID,
+		Status:             dbtypes.BuildStatusWaiting,
 		RamMb:              ramMB,
 		Vcpu:               cpuCount,
 		KernelVersion:      data.KernelVersion,
@@ -220,7 +227,14 @@ func RegisterBuild(
 	telemetry.ReportEvent(ctx, "inserted new build")
 
 	// Check if the alias is available and claim it
-	if alias != "" {
+	var aliases, names []string
+	if data.Alias != nil {
+		// Extract just the alias portion (without namespace) for storage
+		// The identifier may be "namespace/alias" or just "alias"
+		alias := id.ExtractAlias(*data.Alias)
+		aliases = append(aliases, alias)
+		names = append(names, id.WithNamespace(data.Team.Slug, alias))
+
 		exists, err := client.CheckAliasConflictsWithTemplateID(ctx, alias)
 		if err != nil {
 			telemetry.ReportCriticalError(ctx, "error when checking alias", err, attribute.String("alias", alias))
@@ -244,7 +258,10 @@ func RegisterBuild(
 			}
 		}
 
-		aliasDB, err := client.CheckAliasExists(ctx, alias)
+		aliasDB, err := client.CheckAliasExistsInNamespace(ctx, queries.CheckAliasExistsInNamespaceParams{
+			Alias:     alias,
+			Namespace: &data.Team.Slug,
+		})
 		if err != nil {
 			if !dberrors.IsNotFoundError(err) {
 				telemetry.ReportCriticalError(ctx, "error when checking alias", err, attribute.String("alias", alias))
@@ -256,7 +273,7 @@ func RegisterBuild(
 				}
 			}
 
-			aliases, err := client.DeleteOtherTemplateAliases(ctx, data.TemplateID)
+			aliasKeys, err := client.DeleteOtherTemplateAliases(ctx, data.TemplateID)
 			if err != nil {
 				telemetry.ReportCriticalError(ctx, "error when deleting template alias", err, attribute.String("alias", alias))
 
@@ -267,15 +284,16 @@ func RegisterBuild(
 				}
 			}
 
-			count := len(aliases)
-			if count > 0 {
-				telemetry.ReportEvent(ctx, "deleted old aliases", attribute.Int("env.alias.count", count))
+			templateCache.InvalidateAliasesByTemplateID(context.WithoutCancel(ctx), data.TemplateID, aliasKeys)
+			for _, key := range aliasKeys {
+				telemetry.ReportEvent(ctx, "deleted old alias", attribute.String("env.alias", key))
 			}
 
 			err = client.
 				CreateTemplateAlias(ctx, queries.CreateTemplateAliasParams{
 					Alias:      alias,
 					TemplateID: data.TemplateID,
+					Namespace:  &data.Team.Slug,
 				})
 			if err != nil {
 				telemetry.ReportCriticalError(ctx, "error when inserting alias", err, attribute.String("alias", alias))
@@ -286,6 +304,10 @@ func RegisterBuild(
 					Code:      http.StatusInternalServerError,
 				}
 			}
+
+			// Invalidate any cached tombstone for this alias
+			templateCache.InvalidateAlias(context.WithoutCancel(ctx), &data.Team.Slug, alias)
+
 			telemetry.ReportEvent(ctx, "created new alias", attribute.String("env.alias", alias))
 		} else if aliasDB.EnvID != data.TemplateID {
 			err := fmt.Errorf("alias '%s' already used", alias)
@@ -299,6 +321,39 @@ func RegisterBuild(
 		}
 
 		telemetry.ReportEvent(ctx, "inserted alias", attribute.String("env.alias", alias))
+	}
+
+	for _, tag := range tags {
+		err = client.CreateTemplateBuildAssignment(ctx, queries.CreateTemplateBuildAssignmentParams{
+			TemplateID: data.TemplateID,
+			BuildID:    buildID,
+			Tag:        tag,
+		})
+		if err != nil {
+			telemetry.ReportCriticalError(ctx, "error when adding tag to build", err, attribute.String("tag", tag))
+
+			return nil, &api.APIError{
+				Err:       err,
+				ClientMsg: fmt.Sprintf("Error when adding tag '%s' to build: %s", tag, err),
+				Code:      http.StatusInternalServerError,
+			}
+		}
+	}
+
+	err = client.CreateActiveTemplateBuild(ctx, queries.CreateActiveTemplateBuildParams{
+		BuildID:    buildID,
+		TeamID:     data.Team.ID,
+		TemplateID: data.TemplateID,
+		Tags:       tags,
+	})
+	if err != nil {
+		telemetry.ReportCriticalError(ctx, "error when inserting active build", err)
+
+		return nil, &api.APIError{
+			Err:       err,
+			ClientMsg: fmt.Sprintf("Error when updating active builds: %s", err),
+			Code:      http.StatusInternalServerError,
+		}
 	}
 
 	// Commit the transaction
@@ -315,16 +370,10 @@ func RegisterBuild(
 	telemetry.ReportEvent(ctx, "committed transaction")
 
 	telemetry.SetAttributes(ctx,
-		attribute.String("env.alias", alias),
 		attribute.Int64("build.cpu_count", cpuCount),
 		attribute.Int64("build.ram_mb", ramMB),
 	)
 	telemetry.ReportEvent(ctx, "started updating environment")
-
-	var aliases []string
-	if alias != "" {
-		aliases = append(aliases, alias)
-	}
 
 	logger.L().Info(ctx, "template build requested", logger.WithTemplateID(data.TemplateID), logger.WithBuildID(buildID.String()))
 
@@ -332,5 +381,7 @@ func RegisterBuild(
 		TemplateID: data.TemplateID,
 		BuildID:    buildID.String(),
 		Aliases:    aliases,
+		Names:      names,
+		Tags:       tags,
 	}, nil
 }

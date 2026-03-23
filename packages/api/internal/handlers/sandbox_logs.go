@@ -4,93 +4,120 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	"github.com/e2b-dev/infra/packages/api/internal/auth"
-	"github.com/e2b-dev/infra/packages/api/internal/db/types"
+	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	apiedge "github.com/e2b-dev/infra/packages/shared/pkg/http/edge"
+	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
+	"github.com/e2b-dev/infra/packages/auth/pkg/types"
+	clustersshared "github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logs"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 func (a *APIStore) GetSandboxesSandboxIDLogs(c *gin.Context, sandboxID string, params api.GetSandboxesSandboxIDLogsParams) {
 	ctx := c.Request.Context()
-	sandboxID = utils.ShortID(sandboxID)
 
-	team := c.Value(auth.TeamContextKey).(*types.Team)
+	var err error
+	sandboxID, err = utils.ShortID(sandboxID)
+	if err != nil {
+		a.sendAPIStoreError(c, http.StatusBadRequest, "Invalid sandbox ID")
+
+		return
+	}
+
+	team := auth.MustGetTeamInfo(c)
 
 	telemetry.SetAttributes(ctx,
 		attribute.String("instance.id", sandboxID),
 		telemetry.WithTeamID(team.ID.String()),
 	)
 
-	// Sandboxes living in a cluster
-	sbxLogs, err := a.getClusterSandboxLogs(ctx, sandboxID, team.ID.String(), utils.WithClusterFallback(team.ClusterID), params.Limit, params.Start)
-	if err != nil {
-		a.sendAPIStoreError(c, int(err.Code), err.Message)
+	logs, apiErr := a.getSandboxLogs(ctx, team, sandboxID, params.Start, nil, params.Limit, nil, nil, nil)
+	if apiErr != nil {
+		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
+		telemetry.ReportErrorByCode(ctx, apiErr.Code, "error when returning logs for sandbox", apiErr.Err)
 
 		return
 	}
 
-	c.JSON(http.StatusOK, sbxLogs)
+	c.JSON(http.StatusOK, logs)
 }
 
-func (a *APIStore) getClusterSandboxLogs(ctx context.Context, sandboxID string, teamID string, clusterID uuid.UUID, qLimit *int32, qStart *int64) (*api.SandboxLogs, *api.Error) {
-	cluster, ok := a.clustersPool.GetClusterById(clusterID)
-	if !ok {
-		telemetry.ReportCriticalError(ctx, "error getting cluster by ID", fmt.Errorf("cluster with ID '%s' not found", clusterID))
+func (a *APIStore) GetV2SandboxesSandboxIDLogs(c *gin.Context, sandboxID api.SandboxID, params api.GetV2SandboxesSandboxIDLogsParams) {
+	ctx := c.Request.Context()
 
-		return nil, &api.Error{
-			Code:    http.StatusInternalServerError,
-			Message: fmt.Sprintf("Error getting cluster '%s'", clusterID),
-		}
-	}
-
-	res, err := cluster.GetHttpClient().V1SandboxLogsWithResponse(
-		ctx, sandboxID, &apiedge.V1SandboxLogsParams{
-			TeamID: teamID,
-			Start:  qStart,
-			Limit:  qLimit,
-		},
-	)
+	var err error
+	sandboxID, err = utils.ShortID(sandboxID)
 	if err != nil {
-		telemetry.ReportCriticalError(ctx, "error when returning logs for sandbox", err)
+		a.sendAPIStoreError(c, http.StatusBadRequest, "Invalid sandbox ID")
 
-		return nil, &api.Error{
-			Code:    http.StatusInternalServerError,
-			Message: fmt.Sprintf("Error returning logs for sandbox '%s'", sandboxID),
+		return
+	}
+
+	team := auth.MustGetTeamInfo(c)
+
+	telemetry.SetAttributes(ctx,
+		attribute.String("instance.id", sandboxID),
+		telemetry.WithTeamID(team.ID.String()),
+	)
+
+	direction := api.LogsDirectionBackward
+	if params.Direction != nil {
+		direction = *params.Direction
+	}
+
+	var cursor *time.Time
+	if params.Cursor != nil {
+		cursor = sharedutils.ToPtr(time.UnixMilli(*params.Cursor))
+	}
+
+	start, end := clusters.LogQueryWindow(cursor, direction)
+
+	startMs := start.UnixMilli()
+	endMs := end.UnixMilli()
+
+	logs, apiErr := a.getSandboxLogs(ctx, team, sandboxID, &startMs, &endMs, params.Limit, &direction, apiToLogLevel(params.Level), params.Search)
+	if apiErr != nil {
+		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
+		telemetry.ReportErrorByCode(ctx, apiErr.Code, "error when returning logs for sandbox", apiErr.Err)
+
+		return
+	}
+
+	c.JSON(http.StatusOK, api.SandboxLogsV2Response{Logs: logs.LogEntries})
+}
+
+func (a *APIStore) getSandboxLogs(
+	ctx context.Context,
+	team *types.Team,
+	sandboxID string,
+	start *int64,
+	end *int64,
+	limit *int32,
+	direction *api.LogsDirection,
+	level *logs.LogLevel,
+	search *string,
+) (api.SandboxLogs, *api.APIError) {
+	clusterID := clustersshared.WithClusterFallback(team.ClusterID)
+	cluster, ok := a.clusters.GetClusterById(clusterID)
+	if !ok {
+		return api.SandboxLogs{}, &api.APIError{
+			Err:       fmt.Errorf("cluster with ID '%s' not found", clusterID),
+			ClientMsg: "Failed to get cluster",
+			Code:      http.StatusInternalServerError,
 		}
 	}
 
-	if res.JSON200 == nil {
-		telemetry.ReportCriticalError(ctx, "error when returning logs for sandbox", fmt.Errorf("unexpected response for sandbox '%s': %s", sandboxID, string(res.Body)))
-
-		return nil, &api.Error{
-			Code:    http.StatusInternalServerError,
-			Message: fmt.Sprintf("Error returning logs for sandbox '%s'", sandboxID),
-		}
+	logs, apiErr := cluster.GetResources().GetSandboxLogs(ctx, team.ID.String(), sandboxID, start, end, limit, direction, level, search)
+	if apiErr != nil {
+		return api.SandboxLogs{}, apiErr
 	}
 
-	l := make([]api.SandboxLog, 0)
-	for _, row := range res.JSON200.Logs {
-		l = append(l, api.SandboxLog{Line: row.Line, Timestamp: row.Timestamp})
-	}
-
-	le := make([]api.SandboxLogEntry, 0)
-	for _, row := range res.JSON200.LogEntries {
-		le = append(
-			le, api.SandboxLogEntry{
-				Timestamp: row.Timestamp,
-				Level:     api.LogLevel(row.Level),
-				Message:   row.Message,
-				Fields:    row.Fields,
-			},
-		)
-	}
-
-	return &api.SandboxLogs{Logs: l, LogEntries: le}, nil
+	return logs, nil
 }

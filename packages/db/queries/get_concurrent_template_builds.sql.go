@@ -12,11 +12,16 @@ import (
 )
 
 const getConcurrentTemplateBuilds = `-- name: GetConcurrentTemplateBuilds :many
-SELECT id, created_at, updated_at, finished_at, status, dockerfile, start_cmd, vcpu, ram_mb, free_disk_size_mb, total_disk_size_mb, kernel_version, firecracker_version, env_id, envd_version, ready_cmd, cluster_node_id, reason, version, cpu_architecture, cpu_family, cpu_model, cpu_model_name, cpu_flags FROM env_builds eb
+SELECT DISTINCT eb.id, eb.created_at, eb.updated_at, eb.finished_at, eb.status, eb.dockerfile, eb.start_cmd, eb.vcpu, eb.ram_mb, eb.free_disk_size_mb, eb.total_disk_size_mb, eb.kernel_version, eb.firecracker_version, eb.env_id, eb.envd_version, eb.ready_cmd, eb.cluster_node_id, eb.reason, eb.version, eb.cpu_architecture, eb.cpu_family, eb.cpu_model, eb.cpu_model_name, eb.cpu_flags, eb.status_group, eb.team_id FROM env_build_assignments eba
+JOIN env_builds eb ON eb.id = eba.build_id
 WHERE
-    eb.env_id = $1
-    AND eb.status in ('waiting', 'building')
+    eba.env_id = $1
+    AND eb.status_group IN ('pending', 'in_progress')
     AND eb.id != $2
+    AND eba.tag IN (
+        SELECT tag FROM env_build_assignments
+        WHERE build_id = $2 AND env_id = $1
+    )
 `
 
 type GetConcurrentTemplateBuildsParams struct {
@@ -58,6 +63,8 @@ func (q *Queries) GetConcurrentTemplateBuilds(ctx context.Context, arg GetConcur
 			&i.CpuModel,
 			&i.CpuModelName,
 			&i.CpuFlags,
+			&i.StatusGroup,
+			&i.TeamID,
 		); err != nil {
 			return nil, err
 		}

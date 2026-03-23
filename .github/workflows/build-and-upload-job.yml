@@ -20,6 +20,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
   group: deploy-${{ inputs.environment }}
   cancel-in-progress: false
@@ -27,14 +30,14 @@ concurrency:
 jobs:
   deploy:
     name: Build and upload job to the ${{ inputs.environment }} environment
-    runs-on: ubuntu-22.04
+    runs-on: ci-builder
     permissions:
       contents: read
       id-token: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.commit_sha }}
 
@@ -44,6 +47,7 @@ jobs:
           environment: ${{ inputs.environment }}
           infisical_client_id: ${{ secrets.INFISICAL_CLIENT_ID }}
           infisical_client_secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          install_gcloud: "true"
 
       - name: Set up Docker
         env:

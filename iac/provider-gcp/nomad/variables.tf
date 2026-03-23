@@ -14,7 +14,7 @@ variable "orchestrator_node_pool" {
   type = string
 }
 
-variable "orchestration_repository_name" {
+variable "core_repository_name" {
   type = string
 }
 
@@ -51,10 +51,6 @@ variable "otel_collector_resources_cpu_count" {
   type = number
 }
 
-variable "otel_tracing_print" {
-  type = bool
-}
-
 # API
 variable "api_port" {
   type = object({
@@ -64,12 +60,21 @@ variable "api_port" {
   })
 }
 
+variable "api_grpc_port" {
+  type    = number
+  default = 5009
+}
+
 variable "ingress_port" {
   type = object({
     name        = string
     port        = number
     health_path = string
   })
+}
+
+variable "additional_traefik_arguments" {
+  type = list(string)
 }
 
 variable "ingress_count" {
@@ -96,8 +101,33 @@ variable "sandbox_access_token_hash_seed" {
   type = string
 }
 
+variable "sandbox_storage_backend" {
+  type    = string
+  default = "memory"
+}
+
+variable "db_max_open_connections" {
+  type = number
+}
+
+variable "db_min_idle_connections" {
+  type = number
+}
+
+variable "auth_db_max_open_connections" {
+  type = number
+}
+
+variable "auth_db_min_idle_connections" {
+  type = number
+}
+
 variable "environment" {
   type = string
+}
+
+variable "api_server_count" {
+  type = number
 }
 
 variable "api_machine_count" {
@@ -106,6 +136,11 @@ variable "api_machine_count" {
 
 variable "api_node_pool" {
   type = string
+}
+
+variable "loki_use_v13_schema_from" {
+  type    = string
+  default = ""
 }
 
 variable "loki_machine_count" {
@@ -140,6 +175,10 @@ variable "postgres_connection_string_secret_name" {
   type = string
 }
 
+variable "postgres_read_replica_connection_string_secret_version" {
+  type = any
+}
+
 variable "supabase_jwt_secrets_secret_name" {
   type = string
 }
@@ -160,23 +199,12 @@ variable "client_proxy_update_max_parallel" {
   type = number
 }
 
-variable "edge_api_port" {
-  type = object({
-    name = string
-    port = number
-    path = string
-  })
+variable "client_proxy_session_port" {
+  type = number
 }
 
-variable "edge_api_secret" {
-  type = string
-}
-
-variable "edge_proxy_port" {
-  type = object({
-    name = string
-    port = number
-  })
+variable "client_proxy_health_port" {
+  type = number
 }
 
 variable "domain_name" {
@@ -243,15 +271,11 @@ variable "loki_service_port" {
   })
 }
 
-variable "redis_url_secret_version" {
+variable "redis_cluster_url_secret_version" {
   type = any
 }
 
 variable "redis_tls_ca_base64_secret_version" {
-  type = any
-}
-
-variable "redis_secure_cluster_url_secret_version" {
   type = any
 }
 
@@ -281,10 +305,6 @@ variable "fc_env_pipeline_bucket_name" {
   type = string
 }
 
-variable "client_machine_type" {
-  type = string
-}
-
 variable "allow_sandbox_internet" {
   type = bool
 }
@@ -294,8 +314,14 @@ variable "template_manager_port" {
   type = number
 }
 
-variable "template_manager_machine_count" {
-  type = number
+variable "template_manages_clusters_size_gt_1" {
+  type = bool
+}
+
+variable "nomad_autoscaler_version" {
+  type        = string
+  description = "Version of the Nomad Autoscaler to deploy"
+  default     = "0.4.5"
 }
 
 # Redis
@@ -388,6 +414,71 @@ variable "filestore_cache_cleanup_files_per_loop" {
   type = number
 }
 
+variable "filestore_cache_cleanup_max_concurrent_stat" {
+  type        = number
+  description = "Number of concurrent stat goroutines"
+}
+
+variable "filestore_cache_cleanup_max_concurrent_scan" {
+  type        = number
+  description = "Number of concurrent scanner goroutines"
+}
+
+variable "filestore_cache_cleanup_max_concurrent_delete" {
+  type        = number
+  description = "Number of concurrent deleter goroutines"
+}
+
+variable "filestore_cache_cleanup_max_retries" {
+  type        = number
+  description = "Maximum number of continuous error or miss retries before giving up"
+}
+
 variable "dockerhub_remote_repository_url" {
   type = string
+}
+
+variable "persistent_volume_mounts" {
+  type = map(string)
+}
+
+variable "default_persistent_volume_type" {
+  type    = string
+  default = ""
+}
+
+# Dashboard API
+variable "dashboard_api_count" {
+  type    = number
+  default = 0
+}
+
+variable "volume_token_issuer" {
+  type = string
+}
+
+variable "volume_token_signing_key" {
+  type = string
+}
+
+variable "volume_token_signing_key_name" {
+  type = string
+}
+
+variable "volume_token_signing_method" {
+  type = string
+}
+
+variable "volume_token_duration" {
+  type = string
+}
+
+variable "gcs_grpc_connection_pool_size" {
+  description = "Number of gRPC connections in the GCS connection pool"
+  type        = number
+}
+
+variable "orchestrator_env_vars" {
+  type    = map(string)
+  default = {}
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,17 +9,20 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
-	template_manager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
-	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	"github.com/e2b-dev/infra/packages/db/types"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/templates"
 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+const maxLogEntriesPerRequest = int32(100)
 
 // GetTemplatesTemplateIDBuildsBuildIDStatus serves to get a template build status (e.g. to CLI)
 func (a *APIStore) GetTemplatesTemplateIDBuildsBuildIDStatus(c *gin.Context, templateID api.TemplateID, buildID api.BuildID, params api.GetTemplatesTemplateIDBuildsBuildIDStatusParams) {
@@ -34,8 +38,7 @@ func (a *APIStore) GetTemplatesTemplateIDBuildsBuildIDStatus(c *gin.Context, tem
 
 	buildInfo, err := a.templateBuildsCache.Get(ctx, buildUUID, templateID)
 	if err != nil {
-		var notFoundErr templatecache.TemplateBuildInfoNotFoundError
-		if errors.As(err, &notFoundErr) {
+		if errors.Is(err, templatecache.ErrTemplateBuildInfoNotFound) {
 			a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Build '%s' not found", buildUUID))
 
 			return
@@ -64,7 +67,7 @@ func (a *APIStore) GetTemplatesTemplateIDBuildsBuildIDStatus(c *gin.Context, tem
 	}
 
 	// early return if still waiting for build start
-	if buildInfo.BuildStatus == types.BuildStatusWaiting {
+	if buildInfo.BuildStatus == types.BuildStatusGroupPending {
 		result := api.TemplateBuildInfo{
 			LogEntries: make([]api.BuildLogEntry, 0),
 			Logs:       make([]string, 0),
@@ -84,7 +87,7 @@ func (a *APIStore) GetTemplatesTemplateIDBuildsBuildIDStatus(c *gin.Context, tem
 		Logs:       nil,
 		TemplateID: templateID,
 		BuildID:    buildID,
-		Status:     getCorrespondingTemplateBuildStatus(buildInfo.BuildStatus),
+		Status:     getCorrespondingTemplateBuildStatus(ctx, buildInfo.BuildStatus),
 		Reason:     getAPIReason(buildInfo.Reason),
 	}
 
@@ -105,7 +108,7 @@ func (a *APIStore) GetTemplatesTemplateIDBuildsBuildIDStatus(c *gin.Context, tem
 		return
 	}
 
-	cluster, ok := a.clustersPool.GetClusterById(utils.WithClusterFallback(team.ClusterID))
+	cluster, ok := a.clusters.GetClusterById(clusters.WithClusterFallback(team.ClusterID))
 	if !ok {
 		telemetry.ReportError(ctx, "error when getting cluster", fmt.Errorf("cluster with ID '%s' not found", team.ClusterID))
 		a.sendAPIStoreError(c, http.StatusInternalServerError, "Error when getting cluster")
@@ -113,7 +116,19 @@ func (a *APIStore) GetTemplatesTemplateIDBuildsBuildIDStatus(c *gin.Context, tem
 		return
 	}
 
-	logs := template_manager.GetBuildLogs(ctx, cluster, buildInfo.NodeID, templateID, buildID, offset, apiToLogLevel(params.Level))
+	limit := maxLogEntriesPerRequest
+	if params.Limit != nil && *params.Limit < maxLogEntriesPerRequest {
+		limit = *params.Limit
+	}
+
+	logs, apiErr := cluster.GetResources().GetBuildLogs(ctx, buildInfo.NodeID, templateID, buildID, offset, limit, apiToLogLevel(params.Level), nil, api.LogsDirectionForward, nil)
+	if apiErr != nil {
+		telemetry.ReportCriticalError(ctx, "error when getting build logs", apiErr.Err, telemetry.WithTemplateID(templateID), telemetry.WithBuildID(buildID))
+		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
+
+		return
+	}
+
 	for _, entry := range logs {
 		if legacyLogs {
 			lgs = append(lgs, fmt.Sprintf("[%s] %s\n", entry.Timestamp.Format(time.RFC3339), entry.Message))
@@ -131,15 +146,19 @@ func (a *APIStore) GetTemplatesTemplateIDBuildsBuildIDStatus(c *gin.Context, tem
 	c.JSON(http.StatusOK, result)
 }
 
-func getCorrespondingTemplateBuildStatus(s types.BuildStatus) api.TemplateBuildStatus {
+func getCorrespondingTemplateBuildStatus(ctx context.Context, s types.BuildStatusGroup) api.TemplateBuildStatus {
 	switch s {
-	case types.BuildStatusWaiting:
+	case types.BuildStatusGroupPending:
 		return api.TemplateBuildStatusWaiting
-	case types.BuildStatusFailed:
-		return api.TemplateBuildStatusError
-	case types.BuildStatusUploaded:
+	case types.BuildStatusGroupInProgress:
+		return api.TemplateBuildStatusBuilding
+	case types.BuildStatusGroupReady:
 		return api.TemplateBuildStatusReady
+	case types.BuildStatusGroupFailed:
+		return api.TemplateBuildStatusError
 	default:
+		logger.L().Warn(ctx, "unknown build status, defaulting to building", zap.String("status", string(s)))
+
 		return api.TemplateBuildStatusBuilding
 	}
 }

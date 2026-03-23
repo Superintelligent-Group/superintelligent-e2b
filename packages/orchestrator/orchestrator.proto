@@ -46,6 +46,23 @@ message SandboxConfig {
   optional bool allow_internet_access = 21;
 
   optional SandboxNetworkConfig network = 22;
+
+  repeated SandboxVolumeMount volumeMounts = 23;
+
+  // Auto-resume policy for paused sandboxes.
+  optional SandboxAutoResumeConfig auto_resume = 24;
+}
+
+message SandboxAutoResumeConfig {
+  // Policy values are owned by the API layer today (e.g. "off", "any").
+  string policy = 1;
+}
+
+message SandboxVolumeMount {
+  string id = 1;
+  string path = 2;
+  string type = 3;
+  string name = 4;
 }
 
 message SandboxNetworkConfig {
@@ -56,6 +73,8 @@ message SandboxNetworkConfig {
 message SandboxNetworkEgressConfig {
   repeated string allowed_cidrs = 1;
   repeated string denied_cidrs = 2;
+
+  repeated string allowed_domains = 3;
 }
 
 message SandboxNetworkIngressConfig {
@@ -77,7 +96,9 @@ message SandboxCreateResponse {
 message SandboxUpdateRequest {
   string sandbox_id = 1;
 
-  google.protobuf.Timestamp end_time = 2;
+  // All fields are optional — only set fields are applied.
+  optional google.protobuf.Timestamp end_time = 2;
+  optional SandboxNetworkEgressConfig egress = 3;
 }
 
 message SandboxDeleteRequest {
@@ -88,6 +109,14 @@ message SandboxPauseRequest {
   string sandbox_id = 1;
   string template_id = 2;
   string build_id = 3;
+}
+
+message SandboxCheckpointRequest {
+  string sandbox_id = 1;
+  string build_id = 3;
+}
+
+message SandboxCheckpointResponse {
 }
 
 message RunningSandbox {
@@ -117,6 +146,7 @@ service SandboxService {
   rpc List(google.protobuf.Empty) returns (SandboxListResponse);
   rpc Delete(SandboxDeleteRequest) returns (google.protobuf.Empty);
   rpc Pause(SandboxPauseRequest) returns (google.protobuf.Empty);
+  rpc Checkpoint(SandboxCheckpointRequest) returns (SandboxCheckpointResponse);
 
   rpc ListCachedBuilds(google.protobuf.Empty) returns (SandboxListCachedBuildsResponse);
 }

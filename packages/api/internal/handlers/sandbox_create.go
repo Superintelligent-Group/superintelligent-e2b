@@ -1,29 +1,38 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 	"golang.org/x/net/idna"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	"github.com/e2b-dev/infra/packages/api/internal/auth"
-	typesteam "github.com/e2b-dev/infra/packages/api/internal/db/types"
+	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	"github.com/e2b-dev/infra/packages/api/internal/middleware/otel/metrics"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
-	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	"github.com/e2b-dev/infra/packages/db/types"
+	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
+	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
+	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
-	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
+	sandbox_network "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-network"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -32,22 +41,16 @@ const (
 	InstanceIDPrefix            = "i"
 	metricTemplateAlias         = metrics.MetricPrefix + "template.alias"
 	minEnvdVersionForSecureFlag = "0.2.0" // Minimum version of envd that supports secure flag
-)
 
-// mostUsedTemplates is a map of the most used template aliases.
-// It is used for monitoring and to reduce metric cardinality.
-var mostUsedTemplates = map[string]struct{}{
-	"base":                  {},
-	"code-interpreter-v1":   {},
-	"code-interpreter-beta": {},
-	"desktop":               {},
-}
+	// Network validation error messages
+	ErrMsgDomainsRequireBlockAll = "When specifying allowed domains in allow out, you must include 'ALL_TRAFFIC' in deny out to block all other traffic."
+)
 
 func (a *APIStore) PostSandboxes(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	// Get team from context, use TeamContextKey
-	teamInfo := c.Value(auth.TeamContextKey).(*typesteam.Team)
+	teamInfo := auth.MustGetTeamInfo(c)
 
 	c.Set("teamID", teamInfo.Team.ID.String())
 
@@ -55,7 +58,7 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 	traceID := span.SpanContext().TraceID().String()
 	c.Set("traceID", traceID)
 
-	body, err := utils.ParseBody[api.PostSandboxesJSONRequestBody](ctx, c)
+	body, err := ginutils.ParseBody[api.PostSandboxesJSONRequestBody](ctx, c)
 	if err != nil {
 		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Error when parsing request: %s", err))
 
@@ -66,35 +69,37 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 
 	telemetry.ReportEvent(ctx, "Parsed body")
 
-	cleanedAliasOrEnvID, err := id.CleanTemplateID(body.TemplateID)
+	identifier, tag, err := id.ParseName(body.TemplateID)
 	if err != nil {
-		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid environment ID: %s", err))
+		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid template reference: %s", err))
+		telemetry.ReportError(ctx, "invalid template reference", err)
 
-		telemetry.ReportCriticalError(ctx, "error when cleaning env ID", err)
+		return
+	}
+
+	clusterID := clusters.WithClusterFallback(teamInfo.Team.ClusterID)
+	aliasInfo, err := a.templateCache.ResolveAlias(ctx, identifier, teamInfo.Team.Slug)
+	if err != nil {
+		apiErr := templatecache.ErrorToAPIError(err, identifier)
+		telemetry.ReportErrorByCode(ctx, apiErr.Code, "error when resolving template alias", apiErr.Err, attribute.String("identifier", identifier))
+		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
 		return
 	}
 
-	telemetry.ReportEvent(ctx, "Cleaned template ID")
-
-	_, templateSpan := tracer.Start(ctx, "get-template")
-	defer templateSpan.End()
-
-	// Check if team has access to the environment
-	clusterID := utils.WithClusterFallback(teamInfo.Team.ClusterID)
-	env, build, checkErr := a.templateCache.Get(ctx, cleanedAliasOrEnvID, teamInfo.Team.ID, clusterID, true)
-	if checkErr != nil {
-		telemetry.ReportCriticalError(ctx, "error when getting template", checkErr.Err)
-		a.sendAPIStoreError(c, checkErr.Code, checkErr.ClientMsg)
+	env, build, err := a.templateCache.Get(ctx, aliasInfo.TemplateID, tag, teamInfo.Team.ID, clusterID)
+	if err != nil {
+		apiErr := templatecache.ErrorToAPIError(err, aliasInfo.TemplateID)
+		telemetry.ReportErrorByCode(ctx, apiErr.Code, "error when getting template", apiErr.Err, telemetry.WithTemplateID(aliasInfo.TemplateID))
+		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
 		return
 	}
-	templateSpan.End()
 
 	telemetry.ReportEvent(ctx, "Checked team access")
 
 	c.Set("envID", env.TemplateID)
-	setTemplateNameMetric(c, env.Aliases)
+	setTemplateNameMetric(ctx, c, a.featureFlags, env.TemplateID, env.Names)
 
 	sandboxID := InstanceIDPrefix + id.Generate()
 
@@ -111,24 +116,15 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 		attribute.String("env.team.id", teamInfo.Team.ID.String()),
 		telemetry.WithTemplateID(env.TemplateID),
 		attribute.String("env.alias", alias),
-		attribute.String("env.kernel.version", build.KernelVersion),
-		attribute.String("env.firecracker.version", build.FirecrackerVersion),
+		telemetry.WithKernelVersion(build.KernelVersion),
+		telemetry.WithFirecrackerVersion(build.FirecrackerVersion),
 	)
 
-	var metadata map[string]string
-	if body.Metadata != nil {
-		metadata = *body.Metadata
-	}
-
-	var envVars map[string]string
-	if body.EnvVars != nil {
-		envVars = *body.EnvVars
-	}
-
-	var mcp api.Mcp
-	if body.Mcp != nil {
-		mcp = *body.Mcp
-	}
+	autoPause := sharedUtils.DerefOrDefault(body.AutoPause, sandbox.AutoPauseDefault)
+	envVars := sharedUtils.DerefOrDefault(body.EnvVars, nil)
+	mcp := sharedUtils.DerefOrDefault(body.Mcp, nil)
+	metadata := sharedUtils.DerefOrDefault(body.Metadata, nil)
+	apiVolumeMounts := sharedUtils.DerefOrDefault(body.VolumeMounts, nil)
 
 	timeout := sandbox.SandboxTimeoutDefault
 	if body.Timeout != nil {
@@ -141,10 +137,7 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 		}
 	}
 
-	autoPause := sandbox.AutoPauseDefault
-	if body.AutoPause != nil {
-		autoPause = *body.AutoPause
-	}
+	autoResume := buildAutoResumeConfig(body.AutoResume)
 
 	var envdAccessToken *string = nil
 	if body.Secure != nil && *body.Secure == true {
@@ -182,12 +175,35 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 		}
 
 		// Make sure envd seucre access is enforced when public access is disabled,
-		// this is requirement forcing users using newer features to secure sandboxes properly.
+		// This requirement forces users using newer features to secure sandboxes properly.
 		if !sharedUtils.DerefOrDefault(network.Ingress.AllowPublicAccess, types.AllowPublicAccessDefault) && envdAccessToken == nil {
 			a.sendAPIStoreError(c, http.StatusBadRequest, "You cannot create a sandbox without public access unless you enable secure envd access via 'secure' flag.")
 
 			return
 		}
+	}
+
+	sbxVolumeMounts, err := convertAPIVolumesToOrchestratorVolumes(
+		ctx, a.sqlcDB, a.featureFlags, teamInfo.ID, apiVolumeMounts,
+	)
+	if err != nil {
+		if errors.Is(err, ErrVolumeMountsDisabled) {
+			a.sendAPIStoreError(c, http.StatusBadRequest, "Volume mounts are not enabled.")
+
+			return
+		}
+
+		var vne InvalidVolumeMountsError
+		if errors.As(err, &vne) {
+			a.sendAPIStoreError(c, http.StatusBadRequest, vne.Error())
+
+			return
+		}
+
+		telemetry.ReportError(ctx, "failed to convert volume mounts", err, telemetry.WithSandboxID(sandboxID))
+		a.sendAPIStoreError(c, http.StatusInternalServerError, "failed to convert volume mounts")
+
+		return
 	}
 
 	sbx, createErr := a.startSandbox(
@@ -203,20 +219,171 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 		false,
 		nil,
 		env.TemplateID,
+		env.TemplateID,
 		autoPause,
+		autoResume,
 		envdAccessToken,
 		allowInternetAccess,
 		network,
 		mcp,
+		sbxVolumeMounts,
 	)
 	if createErr != nil {
-		logger.L().Error(ctx, "Failed to create sandbox", zap.Error(createErr.Err))
 		a.sendAPIStoreError(c, createErr.Code, createErr.ClientMsg)
 
 		return
 	}
 
 	c.JSON(http.StatusCreated, &sbx)
+}
+
+func buildAutoResumeConfig(autoResume *api.SandboxAutoResumeConfig) *types.SandboxAutoResumeConfig {
+	if autoResume == nil {
+		return nil
+	}
+
+	policy := types.SandboxAutoResumeOff
+	if autoResume.Enabled {
+		policy = types.SandboxAutoResumeAny
+	}
+
+	return &types.SandboxAutoResumeConfig{
+		Policy: policy,
+	}
+}
+
+func dedupeVolumeNames(items []api.SandboxVolumeMount) []string {
+	itemsSet := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		itemsSet[item.Name] = struct{}{}
+	}
+
+	results := make([]string, 0, len(itemsSet))
+	for name := range itemsSet {
+		results = append(results, name)
+	}
+
+	return results
+}
+
+var ErrVolumeMountsDisabled = errors.New("volume mounts are not enabled")
+
+type featureFlagsClient interface {
+	BoolFlag(ctx context.Context, flagName featureflags.BoolFlag, contexts ...ldcontext.Context) bool
+}
+
+type InvalidMount struct {
+	Index  int
+	Reason string
+}
+
+type InvalidVolumeMountsError struct {
+	InvalidMounts []InvalidMount
+}
+
+func (im InvalidVolumeMountsError) Error() string {
+	var errs []string
+
+	for _, mount := range im.InvalidMounts {
+		errs = append(errs, fmt.Sprintf("\t- volume mount #%d: %s", mount.Index, mount.Reason))
+	}
+
+	return fmt.Sprintf("invalid mounts:\n%s", strings.Join(errs, "\n"))
+}
+
+func convertAPIVolumesToOrchestratorVolumes(
+	ctx context.Context,
+	sqlClient *sqlcdb.Client,
+	featureFlags featureFlagsClient,
+	teamID uuid.UUID,
+	volumeMounts []api.SandboxVolumeMount,
+) ([]*orchestrator.SandboxVolumeMount, error) {
+	if len(volumeMounts) == 0 {
+		return []*orchestrator.SandboxVolumeMount{}, nil // only b/c you should never return (nil, nil)
+	}
+
+	if !featureFlags.BoolFlag(ctx, featureflags.PersistentVolumesFlag) {
+		return nil, ErrVolumeMountsDisabled
+	}
+
+	// get volumes from the database
+	dbVolumesMap, err := getDBVolumesMap(ctx, sqlClient, teamID, volumeMounts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get db volumes map: %w", err)
+	}
+
+	invalidVolumeMounts := make([]InvalidMount, 0)
+	results := make([]*orchestrator.SandboxVolumeMount, 0, len(volumeMounts))
+
+	usedPaths := make(map[string]struct{})
+
+	for index, v := range volumeMounts {
+		actualVolume, ok := dbVolumesMap[v.Name]
+		if !ok {
+			invalidVolumeMounts = append(invalidVolumeMounts, InvalidMount{Index: index, Reason: fmt.Sprintf("volume '%s' not found", v.Name)})
+
+			continue
+		}
+
+		if reason, ok := isValidMountPath(v.Path); !ok {
+			invalidVolumeMounts = append(invalidVolumeMounts, InvalidMount{Index: index, Reason: reason})
+
+			continue
+		}
+
+		if _, ok := usedPaths[v.Path]; ok {
+			invalidVolumeMounts = append(invalidVolumeMounts, InvalidMount{Index: index, Reason: fmt.Sprintf("path '%s' is already used", v.Path)})
+
+			continue
+		}
+		usedPaths[v.Path] = struct{}{}
+
+		results = append(results, &orchestrator.SandboxVolumeMount{
+			Id:   actualVolume.ID.String(),
+			Path: v.Path,
+			Type: actualVolume.VolumeType,
+			Name: actualVolume.Name,
+		})
+	}
+
+	if len(invalidVolumeMounts) > 0 {
+		return nil, InvalidVolumeMountsError{InvalidMounts: invalidVolumeMounts}
+	}
+
+	return results, nil
+}
+
+func isValidMountPath(path string) (string, bool) {
+	if path == "" {
+		return "path cannot be empty", false
+	}
+
+	if !filepath.IsAbs(path) {
+		return "path must be absolute", false
+	}
+
+	if filepath.Clean(path) != path {
+		return "path must not contain any '.' or '..' components", false
+	}
+
+	return "", true
+}
+
+func getDBVolumesMap(ctx context.Context, sqlcDB *sqlcdb.Client, teamID uuid.UUID, volumeMounts []api.SandboxVolumeMount) (map[string]queries.Volume, error) {
+	dbVolumes, err := sqlcDB.GetVolumesByName(ctx, queries.GetVolumesByNameParams{
+		TeamID:      teamID,
+		VolumeNames: dedupeVolumeNames(volumeMounts),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get volumes from db: %w", err)
+	}
+
+	dbVolumesMap := make(map[string]queries.Volume, len(dbVolumes))
+	for _, v := range dbVolumes {
+		dbVolumesMap[v.Name] = v
+	}
+
+	return dbVolumesMap, nil
 }
 
 func (a *APIStore) getEnvdAccessToken(envdVersion *string, sandboxID string) (string, *api.APIError) {
@@ -257,16 +424,26 @@ func (a *APIStore) getEnvdAccessToken(envdVersion *string, sandboxID string) (st
 	return key, nil
 }
 
-func setTemplateNameMetric(c *gin.Context, aliases []string) {
-	for _, alias := range aliases {
-		if _, exists := mostUsedTemplates[alias]; exists {
-			c.Set(metricTemplateAlias, alias)
+func setTemplateNameMetric(ctx context.Context, c *gin.Context, ff *featureflags.Client, templateID string, names []string) {
+	trackedTemplates := featureflags.GetTrackedTemplatesSet(ctx, ff)
+
+	// Check template ID first
+	if _, exists := trackedTemplates[templateID]; exists {
+		c.Set(metricTemplateAlias, templateID)
+
+		return
+	}
+
+	// Then check names (namespace/alias format when namespaced)
+	for _, name := range names {
+		if _, exists := trackedTemplates[name]; exists {
+			c.Set(metricTemplateAlias, name)
 
 			return
 		}
 	}
 
-	// Fallback to 'other' if no match of mostUsedTemplates found
+	// Fallback to 'other' if no match of tracked templates found
 	c.Set(metricTemplateAlias, "other")
 }
 
@@ -320,6 +497,50 @@ func validateNetworkConfig(network *api.SandboxNetworkConfig) *api.APIError {
 				Code:      http.StatusBadRequest,
 				Err:       fmt.Errorf("mask request host is not ASCII (%s)!=(%s)", host, hostname),
 				ClientMsg: fmt.Sprintf("mask request host '%s' is not ASCII. Please use ASCII characters only.", hostname),
+			}
+		}
+	}
+
+	denyOut := sharedUtils.DerefOrDefault(network.DenyOut, nil)
+	allowOut := sharedUtils.DerefOrDefault(network.AllowOut, nil)
+
+	return validateEgressRules(allowOut, denyOut)
+}
+
+// validateEgressRules validates egress allow/deny rules:
+// - denyOut entries must be valid IPs or CIDRs (not domains)
+// - allowOut entries must be valid IPs, CIDRs, or domain names
+// - when allowOut contains domains, denyOut must include 0.0.0.0/0
+func validateEgressRules(allowOut, denyOut []string) *api.APIError {
+	for _, cidr := range denyOut {
+		if !sandbox_network.IsSpecifiedIPOrCIDR(cidr) {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       fmt.Errorf("invalid denied CIDR %s", cidr),
+				ClientMsg: fmt.Sprintf("invalid denied CIDR %s", cidr),
+			}
+		}
+	}
+
+	if len(allowOut) > 0 {
+		allowedAddresses, allowedDomains := sandbox_network.ParseAddressesAndDomains(allowOut)
+
+		for _, addr := range allowedAddresses {
+			if !sandbox_network.IsSpecifiedIPOrCIDR(addr) {
+				return &api.APIError{
+					Code:      http.StatusBadRequest,
+					Err:       fmt.Errorf("invalid allowed address %s", addr),
+					ClientMsg: fmt.Sprintf("invalid allowed address %s", addr),
+				}
+			}
+		}
+		hasBlockAll := slices.Contains(denyOut, sandbox_network.AllInternetTrafficCIDR)
+
+		if len(allowedDomains) > 0 && !hasBlockAll {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       fmt.Errorf("allow out contains domains but deny out is missing 0.0.0.0/0 (ALL_TRAFFIC)"),
+				ClientMsg: ErrMsgDomainsRequireBlockAll,
 			}
 		}
 	}

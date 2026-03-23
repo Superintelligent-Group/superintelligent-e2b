@@ -3,17 +3,22 @@ package nodemanager
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
 
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
-	"github.com/e2b-dev/infra/packages/db/types"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	ut "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager")
 
 func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 	childCtx, childSpan := tracer.Start(ctx, "get-sandboxes-from-orchestrator")
@@ -65,11 +70,22 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 			}
 
 			if egress := config.GetNetwork().GetEgress(); egress != nil {
+				// Combine allowed CIDRs and domains back into AllowedAddresses
+				allowedAddresses := slices.Concat(egress.GetAllowedCidrs(), egress.GetAllowedDomains())
 				network.Egress = &types.SandboxNetworkEgressConfig{
-					AllowedAddresses: egress.GetAllowedCidrs(),
+					AllowedAddresses: allowedAddresses,
 					DeniedAddresses:  egress.GetDeniedCidrs(),
 				}
 			}
+		}
+
+		volumeMounts := ConvertOrchestratorMountsToDatabaseMounts(config.GetVolumeMounts())
+
+		var autoResume *types.SandboxAutoResumeConfig
+		if autoResumeCfg := config.GetAutoResume(); autoResumeCfg != nil {
+			p := autoResumeCfg.GetPolicy()
+			policy := types.SandboxAutoResumePolicy(p)
+			autoResume = &types.SandboxAutoResumeConfig{Policy: policy}
 		}
 
 		sandboxesInfo = append(
@@ -95,15 +111,32 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 				n.ID,
 				n.ClusterID,
 				config.GetAutoPause(),
+				autoResume,
 				config.EnvdAccessToken,     //nolint:protogetter // we need the nil check too
 				config.AllowInternetAccess, //nolint:protogetter // we need the nil check too
 				config.GetBaseTemplateId(),
 				n.SandboxDomain,
 				network,
 				networkTrafficAccessToken,
+				volumeMounts,
 			),
 		)
 	}
 
 	return sandboxesInfo, nil
+}
+
+func ConvertOrchestratorMountsToDatabaseMounts(mounts []*orchestrator.SandboxVolumeMount) []*types.SandboxVolumeMountConfig {
+	var results []*types.SandboxVolumeMountConfig
+
+	for _, item := range mounts {
+		results = append(results, &types.SandboxVolumeMountConfig{
+			ID:   item.GetId(),
+			Type: item.GetType(),
+			Name: item.GetName(),
+			Path: item.GetPath(),
+		})
+	}
+
+	return results
 }

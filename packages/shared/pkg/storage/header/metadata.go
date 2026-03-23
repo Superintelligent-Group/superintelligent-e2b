@@ -3,6 +3,7 @@ package header
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/bits-and-blooms/bitset"
 	"github.com/google/uuid"
@@ -26,7 +27,7 @@ type DiffMetadata struct {
 func (d *DiffMetadata) toDiffMapping(
 	ctx context.Context,
 	buildID uuid.UUID,
-) (mapping []*BuildMap, e error) {
+) (mapping []*BuildMap) {
 	dirtyMappings := CreateMapping(
 		&buildID,
 		d.Dirty,
@@ -45,7 +46,7 @@ func (d *DiffMetadata) toDiffMapping(
 	mappings := MergeMappings(dirtyMappings, emptyMappings)
 	telemetry.ReportEvent(ctx, "merge mappings")
 
-	return mappings, nil
+	return mappings
 }
 
 func (d *DiffMetadata) ToDiffHeader(
@@ -62,10 +63,7 @@ func (d *DiffMetadata) ToDiffHeader(
 		}
 	}()
 
-	diffMapping, err := d.toDiffMapping(ctx, buildID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create mapping: %w", err)
-	}
+	diffMapping := d.toDiffMapping(ctx, buildID)
 
 	m := MergeMappings(
 		originalHeader.Mapping,
@@ -105,4 +103,56 @@ func (d *DiffMetadata) ToDiffHeader(
 	}
 
 	return header, nil
+}
+
+type DiffMetadataBuilder struct {
+	dirty *bitset.BitSet
+	empty *bitset.BitSet
+
+	blockSize int64
+}
+
+func NewDiffMetadataBuilder(size, blockSize int64) *DiffMetadataBuilder {
+	return &DiffMetadataBuilder{
+		dirty: bitset.New(uint(TotalBlocks(size, blockSize))),
+		empty: bitset.New(0),
+
+		blockSize: blockSize,
+	}
+}
+
+func (b *DiffMetadataBuilder) Process(ctx context.Context, block []byte, out io.Writer, offset int64) error {
+	blockIdx := BlockIdx(offset, b.blockSize)
+
+	isEmpty, err := IsEmptyBlock(block, b.blockSize)
+	if err != nil {
+		return fmt.Errorf("error checking empty block: %w", err)
+	}
+	if isEmpty {
+		b.empty.Set(uint(blockIdx))
+
+		return nil
+	}
+
+	b.dirty.Set(uint(blockIdx))
+	n, err := out.Write(block)
+	if err != nil {
+		logger.L().Error(ctx, "error writing to out", zap.Error(err))
+
+		return err
+	}
+
+	if int64(n) != b.blockSize {
+		return fmt.Errorf("short write: %d != %d", int64(n), b.blockSize)
+	}
+
+	return nil
+}
+
+func (b *DiffMetadataBuilder) Build() *DiffMetadata {
+	return &DiffMetadata{
+		Dirty:     b.dirty,
+		Empty:     b.empty,
+		BlockSize: b.blockSize,
+	}
 }

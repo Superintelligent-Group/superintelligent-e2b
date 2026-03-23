@@ -4,69 +4,84 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	nomadapi "github.com/hashicorp/nomad/api"
-	middleware "github.com/oapi-codegen/gin-middleware"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
-	authcache "github.com/e2b-dev/infra/packages/api/internal/cache/auth"
+	snapshotcache "github.com/e2b-dev/infra/packages/api/internal/cache/snapshots"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
-	dbapi "github.com/e2b-dev/infra/packages/api/internal/db"
-	"github.com/e2b-dev/infra/packages/api/internal/db/types"
-	"github.com/e2b-dev/infra/packages/api/internal/edge"
+	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	template_manager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
+	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
+	"github.com/e2b-dev/infra/packages/auth/pkg/types"
 	clickhouse "github.com/e2b-dev/infra/packages/clickhouse/pkg"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
-	"github.com/e2b-dev/infra/packages/shared/pkg/factories"
-	featureflags "github.com/e2b-dev/infra/packages/shared/pkg/feature-flags"
-	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
+	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
+	"github.com/e2b-dev/infra/packages/db/pkg/pool"
+	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
-
-// minSupabaseJWTSecretLength is the minimum length of a secret used to verify the Supabase JWT.
-// This is a security measure to prevent the use of weak secrets (like empty).
-const minSupabaseJWTSecretLength = 16
 
 var _ api.ServerInterface = (*APIStore)(nil)
 
 type APIStore struct {
-	Healthy              bool
-	config               cfg.Config
-	posthog              *analyticscollector.PosthogClient
-	Telemetry            *telemetry.Client
-	orchestrator         *orchestrator.Orchestrator
-	templateManager      *template_manager.TemplateManager
-	sqlcDB               *sqlcdb.Client
-	redisClient          redis.UniversalClient
-	templateCache        *templatecache.TemplateCache
-	templateBuildsCache  *templatecache.TemplatesBuildCache
-	authCache            *authcache.TeamAuthCache
-	templateSpawnCounter *utils.TemplateSpawnCounter
-	clickhouseStore      clickhouse.Clickhouse
-	accessTokenGenerator *sandbox.AccessTokenGenerator
-	featureFlags         *featureflags.Client
-	clustersPool         *edge.Pool
+	Healthy               atomic.Bool
+	config                cfg.Config
+	posthog               *analyticscollector.PosthogClient
+	Telemetry             *telemetry.Client
+	orchestrator          *orchestrator.Orchestrator
+	templateManager       *template_manager.TemplateManager
+	sqlcDB                *sqlcdb.Client
+	authDB                *authdb.Client
+	redisClient           redis.UniversalClient
+	templateCache         *templatecache.TemplateCache
+	templateBuildsCache   *templatecache.TemplatesBuildCache
+	snapshotCache         *snapshotcache.SnapshotCache
+	authService           *sharedauth.AuthService[*types.Team]
+	templateSpawnCounter  *utils.TemplateSpawnCounter
+	clickhouseStore       clickhouse.Clickhouse
+	accessTokenGenerator  *sandbox.AccessTokenGenerator
+	featureFlags          *featureflags.Client
+	clusters              *clusters.Pool
+	snapshotUpsertSem     *sharedutils.AdjustableSemaphore
+	sandboxListSem        *sharedutils.AdjustableSemaphore
+	snapshotBuildQuerySem *sharedutils.AdjustableSemaphore
 }
 
-func NewAPIStore(ctx context.Context, tel *telemetry.Client, config cfg.Config) *APIStore {
+func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.UniversalClient, featureFlags *featureflags.Client, config cfg.Config) *APIStore {
 	logger.L().Info(ctx, "Initializing API store and services")
 
-	sqlcDB, err := sqlcdb.NewClient(ctx, sqlcdb.WithMaxConnections(40), sqlcdb.WithMinIdle(5))
+	sqlcDB, err := sqlcdb.NewClient(ctx, config.PostgresConnectionString, pool.WithMaxConnections(config.DBMaxOpenConnections), pool.WithMinIdle(config.DBMinIdleConnections))
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing SQLC client", zap.Error(err))
+	}
+
+	authDB, err := authdb.NewClient(
+		ctx,
+		config.AuthDBConnectionString,
+		config.AuthDBReadReplicaConnectionString,
+		pool.WithMaxConnections(config.AuthDBMaxOpenConnections),
+		pool.WithMinIdle(config.AuthDBMinIdleConnections),
+	)
+	if err != nil {
+		logger.L().Fatal(ctx, "Initializing auth DB client", zap.Error(err))
 	}
 
 	logger.L().Info(ctx, "Created database client")
@@ -97,27 +112,15 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, config cfg.Config) 
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Nomad client", zap.Error(err))
 	}
-	redisClient, err := factories.NewRedisClient(ctx, factories.RedisConfig{
-		RedisURL:         config.RedisURL,
-		RedisClusterURL:  config.RedisClusterURL,
-		RedisTLSCABase64: config.RedisTLSCABase64,
-	})
+
+	queryLogsProvider, err := loki.NewLokiQueryProvider(config.LokiURL, config.LokiUser, config.LokiPassword)
 	if err != nil {
-		if errors.Is(err, factories.ErrRedisDisabled) {
-			logger.L().Warn(ctx, "REDIS_URL not set, using local caches")
-		} else {
-			logger.L().Fatal(ctx, "Initializing Redis client", zap.Error(err))
-		}
+		logger.L().Fatal(ctx, "error when getting logs query provider", zap.Error(err))
 	}
 
-	clustersPool, err := edge.NewPool(ctx, tel, sqlcDB, config)
+	clusters, err := clusters.NewPool(ctx, tel, sqlcDB, nomadClient, clickhouseStore, queryLogsProvider, config)
 	if err != nil {
 		logger.L().Fatal(ctx, "initializing edge clusters pool failed", zap.Error(err))
-	}
-
-	featureFlags, err := featureflags.NewClient()
-	if err != nil {
-		logger.L().Fatal(ctx, "failed to create feature flags client", zap.Error(err))
 	}
 
 	accessTokenGenerator, err := sandbox.NewAccessTokenGenerator(config.SandboxAccessTokenHashSeed)
@@ -125,17 +128,36 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, config cfg.Config) 
 		logger.L().Fatal(ctx, "Initializing access token generator failed", zap.Error(err))
 	}
 
-	orch, err := orchestrator.New(ctx, config, tel, nomadClient, posthogClient, redisClient, sqlcDB, clustersPool, featureFlags, accessTokenGenerator)
+	snapshotCache := snapshotcache.NewSnapshotCache(sqlcDB, redisClient)
+
+	snapshotUpsertSem, err := sharedutils.NewAdjustableSemaphore(dbThrottleLimit(featureFlags.IntFlag(ctx, featureflags.MaxConcurrentSnapshotUpserts)))
+	if err != nil {
+		logger.L().Fatal(ctx, "failed to create snapshot upsert semaphore", zap.Error(err))
+	}
+
+	sandboxListSem, err := sharedutils.NewAdjustableSemaphore(dbThrottleLimit(featureFlags.IntFlag(ctx, featureflags.MaxConcurrentSandboxListQueries)))
+	if err != nil {
+		logger.L().Fatal(ctx, "failed to create sandbox list semaphore", zap.Error(err))
+	}
+
+	snapshotBuildQuerySem, err := sharedutils.NewAdjustableSemaphore(dbThrottleLimit(featureFlags.IntFlag(ctx, featureflags.MaxConcurrentSnapshotBuildQueries)))
+	if err != nil {
+		logger.L().Fatal(ctx, "failed to create snapshot build query semaphore", zap.Error(err))
+	}
+
+	orch, err := orchestrator.New(ctx, config, tel, nomadClient, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Orchestrator client", zap.Error(err))
 	}
 
-	authCache := authcache.NewTeamAuthCache()
-	templateCache := templatecache.NewTemplateCache(sqlcDB)
+	authCache := sharedauth.NewAuthCache[*types.Team]()
+	authStore := sharedauth.NewAuthStore(authDB)
+	authService := sharedauth.NewAuthService[*types.Team](authStore, authCache, config.SupabaseJWTSecrets)
+	templateCache := templatecache.NewTemplateCache(sqlcDB, redisClient)
 	templateSpawnCounter := utils.NewTemplateSpawnCounter(ctx, time.Minute, sqlcDB)
 
-	templateBuildsCache := templatecache.NewTemplateBuildCache(sqlcDB)
-	templateManager, err := template_manager.New(sqlcDB, clustersPool, templateBuildsCache, templateCache)
+	templateBuildsCache := templatecache.NewTemplateBuildCache(sqlcDB, redisClient)
+	templateManager, err := template_manager.New(sqlcDB, clusters, templateBuildsCache, templateCache, featureFlags)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Template manager client", zap.Error(err))
 	}
@@ -144,23 +166,29 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, config cfg.Config) 
 	go templateManager.BuildsStatusPeriodicalSync(ctx)
 
 	a := &APIStore{
-		config:               config,
-		Healthy:              false,
-		orchestrator:         orch,
-		templateManager:      templateManager,
-		sqlcDB:               sqlcDB,
-		Telemetry:            tel,
-		posthog:              posthogClient,
-		templateCache:        templateCache,
-		templateBuildsCache:  templateBuildsCache,
-		authCache:            authCache,
-		templateSpawnCounter: templateSpawnCounter,
-		clickhouseStore:      clickhouseStore,
-		accessTokenGenerator: accessTokenGenerator,
-		clustersPool:         clustersPool,
-		featureFlags:         featureFlags,
-		redisClient:          redisClient,
+		config:                config,
+		orchestrator:          orch,
+		templateManager:       templateManager,
+		sqlcDB:                sqlcDB,
+		authDB:                authDB,
+		Telemetry:             tel,
+		posthog:               posthogClient,
+		templateCache:         templateCache,
+		templateBuildsCache:   templateBuildsCache,
+		snapshotCache:         snapshotCache,
+		authService:           authService,
+		templateSpawnCounter:  templateSpawnCounter,
+		clickhouseStore:       clickhouseStore,
+		accessTokenGenerator:  accessTokenGenerator,
+		clusters:              clusters,
+		featureFlags:          featureFlags,
+		redisClient:           redisClient,
+		snapshotUpsertSem:     snapshotUpsertSem,
+		sandboxListSem:        sandboxListSem,
+		snapshotBuildQuerySem: snapshotBuildQuerySem,
 	}
+
+	go a.updateDBThrottleLimits(ctx)
 
 	// Wait till there's at least one, otherwise we can't create sandboxes yet
 	go func() {
@@ -172,7 +200,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, config cfg.Config) 
 			case <-ticker.C:
 				if orch.NodeCount() != 0 {
 					logger.L().Info(ctx, "Nodes are ready, setting API as healthy")
-					a.Healthy = true
+					a.Healthy.Store(true)
 
 					return
 				}
@@ -201,39 +229,69 @@ func (a *APIStore) Close(ctx context.Context) error {
 		}
 	}
 
-	if a.authCache != nil {
-		if err := a.authCache.Close(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("closing auth cache: %w", err))
+	if a.authService != nil {
+		if err := a.authService.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("closing auth service: %w", err))
 		}
+	}
+
+	a.clusters.Close(ctx)
+
+	if err := a.authDB.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("closing auth database client: %w", err))
 	}
 
 	if err := a.sqlcDB.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("closing sqlc database client: %w", err))
 	}
 
-	if a.redisClient != nil {
-		if err := a.redisClient.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("closing redis client: %w", err))
+	if a.templateBuildsCache != nil {
+		if err := a.templateBuildsCache.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("closing template build cache: %w", err))
 		}
+	}
+
+	if err := a.snapshotCache.Close(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("closing snapshot cache: %w", err))
 	}
 
 	return errors.Join(errs...)
 }
 
-// This function wraps sending of an error in the Error format, and
-// handling the failure to marshal that.
-func (a *APIStore) sendAPIStoreError(c *gin.Context, code int, message string) {
-	apiErr := api.Error{
-		Code:    int32(code),
-		Message: message,
+// dbThrottleLimit returns the semaphore limit for a feature flag value.
+// A non-positive value means "disabled" and maps to math.MaxInt32 to effectively bypass throttling.
+func dbThrottleLimit(flagValue int) int64 {
+	if flagValue <= 0 {
+		return math.MaxInt32
 	}
 
-	c.Error(errors.New(message))
-	c.JSON(code, apiErr)
+	return int64(flagValue)
+}
+
+// updateDBThrottleLimits periodically syncs DB throttle semaphore limits from feature flags.
+func (a *APIStore) updateDBThrottleLimits(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = a.snapshotUpsertSem.SetLimit(dbThrottleLimit(a.featureFlags.IntFlag(ctx, featureflags.MaxConcurrentSnapshotUpserts)))
+			_ = a.sandboxListSem.SetLimit(dbThrottleLimit(a.featureFlags.IntFlag(ctx, featureflags.MaxConcurrentSandboxListQueries)))
+			_ = a.snapshotBuildQuerySem.SetLimit(dbThrottleLimit(a.featureFlags.IntFlag(ctx, featureflags.MaxConcurrentSnapshotBuildQueries)))
+		}
+	}
+}
+
+// sendAPIStoreError wraps sending of an error in the Error format.
+func (a *APIStore) sendAPIStoreError(c *gin.Context, code int, message string) {
+	apierrors.SendAPIStoreError(c, code, message)
 }
 
 func (a *APIStore) GetHealth(c *gin.Context) {
-	if a.Healthy == true {
+	if a.Healthy.Load() {
 		c.String(http.StatusOK, "Health check successful")
 
 		return
@@ -242,177 +300,30 @@ func (a *APIStore) GetHealth(c *gin.Context) {
 	c.String(http.StatusServiceUnavailable, "Service is unavailable")
 }
 
-func (a *APIStore) GetTeamFromAPIKey(ctx context.Context, apiKey string) (*types.Team, *api.APIError) {
-	hashedApiKey, err := keys.VerifyKey(keys.ApiKeyPrefix, apiKey)
-	if err != nil {
-		return nil, &api.APIError{
-			Err:       fmt.Errorf("failed to verify api key: %w", err),
-			ClientMsg: "Invalid API key format",
-			Code:      http.StatusUnauthorized,
-		}
-	}
+func (a *APIStore) GetTeamFromAPIKey(ctx context.Context, ginCtx *gin.Context, apiKey string) (*types.Team, *api.APIError) {
+	ctx, span := tracer.Start(ctx, "get team from api key")
+	defer span.End()
 
-	team, err := a.authCache.GetOrSet(ctx, hashedApiKey, func(ctx context.Context, key string) (*types.Team, error) {
-		return dbapi.GetTeamAuth(ctx, a.sqlcDB, key)
-	})
-	if err != nil {
-		var usageErr *dbapi.TeamForbiddenError
-		if errors.As(err, &usageErr) {
-			return nil, &api.APIError{
-				Err:       err,
-				ClientMsg: err.Error(),
-				Code:      http.StatusForbidden,
-			}
-		}
-
-		var blockedErr *dbapi.TeamBlockedError
-		if errors.As(err, &blockedErr) {
-			return nil, &api.APIError{
-				Err:       err,
-				ClientMsg: err.Error(),
-				Code:      http.StatusForbidden,
-			}
-		}
-
-		return nil, &api.APIError{
-			Err:       fmt.Errorf("failed to get the team from db for an api key: %w", err),
-			ClientMsg: "Cannot get the team for the given API key",
-			Code:      http.StatusUnauthorized,
-		}
-	}
-
-	return team, nil
+	return a.authService.ValidateAPIKey(ctx, ginCtx, apiKey)
 }
 
-func (a *APIStore) GetUserFromAccessToken(ctx context.Context, accessToken string) (uuid.UUID, *api.APIError) {
-	hashedToken, err := keys.VerifyKey(keys.AccessTokenPrefix, accessToken)
-	if err != nil {
-		return uuid.UUID{}, &api.APIError{
-			Err:       fmt.Errorf("failed to verify access token: %w", err),
-			ClientMsg: "Invalid access token format",
-			Code:      http.StatusUnauthorized,
-		}
-	}
+func (a *APIStore) GetUserFromAccessToken(ctx context.Context, ginCtx *gin.Context, accessToken string) (uuid.UUID, *api.APIError) {
+	ctx, span := tracer.Start(ctx, "get user from access token")
+	defer span.End()
 
-	userID, err := a.sqlcDB.GetUserIDFromAccessToken(ctx, hashedToken)
-	if err != nil {
-		return uuid.UUID{}, &api.APIError{
-			Err:       fmt.Errorf("failed to get the user from db for an access token: %w", err),
-			ClientMsg: "Cannot get the user for the given access token",
-			Code:      http.StatusUnauthorized,
-		}
-	}
-
-	return userID, nil
+	return a.authService.ValidateAccessToken(ctx, ginCtx, accessToken)
 }
 
-// supabaseClaims defines the claims we expect from the Supabase JWT.
-type supabaseClaims struct {
-	jwt.RegisteredClaims
+func (a *APIStore) GetUserIDFromSupabaseToken(ctx context.Context, ginCtx *gin.Context, supabaseToken string) (uuid.UUID, *api.APIError) {
+	ctx, span := tracer.Start(ctx, "get user id from supabase token")
+	defer span.End()
+
+	return a.authService.ValidateSupabaseToken(ctx, ginCtx, supabaseToken)
 }
 
-func getJWTClaims(ctx context.Context, secrets []string, token string) (*supabaseClaims, error) {
-	errs := make([]error, 0)
+func (a *APIStore) GetTeamFromSupabaseToken(ctx context.Context, ginCtx *gin.Context, teamID string) (*types.Team, *api.APIError) {
+	ctx, span := tracer.Start(ctx, "get team from supabase token")
+	defer span.End()
 
-	for _, secret := range secrets {
-		if len(secret) < minSupabaseJWTSecretLength {
-			logger.L().Warn(ctx, "jwt secret is too short and will be ignored", zap.Int("min_length", minSupabaseJWTSecretLength), zap.String("secret_start", secret[:min(3, len(secret))]))
-
-			continue
-		}
-
-		// Parse the token with the custom claims.
-		token, err := jwt.ParseWithClaims(token, &supabaseClaims{}, func(token *jwt.Token) (any, error) {
-			// Verify that the signing method is HMAC (HS256)
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			// Return the secret key used for signing the token.
-			return []byte(secret), nil
-		})
-		if err != nil {
-			// This error is ignored because we will try to parse the token with the next secret.
-			errs = append(errs, fmt.Errorf("failed to parse supabase token: %w", err))
-
-			continue
-		}
-
-		// Extract and return the custom claims if the token is valid.
-		if claims, ok := token.Claims.(*supabaseClaims); ok && token.Valid {
-			return claims, nil
-		}
-	}
-
-	if len(errs) == 0 {
-		return nil, errors.New("failed to parse supabase token, no secrets found")
-	}
-
-	return nil, errors.Join(errs...)
-}
-
-func (a *APIStore) GetUserIDFromSupabaseToken(ctx context.Context, supabaseToken string) (uuid.UUID, *api.APIError) {
-	claims, err := getJWTClaims(ctx, a.config.SupabaseJWTSecrets, supabaseToken)
-	if err != nil {
-		return uuid.UUID{}, &api.APIError{
-			Err:       err,
-			ClientMsg: "Backend authentication failed",
-			Code:      http.StatusUnauthorized,
-		}
-	}
-
-	userId, err := claims.GetSubject()
-	if err != nil {
-		return uuid.UUID{}, &api.APIError{
-			Err:       fmt.Errorf("failed getting jwt subject: %w", err),
-			ClientMsg: "Backend authentication failed",
-			Code:      http.StatusUnauthorized,
-		}
-	}
-
-	userIDParsed, err := uuid.Parse(userId)
-	if err != nil {
-		return uuid.UUID{}, &api.APIError{
-			Err:       fmt.Errorf("failed parsing user uuid: %w", err),
-			ClientMsg: "Backend authentication failed",
-			Code:      http.StatusUnauthorized,
-		}
-	}
-
-	return userIDParsed, nil
-}
-
-func (a *APIStore) GetTeamFromSupabaseToken(ctx context.Context, teamID string) (*types.Team, *api.APIError) {
-	userID := a.GetUserID(middleware.GetGinContext(ctx))
-
-	cacheKey := fmt.Sprintf("%s-%s", userID.String(), teamID)
-	team, err := a.authCache.GetOrSet(ctx, cacheKey, func(ctx context.Context, _ string) (*types.Team, error) {
-		return dbapi.GetTeamByIDAndUserIDAuth(ctx, a.sqlcDB, teamID, userID)
-	})
-	if err != nil {
-		var usageErr *dbapi.TeamForbiddenError
-		if errors.As(err, &usageErr) {
-			return nil, &api.APIError{
-				Err:       fmt.Errorf("failed getting team: %w", err),
-				ClientMsg: fmt.Sprintf("Forbidden: %s", err.Error()),
-				Code:      http.StatusForbidden,
-			}
-		}
-
-		var blockedErr *dbapi.TeamBlockedError
-		if errors.As(err, &blockedErr) {
-			return nil, &api.APIError{
-				Err:       fmt.Errorf("failed getting team: %w", err),
-				ClientMsg: fmt.Sprintf("Blocked: %s", err.Error()),
-				Code:      http.StatusForbidden,
-			}
-		}
-
-		return nil, &api.APIError{
-			Err:       fmt.Errorf("failed getting team: %w", err),
-			ClientMsg: "Backend authentication failed",
-			Code:      http.StatusUnauthorized,
-		}
-	}
-
-	return team, nil
+	return a.authService.ValidateSupabaseTeam(ctx, ginCtx, teamID)
 }

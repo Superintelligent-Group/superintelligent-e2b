@@ -15,6 +15,7 @@ import (
 )
 
 func TestWatcher(t *testing.T) {
+	t.Parallel()
 	c := setup.GetAPIClient()
 	sbx := utils.SetupSandboxWithCleanup(t, c)
 	envdClient := setup.GetEnvdClient(t, t.Context())
@@ -28,8 +29,8 @@ func TestWatcher(t *testing.T) {
 		Path:      watchDir,
 		Recursive: false,
 	})
-	setup.SetSandboxHeader(createReq.Header(), sbx.SandboxID)
-	setup.SetUserHeader(createReq.Header(), "user")
+	setup.SetSandboxHeader(t, createReq.Header(), sbx.SandboxID)
+	setup.SetUserHeader(t, createReq.Header(), "user")
 
 	createResp, err := envdClient.FilesystemClient.CreateWatcher(t.Context(), createReq)
 	require.NoError(t, err)
@@ -41,8 +42,8 @@ func TestWatcher(t *testing.T) {
 	getReq := connect.NewRequest(&filesystem.GetWatcherEventsRequest{
 		WatcherId: watcherId,
 	})
-	setup.SetSandboxHeader(getReq.Header(), sbx.SandboxID)
-	setup.SetUserHeader(getReq.Header(), "user")
+	setup.SetSandboxHeader(t, getReq.Header(), sbx.SandboxID)
+	setup.SetUserHeader(t, getReq.Header(), "user")
 
 	getResp, err := envdClient.FilesystemClient.GetWatcherEvents(t.Context(), getReq)
 	require.NoError(t, err)
@@ -67,8 +68,8 @@ func TestWatcher(t *testing.T) {
 	removeReq := connect.NewRequest(&filesystem.RemoveWatcherRequest{
 		WatcherId: watcherId,
 	})
-	setup.SetSandboxHeader(removeReq.Header(), sbx.SandboxID)
-	setup.SetUserHeader(removeReq.Header(), "user")
+	setup.SetSandboxHeader(t, removeReq.Header(), sbx.SandboxID)
+	setup.SetUserHeader(t, removeReq.Header(), "user")
 
 	removeResp, err := envdClient.FilesystemClient.RemoveWatcher(t.Context(), removeReq)
 	require.NoError(t, err)
