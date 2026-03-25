@@ -153,6 +153,8 @@ module "cluster" {
   client_server_nested_virtualization = var.client_server_nested_virtualization
   client_node_labels                  = var.client_node_labels
 
+  postgres_ebs_az = "${data.aws_region.current.name}c" # Must match API node AZ
+
   clickhouse_az                    = "${data.aws_region.current.name}a"
   clickhouse_cluster_size          = var.clickhouse_cluster_size
   clickhouse_image_family_prefix   = var.clickhouse_image_family_prefix != "" ? var.clickhouse_image_family_prefix : local.ami_family_prefix
@@ -232,6 +234,19 @@ module "nomad" {
   db_min_idle_connections      = var.db_min_idle_connections
   auth_db_max_open_connections = var.auth_db_max_open_connections
   auth_db_min_idle_connections = var.auth_db_min_idle_connections
+
+  # Resource overrides for dev (fit all jobs on t3.large = 2 vCPU)
+  redis_cpu              = var.redis_cpu
+  redis_memory_mb        = var.redis_memory_mb
+  otel_cpu_count         = var.otel_cpu_count
+  otel_memory_mb         = var.otel_memory_mb
+  ingress_cpu_count      = var.ingress_cpu_count
+  ingress_memory_mb      = var.ingress_memory_mb
+  client_proxy_cpu_count = var.client_proxy_cpu_count
+  client_proxy_memory_mb = var.client_proxy_memory_mb
+  loki_enabled           = var.loki_enabled
+  loki_cpu_count         = var.loki_cpu_count
+  loki_memory_mb         = var.loki_memory_mb
 }
 
 resource "aws_security_group" "cluster_node" {

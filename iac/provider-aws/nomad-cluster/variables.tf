@@ -234,3 +234,8 @@ variable "clickhouse_backups_bucket_name" {
 variable "custom_environments_repository_name" {
   type = string
 }
+
+variable "postgres_ebs_az" {
+  type        = string
+  description = "Availability zone for the persistent Postgres EBS volume"
+}

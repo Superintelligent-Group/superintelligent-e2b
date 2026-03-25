@@ -171,7 +171,7 @@ variable "api_memory_mb" {
 
 variable "api_cpu_count" {
   type    = number
-  default = 1
+  default = 0.5
 }
 
 variable "api_repository_name" {
@@ -288,6 +288,63 @@ variable "otel_collector_grpc_port" {
 variable "logs_proxy_port" {
   type    = number
   default = 30006
+}
+
+# --- Resource overrides (right-size for dev / small clusters) ---
+variable "ingress_cpu_count" {
+  type    = number
+  default = 1
+}
+
+variable "ingress_memory_mb" {
+  type    = number
+  default = 512
+}
+
+variable "client_proxy_cpu_count" {
+  type    = number
+  default = 1
+}
+
+variable "client_proxy_memory_mb" {
+  type    = number
+  default = 512
+}
+
+variable "redis_cpu" {
+  type    = number
+  default = 1000
+}
+
+variable "redis_memory_mb" {
+  type    = number
+  default = 2048
+}
+
+variable "otel_cpu_count" {
+  type    = number
+  default = 1
+}
+
+variable "otel_memory_mb" {
+  type    = number
+  default = 512
+}
+
+variable "loki_enabled" {
+  description = "Whether to deploy Loki for log aggregation (can skip in dev)"
+  type        = bool
+  default     = true
+}
+
+variable "loki_cpu_count" {
+  type    = number
+  default = 1
+}
+
+variable "loki_memory_mb" {
+  type    = number
+  default = 512
 }
 
 # Feature flags

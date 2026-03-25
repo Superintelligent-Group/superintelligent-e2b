@@ -3,5 +3,7 @@ resource "nomad_job" "redis" {
     node_pool   = var.node_pool
     port_number = var.port_number
     port_name   = var.port_name
+    cpu         = var.cpu
+    memory_mb   = var.memory_mb
   })
 }

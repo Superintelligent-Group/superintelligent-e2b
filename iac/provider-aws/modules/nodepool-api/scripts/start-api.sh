@@ -14,6 +14,80 @@ exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&
 ulimit -n 1048576
 export GOMAXPROCS=$(nproc)
 
+# --------------- Persistent Postgres EBS Volume ---------------
+# Attach, format (if needed), and mount the EBS volume for Postgres data.
+# This survives scale-to-zero cycles so DB state persists.
+
+POSTGRES_EBS_VOLUME_ID="${POSTGRES_EBS_VOLUME_ID}"
+POSTGRES_MOUNT_POINT="/opt/e2b-postgres-data"
+EBS_DEVICE="/dev/xvdf"
+
+if [ -n "$POSTGRES_EBS_VOLUME_ID" ]; then
+    echo "Attaching EBS volume $POSTGRES_EBS_VOLUME_ID..."
+
+    # Get instance ID from metadata
+    IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+    AWS_REGION=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+
+    # Wait for volume to be available (may still be attached to a terminated instance)
+    for i in $(seq 1 30); do
+        VOL_STATE=$(aws ec2 describe-volumes --volume-ids "$POSTGRES_EBS_VOLUME_ID" \
+            --region "$AWS_REGION" --query 'Volumes[0].State' --output text 2>/dev/null || echo "unknown")
+        if [ "$VOL_STATE" = "available" ]; then
+            break
+        fi
+        if [ "$VOL_STATE" = "in-use" ]; then
+            # Force detach from previous (terminated) instance
+            ATTACHED_INSTANCE=$(aws ec2 describe-volumes --volume-ids "$POSTGRES_EBS_VOLUME_ID" \
+                --region "$AWS_REGION" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null)
+            echo "Volume attached to $ATTACHED_INSTANCE, force-detaching..."
+            aws ec2 detach-volume --volume-id "$POSTGRES_EBS_VOLUME_ID" --force --region "$AWS_REGION" 2>/dev/null || true
+        fi
+        echo "Waiting for volume ($VOL_STATE)... attempt $i/30"
+        sleep 5
+    done
+
+    # Attach the volume
+    aws ec2 attach-volume \
+        --volume-id "$POSTGRES_EBS_VOLUME_ID" \
+        --instance-id "$INSTANCE_ID" \
+        --device "$EBS_DEVICE" \
+        --region "$AWS_REGION" 2>&1 || echo "WARN: attach-volume failed (may already be attached)"
+
+    # Wait for the device to appear
+    for i in $(seq 1 30); do
+        if [ -b "$EBS_DEVICE" ] || [ -b "/dev/nvme1n1" ]; then
+            break
+        fi
+        echo "Waiting for block device... attempt $i/30"
+        sleep 2
+    done
+
+    # On Nitro instances, /dev/xvdf may appear as /dev/nvme1n1
+    ACTUAL_DEVICE="$EBS_DEVICE"
+    if [ -b "/dev/nvme1n1" ] && [ ! -b "$EBS_DEVICE" ]; then
+        ACTUAL_DEVICE="/dev/nvme1n1"
+    fi
+
+    # Format if no filesystem exists
+    if ! blkid "$ACTUAL_DEVICE" >/dev/null 2>&1; then
+        echo "Formatting $ACTUAL_DEVICE with ext4..."
+        mkfs.ext4 -L e2b-pgdata "$ACTUAL_DEVICE"
+    fi
+
+    # Mount
+    mkdir -p "$POSTGRES_MOUNT_POINT"
+    mount "$ACTUAL_DEVICE" "$POSTGRES_MOUNT_POINT"
+    echo "Mounted $ACTUAL_DEVICE at $POSTGRES_MOUNT_POINT"
+
+    # Ensure postgres user (UID 70 in alpine) can write
+    chown -R 70:70 "$POSTGRES_MOUNT_POINT" 2>/dev/null || true
+else
+    echo "No POSTGRES_EBS_VOLUME_ID configured, using ephemeral storage"
+    mkdir -p "$POSTGRES_MOUNT_POINT"
+fi
+
 sudo tee -a /etc/sysctl.conf <<EOF
 # Increase the maximum number of socket connections
 net.core.somaxconn = 65535

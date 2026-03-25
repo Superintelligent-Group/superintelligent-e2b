@@ -91,3 +91,8 @@ variable "scripts_path" {
   description = "Path to the directory containing startup scripts. Defaults to in-module scripts."
   default     = ""
 }
+
+variable "postgres_ebs_az" {
+  type        = string
+  description = "Availability zone for the persistent Postgres EBS volume. Must match the API node's AZ."
+}

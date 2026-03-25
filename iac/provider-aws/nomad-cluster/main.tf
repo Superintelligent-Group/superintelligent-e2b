@@ -248,6 +248,7 @@ module "api" {
   aws_ecr_account_repository_domain = local.aws_ecr_account_repository_domain
   loki_bucket_arn                   = data.aws_s3_bucket.loki_bucket.arn
 
+  postgres_ebs_az = var.postgres_ebs_az
 }
 
 module "clickhouse" {

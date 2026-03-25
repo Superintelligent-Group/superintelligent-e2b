@@ -83,6 +83,11 @@ resource "aws_iam_role_policy" "scaler" {
         ]
         Resource = "arn:aws:logs:*:*:*"
       },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = "arn:aws:secretsmanager:*:*:secret:e2b-dev/*"
+      },
     ]
   })
 }
@@ -91,13 +96,16 @@ resource "aws_iam_role_policy" "scaler" {
 
 locals {
   lambda_env = {
-    CONTROL_SERVER_ASG_NAME  = var.control_server_asg_name
-    API_ASG_NAME             = var.api_asg_name
-    CLIENT_ASG_NAME          = var.client_asg_name
-    BUILD_ASG_NAME           = var.build_asg_name
-    IDLE_TIMEOUT_MINUTES     = tostring(var.idle_timeout_minutes)
+    CONTROL_SERVER_ASG_NAME    = var.control_server_asg_name
+    API_ASG_NAME               = var.api_asg_name
+    CLIENT_ASG_NAME            = var.client_asg_name
+    BUILD_ASG_NAME             = var.build_asg_name
+    IDLE_TIMEOUT_MINUTES       = tostring(var.idle_timeout_minutes)
     CLIENT_SPOT_INSTANCE_TYPES = jsonencode(var.client_spot_instance_types)
     API_SPOT_INSTANCE_TYPES    = jsonencode(var.api_spot_instance_types)
+    NOMAD_ADDR                 = var.nomad_addr
+    NOMAD_TOKEN_SECRET_ID      = var.nomad_token_secret_id
+    CONSUL_TOKEN_SECRET_ID     = var.consul_token_secret_id
   }
 }
 

@@ -14,6 +14,8 @@ locals {
 
     RUN_CONSUL_FILE_HASH = var.setup_files_hash["run-consul"]
     RUN_NOMAD_FILE_HASH  = var.setup_files_hash["run-nomad"]
+
+    POSTGRES_EBS_VOLUME_ID = aws_ebs_volume.postgres_data.id
   })
 }
 
@@ -32,6 +34,32 @@ data "aws_iam_policy_document" "api_node_policy" {
       "${var.loki_bucket_arn}/*",
       var.loki_bucket_arn,
     ]
+  }
+
+  # Allow API nodes to attach/detach the persistent Postgres EBS volume
+  statement {
+    effect = "Allow"
+    actions = [
+      "ec2:AttachVolume",
+      "ec2:DetachVolume",
+      "ec2:DescribeVolumes",
+    ]
+    resources = ["*"]
+  }
+}
+
+# --------------- Persistent EBS volume for in-cluster Postgres ---------------
+# This volume persists across scale-to-zero cycles. The API node's startup
+# script auto-attaches, formats (if needed), and mounts it at /opt/e2b-postgres-data.
+
+resource "aws_ebs_volume" "postgres_data" {
+  availability_zone = var.postgres_ebs_az
+  size              = 10 # GB — plenty for E2B metadata (teams, templates, builds)
+  type              = "gp3"
+
+  tags = {
+    Name    = "${var.prefix}postgres-data"
+    Purpose = "e2b-postgres-persistent-storage"
   }
 }
 
@@ -116,6 +144,6 @@ resource "aws_autoscaling_group" "api" {
   }
 
   lifecycle {
-    ignore_changes = [desired_capacity]
+    ignore_changes = [desired_capacity, min_size, max_size]
   }
 }

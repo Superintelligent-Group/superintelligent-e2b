@@ -36,9 +36,9 @@ job "redis" {
       driver = "docker"
 
       resources {
-        memory_max = 4096
-        memory     = 2048
-        cpu        = 1000
+        memory_max = ${memory_mb * 2}
+        memory     = ${memory_mb}
+        cpu        = ${cpu}
       }
 
       config {

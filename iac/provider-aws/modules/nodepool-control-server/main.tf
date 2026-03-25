@@ -100,6 +100,6 @@ resource "aws_autoscaling_group" "control_server" {
   health_check_grace_period = 600
 
   lifecycle {
-    ignore_changes = [desired_capacity]
+    ignore_changes = [desired_capacity, min_size, max_size]
   }
 }

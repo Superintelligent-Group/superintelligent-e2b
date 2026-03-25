@@ -174,6 +174,6 @@ resource "aws_autoscaling_group" "client" {
   force_delete_warm_pool = true
 
   lifecycle {
-    ignore_changes = [desired_capacity]
+    ignore_changes = [desired_capacity, min_size, max_size]
   }
 }

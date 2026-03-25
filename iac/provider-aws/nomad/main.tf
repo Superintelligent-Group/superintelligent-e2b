@@ -18,6 +18,8 @@ module "otel_collector" {
   provider_name = "aws"
 
   otel_collector_grpc_port = var.otel_collector_grpc_port
+  cpu_count                = var.otel_cpu_count
+  memory_mb                = var.otel_memory_mb
 
   grafana_otel_collector_token = var.grafana_otel_collector_token
   grafana_otlp_url             = var.grafana_otlp_url
@@ -48,6 +50,8 @@ module "redis" {
   node_pool   = var.api_node_pool
   port_number = var.redis_port
   port_name   = "redis"
+  cpu         = var.redis_cpu
+  memory_mb   = var.redis_memory_mb
 }
 
 module "ingress" {
@@ -55,6 +59,8 @@ module "ingress" {
 
   ingress_count                = var.ingress_count
   ingress_proxy_port           = var.ingress_port
+  ingress_cpu_count            = var.ingress_cpu_count
+  ingress_memory_mb            = var.ingress_memory_mb
   additional_traefik_arguments = var.additional_traefik_arguments
 
   node_pool     = var.api_node_pool
@@ -69,8 +75,10 @@ module "ingress" {
 module "client_proxy" {
   source = "../../modules/job-client-proxy"
 
-  update_stanza      = var.api_cluster_size > 1
-  client_proxy_count = var.client_proxy_count
+  update_stanza          = var.api_cluster_size > 1
+  client_proxy_count     = var.client_proxy_count
+  client_proxy_cpu_count = var.client_proxy_cpu_count
+  client_proxy_memory_mb = var.client_proxy_memory_mb
 
   node_pool   = var.api_node_pool
   environment = var.environment
@@ -225,6 +233,7 @@ module "template_manager_autoscaler" {
 # ---
 module "loki" {
   source = "../../modules/job-loki"
+  count  = var.loki_enabled ? 1 : 0
 
   provider_name = "aws"
   aws_region    = var.aws_region
@@ -233,6 +242,8 @@ module "loki" {
   prevent_colocation = var.api_cluster_size > 2
   bucket_name        = var.loki_bucket_name
   loki_port          = var.loki_port
+  cpu_count          = var.loki_cpu_count
+  memory_mb          = var.loki_memory_mb
 }
 
 # ---

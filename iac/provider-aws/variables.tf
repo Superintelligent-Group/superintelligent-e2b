@@ -59,6 +59,65 @@ variable "client_proxy_count" {
   default = 1
 }
 
+# --- Resource overrides (right-size Nomad jobs for dev clusters) ---
+# --- Resource overrides ---
+# Dev defaults: all jobs fit on t3.large (2 vCPU = 2048 CPU shares)
+# Budget: redis(500) + ingress(300) + otel(200) + otel-nomad(100) + api(500) + client-proxy(300) = 1900
+variable "redis_cpu" {
+  type    = number
+  default = 500
+}
+
+variable "redis_memory_mb" {
+  type    = number
+  default = 1024
+}
+
+variable "ingress_cpu_count" {
+  type    = number
+  default = 0.3
+}
+
+variable "ingress_memory_mb" {
+  type    = number
+  default = 256
+}
+
+variable "client_proxy_cpu_count" {
+  type    = number
+  default = 0.3
+}
+
+variable "client_proxy_memory_mb" {
+  type    = number
+  default = 256
+}
+
+variable "otel_cpu_count" {
+  type    = number
+  default = 0.2
+}
+
+variable "otel_memory_mb" {
+  type    = number
+  default = 256
+}
+
+variable "loki_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "loki_cpu_count" {
+  type    = number
+  default = 0.3
+}
+
+variable "loki_memory_mb" {
+  type    = number
+  default = 256
+}
+
 variable "clickhouse_cluster_size" {
   type    = number
   default = 1

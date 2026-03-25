@@ -17,9 +17,14 @@ module "auto_scaling" {
 
   idle_timeout_minutes = 30
 
-  # Multiple instance types improve spot availability
-  client_spot_instance_types = ["c8i.2xlarge", "c7i.2xlarge", "c6i.2xlarge", "m7i.2xlarge"]
+  # Client nodes need nested virtualization for Firecracker — only c8i/m8i families support it
+  client_spot_instance_types = ["c8i.2xlarge", "m8i.2xlarge", "c8i-flex.2xlarge", "m8i-flex.2xlarge"]
   api_spot_instance_types    = ["t3.large", "t3a.large", "m6i.large"]
+
+  # Nomad/Consul tokens for job re-evaluation after scale-up
+  nomad_addr             = "https://nomad.${var.domain_name}"
+  nomad_token_secret_id  = "e2b-dev/nomad-acl-token"
+  consul_token_secret_id = "e2b-dev/consul-acl-token"
 
   tags = {
     Project   = "superintelligent-e2b"
