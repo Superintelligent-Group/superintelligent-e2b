@@ -289,6 +289,22 @@ Submit a Nomad batch job — Postgres is only accessible from within the VPC.
 Use datacenter `us-east-1c`, default NodePool, and `postgres:15-alpine` image.
 See examples in the repo's operational history.
 
+## Full Rebuild
+
+For a complete destroy-and-rebuild, see [rebuild-from-scratch.md](./rebuild-from-scratch.md).
+It covers every step from AMI to verified sandbox creation (~55 min total).
+
+## E2E Test Suite
+
+```bash
+cd tests
+E2B_API_KEY=e2b_... node e2b-e2e.mjs
+```
+
+Tests: health check, sandbox create/kill, command execution (simple, exit codes,
+concurrent, large output), file I/O, apt install, network access, file permissions,
+PID namespace isolation, timeout extension, lifecycle.
+
 ## Upstream E2B Setup Reference
 
 The canonical self-hosting guide is in [`self-host.md`](../self-host.md). Key steps:
@@ -300,6 +316,27 @@ The canonical self-hosting guide is in [`self-host.md`](../self-host.md). Key st
 6. `make plan-without-jobs && make apply` → `make plan && make apply`
 7. `cd packages/shared && make prep-cluster` (seed DB + build base template)
 
+## Windows Development Notes
+
+**CRLF**: All `.sh`, `.tpl`, `.conf` files must have LF endings (enforced by
+`.gitattributes`). If template builds fail with `sed: unknown option to 's'`,
+the orchestrator binary has CRLF-contaminated embedded templates. Fix:
+
+```bash
+# Convert templates to LF
+find packages/orchestrator -name '*.tpl' -exec sed -i 's/\r$//' {} +
+# Rebuild via Docker
+cd packages/orchestrator && make build
+# Re-upload
+make upload/orchestrator && make upload/template-manager
+```
+
+**Docker**: The orchestrator binary requires `docker build --platform linux/amd64`
+(uses Linux userfaultfd syscall). Can't cross-compile on Windows.
+
+**`make` on Windows**: Use Git Bash or WSL. If `make` is unavailable, run the
+terraform commands from the Makefile manually with the `TF_VAR_*` variables.
+
 ## File Structure
 
 ```
@@ -310,15 +347,23 @@ iac/provider-aws/
 │   ├── variables.tf                   # Instance types, timeouts
 │   ├── outputs.tf                     # Wake function URL output
 │   └── lambda/cluster_scaler.py       # Wake + shutdown Python handlers
+├── modules/nodepool-api/
+│   ├── main.tf                        # EBS volume, IAM, launch template, ASG
+│   ├── scripts/start-api.sh           # EBS attach + mount for Postgres
+│   └── variables.tf                   # postgres_ebs_az
 packages/
 ├── api/                               # E2B API server (Go)
 ├── orchestrator/                      # Sandbox orchestrator + template-manager (Go)
 ├── shared/pkg/keys/                   # API key generation + verification
 ├── db/scripts/seed/postgres/          # Official DB seeding tool (Go)
 ├── shared/scripts/                    # Base template builder (TypeScript)
-└── envd/                              # In-VM guest daemon
+├── envd/                              # In-VM guest daemon
+└── client-proxy/                      # Sandbox port forwarding (Go)
 docs/
 ├── operations-guide.md                # This file
+├── rebuild-from-scratch.md            # Full rebuild playbook
 ├── instance-pricing.md                # Spot pricing + instance selection
 └── database-seed.md                   # DB seeding for volatile Postgres
+tests/
+└── e2b-e2e.mjs                        # End-to-end sandbox test suite
 ```

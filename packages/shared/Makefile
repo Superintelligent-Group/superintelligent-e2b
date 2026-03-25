@@ -9,7 +9,7 @@ generate:
 build-base-template:
 	@echo "Building base template..."
 	@cd scripts; \
-    	npm install --silent; \
+    	pnpm install --silent 2>/dev/null || npm install --silent; \
         E2B_API_KEY=$(E2B_API_KEY); \
         if [ -z "$$E2B_API_KEY" ]; then \
 			read -p "Enter E2B_API_KEY for the base template team: " E2B_API_KEY; \

@@ -26,3 +26,6 @@ errored.tfstate
 *.tfstate.backup
 domain.tf.cloudflare-upstream
 wake-response.json
+
+# pnpm lock files (generated)
+pnpm-lock.yaml
