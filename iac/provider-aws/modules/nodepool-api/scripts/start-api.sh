@@ -116,6 +116,14 @@ cat <<EOF >/root/docker/config.json
 }
 EOF
 
+# --------------- Pre-pull Docker images ---------------
+# Pull images that Nomad jobs will need immediately on startup.
+# This avoids 20-60s delays when batch jobs (like DB seed) run
+# on a fresh node that hasn't cached the image yet.
+echo "Pre-pulling Docker images..."
+docker pull postgres:15-alpine &
+DOCKER_PULL_PID=$!
+
 mkdir -p /etc/systemd/resolved.conf.d/
 touch /etc/systemd/resolved.conf.d/consul.conf
 cat <<EOF >/etc/systemd/resolved.conf.d/consul.conf
@@ -138,3 +146,8 @@ systemctl restart systemd-resolved
     --dns-request-token "${CONSUL_DNS_REQUEST_TOKEN}" &
 
 /opt/nomad/bin/run-nomad.sh --client --consul-token "${CONSUL_TOKEN}" --node-pool "${NODE_POOL}" &
+
+# Wait for background Docker pre-pull to finish (non-blocking if already done)
+if [ -n "${DOCKER_PULL_PID:-}" ]; then
+    wait "$DOCKER_PULL_PID" 2>/dev/null && echo "Docker pre-pull complete" || echo "Docker pre-pull finished (may have had warnings)"
+fi

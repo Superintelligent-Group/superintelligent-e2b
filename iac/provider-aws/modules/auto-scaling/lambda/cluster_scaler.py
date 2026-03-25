@@ -310,15 +310,39 @@ def _run_seed_sql(pg_ip, job_name, sql, timeout_seconds=90):
     return False
 
 
+def _check_db_seeded(pg_ip):
+    """Check if the database already has seed data. Returns True if seeded."""
+    # Run a quick query to check if the team exists
+    ok = _run_seed_sql(
+        pg_ip, "db-check",
+        f"SELECT 1 FROM teams WHERE id = '{SEED_TEAM_ID}';",
+        timeout_seconds=60,
+    )
+    # Cleanup
+    try:
+        _nomad_request("DELETE", "/v1/job/db-check?purge=true")
+    except Exception:
+        pass
+    return ok
+
+
 def _seed_database(pg_ip):
     """Seed the E2B database with team, API key, tier, and base template.
 
     All statements are idempotent (ON CONFLICT DO NOTHING/UPDATE).
-    This is called on every wake cycle because postgres is volatile
-    (data lost when the API node terminates in scale-to-zero).
+    Postgres data persists on EBS across scale-to-zero cycles, so this
+    typically only runs once after initial deploy. The check-before-seed
+    pattern skips the full seed if data already exists (~60s faster).
     """
+    # Fast path: check if DB already has seed data
+    if _check_db_seeded(pg_ip):
+        print("DB already seeded — skipping")
+        return True
+
     import hashlib
     import base64
+
+    print("DB empty — running full seed...")
 
     e2b_key = _get_secret(E2B_API_KEY_SECRET)
     if not e2b_key or not e2b_key.startswith("e2b_"):
@@ -625,9 +649,9 @@ def wake_handler(event, context):
         _fix_api_connection_strings(pg_ip)
         _fix_job_redis_urls(pg_ip)
 
-        # Seed the database — postgres is volatile (in-cluster Nomad job),
-        # so data is lost on every API node termination. All statements are
-        # idempotent, so this is safe to run on every wake cycle.
+        # Seed the database if needed. Postgres data persists on EBS across
+        # scale-to-zero cycles, so this check is fast (exits early if seeded).
+        # Only runs the full seed on first deploy or after volume wipe.
         seed_ok = _seed_database(pg_ip)
         if not seed_ok:
             print("WARN: DB seed failed — API may not authenticate")
