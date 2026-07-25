@@ -48,6 +48,14 @@ resource "aws_route53_record" "cert_validation" {
   type    = each.value.type
   records = [each.value.record]
   ttl     = 300
+
+  # The for_each keys on domain_name, so a certificate covering BOTH the apex
+  # and the wildcard yields two entries that resolve to the SAME validation
+  # record name -- ACM emits one shared CNAME for the pair. Without this the
+  # second create collides with the first ("but it already exists") and the
+  # apply fails. allow_overwrite is the documented idiom for ACM validation
+  # records and also makes re-applies idempotent after a partial failure.
+  allow_overwrite = true
 }
 
 resource "aws_acm_certificate_validation" "wildcard" {
