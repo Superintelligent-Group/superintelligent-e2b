@@ -148,6 +148,8 @@ systemctl restart systemd-resolved
 /opt/nomad/bin/run-nomad.sh --client --consul-token "${CONSUL_TOKEN}" --node-pool "${NODE_POOL}" &
 
 # Wait for background Docker pre-pull to finish (non-blocking if already done)
-if [ -n "${DOCKER_PULL_PID:-}" ]; then
+# The doubled dollar escapes bash brace-expansion so templatefile() emits it
+# literally; unescaped, Terraform reads it as an interpolation and plan fails.
+if [ -n "$${DOCKER_PULL_PID:-}" ]; then
     wait "$DOCKER_PULL_PID" 2>/dev/null && echo "Docker pre-pull complete" || echo "Docker pre-pull finished (may have had warnings)"
 fi

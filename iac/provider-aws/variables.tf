@@ -239,3 +239,14 @@ variable "auth_db_min_idle_connections" {
   type    = number
   default = 5
 }
+
+# COST-00 P3 (SUP-619): the Route53 zone this stack manages records in, when it
+# is NOT the registrable root of var.domain_name. On CommonQuant the apex zone
+# superintelligent.group remains SIG-owned and only e2b.superintelligent.group
+# is delegated here, so this points at the delegated subdomain zone. Empty
+# preserves upstream behaviour (derive the root from domain_name).
+variable "hosted_zone_name" {
+  description = "Explicit Route53 hosted zone name to use instead of the derived registrable root."
+  type        = string
+  default     = ""
+}
