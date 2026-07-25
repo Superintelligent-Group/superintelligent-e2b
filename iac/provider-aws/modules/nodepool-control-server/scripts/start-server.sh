@@ -12,6 +12,18 @@ exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&
 ulimit -n 65536
 export GOMAXPROCS=$(nproc)
 
+# SSM Session Manager agent. The Packer AMI does not ship it, so these nodes are
+# unreachable: no public IP, no SSH key, and a failed Nomad/Consul bootstrap
+# leaves nothing to inspect but the EC2 console buffer. Best-effort and
+# non-fatal on purpose -- under `set -e` a transient snap/apt failure must not
+# abort the cluster bootstrap, which is this script's actual job.
+if ! systemctl is-active --quiet amazon-ssm-agent 2>/dev/null; then
+  (snap install amazon-ssm-agent --classic \
+    || (apt-get update -y && apt-get install -y amazon-ssm-agent)) >/dev/null 2>&1 || true
+  (systemctl enable --now amazon-ssm-agent \
+    || systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service) >/dev/null 2>&1 || true
+fi
+
 aws s3 cp "s3://${SCRIPTS_BUCKET}/run-consul-${RUN_CONSUL_FILE_HASH}.sh" /opt/consul/bin/run-consul.sh
 aws s3 cp "s3://${SCRIPTS_BUCKET}/run-nomad-${RUN_NOMAD_FILE_HASH}.sh" /opt/nomad/bin/run-nomad.sh
 

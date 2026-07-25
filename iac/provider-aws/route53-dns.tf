@@ -9,10 +9,18 @@ locals {
   domain_parts        = split(".", var.domain_name)
   domain_is_subdomain = length(local.domain_parts) > 2
   domain_root         = local.domain_is_subdomain ? join(".", slice(local.domain_parts, length(local.domain_parts) - 2, length(local.domain_parts))) : var.domain_name
+
+  # COST-00 P3 (SUP-619): on CommonQuant the apex zone is NOT in this account —
+  # superintelligent.group stays registered and hosted on the SIG account, with
+  # only e2b.superintelligent.group delegated here via NS records. So resolve
+  # the zone this stack owns (the delegated subdomain) rather than the apex.
+  # var.hosted_zone_name overrides when the two differ; empty keeps upstream
+  # behaviour (look up the registrable root).
+  zone_lookup_name = var.hosted_zone_name != "" ? var.hosted_zone_name : local.domain_root
 }
 
 data "aws_route53_zone" "domain" {
-  name = local.domain_root
+  name = local.zone_lookup_name
 }
 
 # Named "wildcard" to match the reference in alb.tf (certificate_arn)
@@ -40,6 +48,14 @@ resource "aws_route53_record" "cert_validation" {
   type    = each.value.type
   records = [each.value.record]
   ttl     = 300
+
+  # The for_each keys on domain_name, so a certificate covering BOTH the apex
+  # and the wildcard yields two entries that resolve to the SAME validation
+  # record name -- ACM emits one shared CNAME for the pair. Without this the
+  # second create collides with the first ("but it already exists") and the
+  # apply fails. allow_overwrite is the documented idiom for ACM validation
+  # records and also makes re-applies idempotent after a partial failure.
+  allow_overwrite = true
 }
 
 resource "aws_acm_certificate_validation" "wildcard" {

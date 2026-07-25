@@ -23,6 +23,12 @@ resource "aws_iam_role" "control_server" {
 resource "aws_iam_role_policy_attachment" "control_server" {
   for_each = {
     "cluster-node" = var.cluster_node_policy_arn
+    # SSM Session Manager. Without this the node boots but is unreachable —
+    # no shell, no port-forward, no way to inspect a failed Nomad/Consul
+    # bootstrap on a host with no public IP and no SSH key. Observed as
+    # PingStatus=None on both accounts. Adds no inbound network path: the
+    # SSM agent dials out, and every session is auditable in CloudTrail.
+    "ssm-core" = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
   }
 
   role       = aws_iam_role.control_server.name

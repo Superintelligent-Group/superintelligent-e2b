@@ -29,3 +29,8 @@ wake-response.json
 
 # pnpm lock files (generated)
 pnpm-lock.yaml
+
+# COST-00 P3: per-account Terraform working dirs and local plan artifacts
+iac/provider-aws/.terraform-*/
+*.tfplan
+*.sig-backup
