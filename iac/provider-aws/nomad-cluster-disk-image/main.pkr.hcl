@@ -37,6 +37,21 @@ source "amazon-ebs" "ubuntu" {
     Name = "${var.prefix}orch-${formatdate("YYYY-MM-DD-hh-mm-ss", timestamp())}"
   }
 
+  # Stamp the runtime versions onto the AMI itself. Without this an image is
+  # opaque: the only way to learn what Nomad it carries is to boot it and read
+  # the console, because these nodes have no public IP and no SSH key. That
+  # opacity let a rebuild get skipped after the template bumped nomad_version,
+  # and we ran Nomad 1.6.2 (built 2023-09-13) against a template declaring
+  # 1.8.4 for months — surfacing only when upstream jobspecs using
+  # memory_max = -1 (Nomad 1.7+) started returning 500.
+  tags = {
+    Name          = "${var.prefix}orch-${formatdate("YYYY-MM-DD-hh-mm-ss", timestamp())}"
+    NomadVersion  = var.nomad_version
+    ConsulVersion = var.consul_version
+    BuiltAt       = formatdate("YYYY-MM-DD'T'hh:mm:ssZ", timestamp())
+    SourceAMI     = "{{ .SourceAMI }}"
+  }
+
   launch_block_device_mappings {
     device_name           = "/dev/sda1"
     volume_size           = 15
