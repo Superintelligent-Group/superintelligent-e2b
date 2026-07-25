@@ -62,7 +62,11 @@ job "orchestrator-${latest_orchestrator_job_id}" {
 
       resources {
         memory     = 1024
-        memory_max = -1
+        # COST-00: upstream uses memory_max = -1 (unlimited oversubscription),
+        # which requires Nomad 1.7+. Our Packer AMI ships Nomad 1.6.2 and rejects
+        # it ("MemoryMaxMB (-1) should be larger than MemoryMB"). Bounded value
+        # until the AMI is rebuilt on a current Nomad; revert to -1 after that.
+        memory_max = 4096
       }
 
       env {
