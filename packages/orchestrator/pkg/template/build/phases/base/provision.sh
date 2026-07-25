@@ -6,6 +6,10 @@ RESULT_PATH="{{ .ResultPath }}"
 
 echo "Starting provisioning script"
 
+{{ if eq .Provider "gcp" }}
+# GCP Specific logic
+{{ end }}
+
 echo "Making configuration immutable"
 $BUSYBOX chattr +i /etc/resolv.conf
 
@@ -15,7 +19,7 @@ is_package_installed() {
 }
 
 # Install required packages if not already installed
-PACKAGES="systemd systemd-sysv openssh-server sudo chrony socat curl ca-certificates fuse3 iptables git nfs-common"
+PACKAGES="systemd systemd-sysv openssh-server sudo chrony socat curl ca-certificates fuse3 iptables git nfs-common less nftables iputils-ping jq"
 echo "Checking presence of the following packages: $PACKAGES"
 
 MISSING=""
@@ -34,6 +38,11 @@ else
     echo "All required packages are already installed."
 fi
 
+# Set /dev/fuse permissions to 666 for non-root access
+# Use systemd-tmpfiles to set permissions at boot
+mkdir -p /etc/tmpfiles.d
+echo 'z /dev/fuse 0666 root root -' > /etc/tmpfiles.d/fuse.conf
+
 echo "Setting up shell"
 echo "export SHELL='/bin/bash'" >/etc/profile.d/shell.sh
 echo "export PS1='\w \$ '" >/etc/profile.d/prompt.sh
@@ -50,6 +59,12 @@ echo "Setting up chrony"
 mkdir -p /etc/chrony
 cat <<EOF >/etc/chrony/chrony.conf
 refclock PHC /dev/ptp0 poll 2 dpoll 2
+# Step (jump) the clock instead of slewing when the offset exceeds 1s, but only
+# for the first 3 updates after chronyd starts. chronyd restarts on every cold
+# boot/reboot, so this corrects a large boot-time offset fast (TLS needs a
+# correct clock) without risking a backward jump under a running workload.
+# Needed because chrony-wait is masked, so boot no longer blocks on first sync.
+makestep 1.0 3
 EOF
 
 # Add a proxy config, as some environments expects it there (e.g. timemaster in Node Dockerimage)
@@ -66,6 +81,14 @@ EOF
 echo "Increasing inotify watch limit"
 echo 'fs.inotify.max_user_watches=65536' | tee -a /etc/sysctl.conf
 
+# Disable kcompactd background page migration. With 2 MiB host-side hugepage
+# backing of guest RAM, every migration dirties a destination hugepage from
+# the host UFFD's perspective and lands in the next memfile diff, with no
+# corresponding workload benefit between snapshots. We trigger compaction
+# explicitly pre-pause instead.
+echo "Disabling proactive memory compaction"
+echo 'vm.compaction_proactiveness=0' | tee -a /etc/sysctl.conf
+
 echo "Don't wait for ttyS0 (serial console kernel logs)"
 # This is required when the Firecracker kernel args has specified console=ttyS0
 systemctl mask serial-getty@ttyS0.service
@@ -77,6 +100,17 @@ echo "Disable system first boot wizard"
 # This was problem with Ubuntu 24.04, that differently calculate wizard should be called
 # and Linux boot was stuck in wizard until envd wait timeout
 systemctl mask systemd-firstboot.service
+
+echo "Disable chrony-wait"
+# chrony-wait blocks multi-user.target until the first clock sync (~8s);
+# chrony still syncs in the background, nothing needs to wait for it.
+systemctl mask chrony-wait.service
+
+echo "Disable slow boot units not needed in the sandbox"
+# binfmt registrations (foreign-arch exec) take ~1s of CPU early in boot and
+# compete with envd start; e2scrub is for LVM-backed ext4 only.
+systemctl mask systemd-binfmt.service
+systemctl mask e2scrub_reap.service
 
 # Clean machine-id from Docker
 rm -rf /etc/machine-id

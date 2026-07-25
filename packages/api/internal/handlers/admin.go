@@ -6,6 +6,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
@@ -14,8 +16,9 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
-func (a *APIStore) GetNodes(c *gin.Context) {
-	result, err := a.orchestrator.AdminNodes()
+func (a *APIStore) GetNodes(c *gin.Context, params api.GetNodesParams) {
+	clusterID := clusters.WithClusterFallback(params.ClusterID)
+	result, err := a.orchestrator.AdminNodes(clusterID)
 	if err != nil {
 		telemetry.ReportCriticalError(c.Request.Context(), "error when getting nodes", err)
 		a.sendAPIStoreError(c, http.StatusInternalServerError, "Error when getting nodes")
@@ -67,6 +70,12 @@ func (a *APIStore) PostNodesNodeID(c *gin.Context, nodeId api.NodeID) {
 
 	err = node.SendStatusChange(ctx, body.Status)
 	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			a.sendAPIStoreError(c, http.StatusConflict, status.Convert(err).Message())
+
+			return
+		}
+
 		a.sendAPIStoreError(c, http.StatusInternalServerError, fmt.Sprintf("Error when sending status change: %s", err))
 
 		telemetry.ReportCriticalError(ctx, "error when sending status change", err)

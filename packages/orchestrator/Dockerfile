@@ -1,9 +1,15 @@
-ARG GOLANG_VERSION=1.25.4
+ARG GOLANG_VERSION=1.26.5
 
-# It has to match with the host OS version (Ubuntu 22.04 = bookworm)
+# The orchestrator binary is built with CGO and dynamically links against
+# glibc, so the build image's glibc must be <= the host's glibc (forward
+# compatibility only). The host runs Ubuntu 24.04 (glibc 2.39), so bookworm
+# (glibc 2.36) is safe; do NOT bump to trixie (glibc 2.41) without also
+# upgrading the host, or the binary will fail to start with
+# "GLIBC_2.4x not found" errors.
 ARG DEBIAN_VERSION=bookworm
 
 FROM golang:${GOLANG_VERSION}-${DEBIAN_VERSION} AS builder
+ARG TARGETARCH
 
 # Cached golang dependencies
 WORKDIR /build/shared
@@ -32,7 +38,8 @@ COPY ./orchestrator/Makefile ./orchestrator/Makefile
 WORKDIR /build/orchestrator
 
 ARG COMMIT_SHA
-RUN --mount=type=cache,target=/root/.cache/go-build make build-local COMMIT_SHA=${COMMIT_SHA}
+# Use Docker's TARGETARCH (set by --platform) so GOARCH matches the container platform.
+RUN --mount=type=cache,target=/root/.cache/go-build make build-local COMMIT_SHA=${COMMIT_SHA} BUILD_ARCH=${TARGETARCH}
 
 FROM scratch
 

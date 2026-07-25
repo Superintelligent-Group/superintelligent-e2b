@@ -1,4 +1,6 @@
-package smoketest_test
+//go:build linux
+
+package smoketest
 
 import (
 	"context"
@@ -8,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,10 +20,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
 
+	"github.com/e2b-dev/infra/packages/clickhouse/pkg/hoststats"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/proxy"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/artifact"
 	blockmetrics "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
@@ -75,7 +82,7 @@ func TestSmokeAllFCVersions(t *testing.T) { //nolint:paralleltest // subtests sh
 			force := true
 			_, err := infra.builder.Build(
 				ctx,
-				storage.TemplateFiles{BuildID: buildID},
+				storage.Paths{BuildID: buildID},
 				config.TemplateConfig{
 					Version:            templates.TemplateV2LatestVersion,
 					TemplateID:         "smoke-" + fcMajor,
@@ -177,14 +184,18 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 	ti := &testInfra{}
 
 	// Storage
-	persistenceTemplate, err := storage.GetStorageProvider(ctx, storage.TemplateStorageConfig)
+	templateSpec, err := cfg.TemplateStorage()
+	require.NoError(t, err)
+	persistenceTemplate, err := storage.NewProvider(ctx, templateSpec)
 	require.NoError(t, err)
 
-	persistenceBuild, err := storage.GetStorageProvider(ctx, storage.BuildCacheStorageConfig)
+	buildCacheSpec, err := cfg.BuildCacheStorage()
+	require.NoError(t, err)
+	persistenceBuild, err := storage.NewProvider(ctx, buildCacheSpec)
 	require.NoError(t, err)
 
 	// NBD
-	devicePool, err := nbd.NewDevicePool()
+	devicePool, err := nbd.NewDevicePool(orcConfig.NBDPoolSize)
 	require.NoError(t, err)
 	go devicePool.Populate(ctx)
 	ti.closers = append(ti.closers, func(ctx context.Context) { devicePool.Close(ctx) })
@@ -225,7 +236,7 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 	ti.closers = append(ti.closers, func(ctx context.Context) { sandboxProxy.Close(ctx) })
 
 	// Factory + Builder
-	factory := sandbox.NewFactory(orcConfig.BuilderConfig, networkPool, devicePool, flags, nil, nil, sandboxes)
+	factory := sandbox.NewFactory(orcConfig.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
 	ti.factory = factory
 
 	buildMetrics, _ := metrics.NewBuildMetrics(noop.MeterProvider{})
@@ -233,6 +244,7 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 		builderConfig, l, flags, factory,
 		persistenceTemplate, persistenceBuild, artifactRegistry,
 		dockerhubRepo, sandboxProxy, sandboxes, templateCache, buildMetrics,
+		nil,
 	)
 
 	return ti
@@ -282,7 +294,7 @@ func findOrBuildEnvd(t *testing.T) string {
 
 	cmd := exec.CommandContext(t.Context(), "go", "build", "-o", binPath, ".") //nolint:gosec // trusted input
 	cmd.Dir = envdDir
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Skipf("failed to build envd: %v\n%s", err, out)
@@ -355,15 +367,25 @@ func setupEnvVars(t *testing.T, dataDir, envdPath string) {
 
 func downloadKernel(t *testing.T, dataDir string) {
 	t.Helper()
-	dst := filepath.Join(dataDir, "kernels", featureflags.DefaultKernelVersion, "vmlinux.bin")
-	url := fmt.Sprintf("https://storage.googleapis.com/e2b-prod-public-builds/kernels/%s/vmlinux.bin", featureflags.DefaultKernelVersion)
+	dst := filepath.Join(dataDir, "kernels", featureflags.DefaultKernelVersion, artifact.KernelFileName)
+	url := fmt.Sprintf("https://storage.googleapis.com/e2b-prod-public-builds/kernels/%s/%s", featureflags.DefaultKernelVersion, artifact.KernelFileName)
 	downloadFile(t, url, dst, 0o644)
 }
 
 func downloadFC(t *testing.T, dataDir, version string) {
 	t.Helper()
-	dst := filepath.Join(dataDir, "fc-versions", version, "firecracker")
-	url := fmt.Sprintf("https://github.com/e2b-dev/fc-versions/releases/download/%s/firecracker", version)
+
+	// Old releases in https://github.com/e2b-dev/fc-versions/releases don't build
+	// x86_64 and aarch64 binaries. They just build the former and the asset's name
+	// is just 'firecracker'
+	// TODO: Drop this work-around once we remove support for Firecracker v1.10
+	assetName := "firecracker-amd64"
+	if strings.HasPrefix(version, "v1.10") {
+		assetName = artifact.FirecrackerBinaryName
+	}
+
+	dst := filepath.Join(dataDir, "fc-versions", version, artifact.FirecrackerBinaryName)
+	url := fmt.Sprintf("https://github.com/e2b-dev/fc-versions/releases/download/%s/%s", version, assetName)
 	downloadFile(t, url, dst, 0o755)
 }
 

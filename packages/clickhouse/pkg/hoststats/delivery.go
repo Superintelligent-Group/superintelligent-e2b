@@ -6,6 +6,10 @@ import (
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/clickhouse/pkg/batcher"
@@ -23,15 +27,15 @@ const InsertSandboxHostStatQuery = `INSERT INTO sandbox_host_stats
     sandbox_team_id,
     sandbox_vcpu_count,
     sandbox_memory_mb,
-    firecracker_cpu_user_time,
-    firecracker_cpu_system_time,
-    firecracker_memory_rss,
-    firecracker_memory_vms,
     cgroup_cpu_usage_usec,
     cgroup_cpu_user_usec,
     cgroup_cpu_system_usec,
     cgroup_memory_usage_bytes,
     cgroup_memory_peak_bytes,
+    delta_cgroup_cpu_usage_usec,
+    delta_cgroup_cpu_user_usec,
+    delta_cgroup_cpu_system_usec,
+    interval_us,
     sandbox_type
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -41,10 +45,21 @@ type ClickhouseDelivery struct {
 	conn    driver.Conn
 }
 
+type GatedClickhouseDelivery struct {
+	*ClickhouseDelivery
+
+	ff *featureflags.Client
+}
+
+var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/clickhouse/pkg/hoststats")
+
+const DefaultBatcherName = "sandbox-host-stats"
+
 func NewDefaultClickhouseHostStatsDelivery(
 	ctx context.Context,
 	conn driver.Conn,
 	featureFlags *featureflags.Client,
+	batcherName string,
 ) (*ClickhouseDelivery, error) {
 	maxBatchSize := featureFlags.IntFlag(ctx, featureflags.ClickhouseBatcherMaxBatchSize)
 	maxDelay := time.Duration(featureFlags.IntFlag(ctx, featureflags.ClickhouseBatcherMaxDelay)) * time.Millisecond
@@ -52,6 +67,7 @@ func NewDefaultClickhouseHostStatsDelivery(
 
 	return NewClickhouseHostStatsDelivery(
 		ctx, conn, batcher.BatcherOptions{
+			Name:         batcherName,
 			MaxBatchSize: maxBatchSize,
 			MaxDelay:     maxDelay,
 			QueueSize:    batcherQueueSize,
@@ -62,14 +78,18 @@ func NewDefaultClickhouseHostStatsDelivery(
 	)
 }
 
+func NewGatedDelivery(inner *ClickhouseDelivery, featureFlags *featureflags.Client) *GatedClickhouseDelivery {
+	return &GatedClickhouseDelivery{ClickhouseDelivery: inner, ff: featureFlags}
+}
+
 func NewClickhouseHostStatsDelivery(
 	ctx context.Context,
 	conn driver.Conn,
 	opts batcher.BatcherOptions,
 ) (*ClickhouseDelivery, error) {
-	var err error
-
 	delivery := &ClickhouseDelivery{conn: conn}
+
+	var err error
 	delivery.batcher, err = batcher.NewBatcher(delivery.batchInserter, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create batcher: %w", err)
@@ -83,27 +103,35 @@ func NewClickhouseHostStatsDelivery(
 }
 
 func (c *ClickhouseDelivery) Push(stat SandboxHostStat) error {
-	ok, err := c.batcher.Push(stat)
-	if err != nil {
-		return err
-	}
+	return c.batcher.Push(stat)
+}
 
-	if !ok {
-		return batcher.ErrBatcherQueueFull
+func (c *GatedClickhouseDelivery) Push(stat SandboxHostStat) error {
+	if c.ff != nil && c.ff.BoolFlag(context.Background(), featureflags.ClickhouseWriteFanoutFlag) {
+		return c.ClickhouseDelivery.Push(stat)
 	}
 
 	return nil
 }
 
-func (c *ClickhouseDelivery) Close(context.Context) error {
+// Close drains the batcher. ctx is ignored to avoid leaking the flush goroutine.
+func (c *ClickhouseDelivery) Close(_ context.Context) error {
 	return c.batcher.Stop()
 }
 
 func (c *ClickhouseDelivery) batchInserter(ctx context.Context, stats []SandboxHostStat) error {
+	attrs := trace.WithAttributes(attribute.Int("batch.size", len(stats)))
+	ctx, span := tracer.Start(ctx, "Flush host stats batch to Clickhouse", attrs)
+	defer span.End()
+
 	batch, err := c.conn.PrepareBatch(ctx, InsertSandboxHostStatQuery, driver.WithReleaseConnection())
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "prepare batch failed")
+
 		return fmt.Errorf("error preparing batch: %w", err)
 	}
+	defer batch.Close()
 
 	for _, stat := range stats {
 		err := batch.Append(
@@ -115,24 +143,29 @@ func (c *ClickhouseDelivery) batchInserter(ctx context.Context, stats []SandboxH
 			stat.SandboxTeamID,
 			stat.SandboxVCPUCount,
 			stat.SandboxMemoryMB,
-			stat.FirecrackerCPUUserTime,
-			stat.FirecrackerCPUSystemTime,
-			stat.FirecrackerMemoryRSS,
-			stat.FirecrackerMemoryVMS,
 			stat.CgroupCPUUsageUsec,
 			stat.CgroupCPUUserUsec,
 			stat.CgroupCPUSystemUsec,
 			stat.CgroupMemoryUsage,
 			stat.CgroupMemoryPeak,
+			stat.DeltaCgroupCPUUsageUsec,
+			stat.DeltaCgroupCPUUserUsec,
+			stat.DeltaCgroupCPUSystemUsec,
+			stat.IntervalUs,
 			stat.SandboxType,
 		)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "append failed")
+
 			return fmt.Errorf("error appending %d host stat to batch: %w", len(stats), err)
 		}
 	}
 
-	err = batch.Send()
-	if err != nil {
+	if err = batch.Send(); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "send failed")
+
 		return fmt.Errorf("error sending %d host stats batch: %w", len(stats), err)
 	}
 

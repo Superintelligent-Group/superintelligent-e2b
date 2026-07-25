@@ -2,29 +2,55 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
+	e2bgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc"
 	proxygrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/proxy"
 )
 
 type grpcPausedSandboxResumer struct {
 	conn   *grpc.ClientConn
 	client proxygrpc.SandboxServiceClient
+	auth   grpcResumeAuth
 }
 
-func NewGrpcPausedSandboxResumer(address string) (PausedSandboxResumer, error) {
-	// Client-proxy uses this gRPC client to trigger ResumeSandbox when needed.
-	if strings.TrimSpace(address) == "" {
-		return nil, fmt.Errorf("api grpc address is required")
+type GRPCOAuthConfig struct {
+	ClientID     string
+	ClientSecret string
+	TokenURL     string
+}
+
+func NewGRPCPausedSandboxResumer(ctx context.Context, address string, oauthConfig GRPCOAuthConfig, useTLS bool) (PausedSandboxResumer, error) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return nil, errors.New("api grpc address is required")
 	}
 
-	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	auth, err := newGrpcResumeAuth(ctx, oauthConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	creds := insecure.NewCredentials()
+	if useTLS {
+		creds = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+	}
+
+	conn, err := grpc.NewClient(
+		address,
+		grpc.WithTransportCredentials(creds),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create grpc client: %w", err)
 	}
@@ -32,7 +58,12 @@ func NewGrpcPausedSandboxResumer(address string) (PausedSandboxResumer, error) {
 	return &grpcPausedSandboxResumer{
 		conn:   conn,
 		client: proxygrpc.NewSandboxServiceClient(conn),
+		auth:   auth,
 	}, nil
+}
+
+func (c *grpcPausedSandboxResumer) Init(ctx context.Context) {
+	e2bgrpc.ObserveConnection(ctx, c.conn, "api-resumer")
 }
 
 func (c *grpcPausedSandboxResumer) Close(_ context.Context) error {
@@ -48,6 +79,11 @@ func (c *grpcPausedSandboxResumer) Resume(ctx context.Context, sandboxId string,
 
 	if envdAccessToken != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, proxygrpc.MetadataEnvdAccessToken, envdAccessToken)
+	}
+
+	ctx, err := c.auth.authorize(ctx)
+	if err != nil {
+		return "", err
 	}
 
 	resp, err := c.client.ResumeSandbox(ctx, &proxygrpc.SandboxResumeRequest{

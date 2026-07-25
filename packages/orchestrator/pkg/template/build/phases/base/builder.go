@@ -1,3 +1,5 @@
+//go:build linux
+
 package base
 
 import (
@@ -34,7 +36,6 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
-	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 const (
@@ -183,13 +184,13 @@ func (bb *BaseBuilder) buildLayerFromOCI(
 		return metadata.Template{}, fmt.Errorf("error building environment: %w", err)
 	}
 
-	cacheFiles, err := storage.TemplateFiles{BuildID: baseMetadata.Template.BuildID}.CacheFiles(bb.BuildContext.BuilderConfig.StorageConfig)
+	cachePaths, err := storage.Paths{BuildID: baseMetadata.Template.BuildID}.Cache(bb.BuildContext.BuilderConfig.StorageConfig)
 	if err != nil {
 		err = errors.Join(err, rootfs.Close(), memfile.Close())
 
 		return metadata.Template{}, fmt.Errorf("error creating template files: %w", err)
 	}
-	localTemplate := sbxtemplate.NewLocalTemplate(cacheFiles, rootfs, memfile)
+	localTemplate := sbxtemplate.NewLocalTemplate(cachePaths, rootfs, memfile)
 	defer localTemplate.Close(ctx)
 
 	// Env variables from the Docker image
@@ -200,9 +201,11 @@ func (bb *BaseBuilder) buildLayerFromOCI(
 
 	// Allow sandbox internet access during provisioning (nil network = no restrictions).
 	baseSbxConfig := sandbox.NewConfig(sandbox.Config{
-		Vcpu:      bb.Config.VCpuCount,
-		RamMB:     bb.Config.MemoryMB,
-		HugePages: bb.Config.HugePages,
+		Vcpu:              bb.Config.VCpuCount,
+		RamMB:             bb.Config.MemoryMB,
+		HugePages:         bb.Config.HugePages,
+		FreePageReporting: bb.Config.FreePageReporting,
+		FreePageHinting:   bb.Config.FreePageHinting,
 
 		Envd: sandbox.EnvdMetadata{
 			Version: bb.EnvdVersion,
@@ -292,6 +295,7 @@ func (bb *BaseBuilder) buildLayerFromOCI(
 			UpdateEnvd:     false,
 			SandboxCreator: sandboxCreator,
 			ActionExecutor: actionExecutor,
+			BuildOrigin:    storage.ObjectOriginTemplateBuildCache,
 		},
 	)
 	if err != nil {
@@ -322,7 +326,7 @@ func (bb *BaseBuilder) Layer(
 		tm, err := bb.index.Cached(ctx, bb.Config.FromTemplate.GetBuildID())
 		if err != nil {
 			if errors.Is(err, storage.ErrObjectNotExist) {
-				return phases.LayerResult{}, phases.NewPhaseBuildError(bb.Metadata(), fmt.Errorf("error getting base template, you may need to rebuild it first"))
+				return phases.LayerResult{}, phases.NewPhaseBuildError(bb.Metadata(), errors.New("error getting base template, you may need to rebuild it first"))
 			}
 
 			return phases.LayerResult{}, fmt.Errorf("error getting base template: %w", err)
@@ -343,7 +347,7 @@ func (bb *BaseBuilder) Layer(
 
 		// This is a compatibility for v1 template builds
 		if bb.IsV1Build {
-			cmdMeta.WorkDir = utils.ToPtr("/home/user")
+			cmdMeta.WorkDir = new("/home/user")
 		}
 
 		meta := metadata.Template{

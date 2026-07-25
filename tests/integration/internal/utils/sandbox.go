@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,11 +15,37 @@ import (
 	"github.com/e2b-dev/infra/tests/integration/internal/setup"
 )
 
+// MaxConcurrentSandboxes gates parallel sandbox creation in tests. The
+// integration test team is granted extra capacity in seed.go (base tier 20 +
+// addon 200 = 220), so this can stay well below that ceiling.
+const MaxConcurrentSandboxes = 100
+
+// sandboxSemaphore gates sandbox creation so parallel tests don't exceed the
+// tier's concurrent instance limit. A slot is acquired before creation and
+// released after teardown in t.Cleanup.
+var sandboxSemaphore = make(chan struct{}, MaxConcurrentSandboxes)
+
+// AcquireSandboxSlot blocks until a sandbox slot is available and
+// returns an idempotent release function. The slot is also released
+// automatically via t.Cleanup, so callers that tie the sandbox
+// lifetime to the test can simply ignore the return value. Callers
+// that tear down sandboxes inline (loops, sequential creates) can
+// call the returned function early to free the slot sooner.
+func AcquireSandboxSlot(t *testing.T) func() {
+	t.Helper()
+	sandboxSemaphore <- struct{}{}
+	release := sync.OnceFunc(func() { <-sandboxSemaphore })
+	t.Cleanup(release)
+
+	return release
+}
+
 type SandboxConfig struct {
 	templateID          string
 	metadata            api.SandboxMetadata
 	timeout             int32
 	autoPause           bool
+	autoPauseMemory     *bool
 	autoResume          *api.SandboxAutoResumeConfig
 	network             *api.SandboxNetworkConfig
 	allowInternetAccess *bool
@@ -48,6 +75,14 @@ func WithTimeout(timeout int32) SandboxOption {
 func WithAutoPause(autoPause bool) SandboxOption {
 	return func(config *SandboxConfig) {
 		config.autoPause = autoPause
+	}
+}
+
+// WithAutoPauseMemory controls the snapshot kind taken when the sandbox
+// auto-pauses on timeout. false requests a filesystem-only auto-pause.
+func WithAutoPauseMemory(memory bool) SandboxOption {
+	return func(config *SandboxConfig) {
+		config.autoPauseMemory = &memory
 	}
 }
 
@@ -81,9 +116,13 @@ func WithTemplateID(templateID string) SandboxOption {
 	}
 }
 
-// SetupSandboxWithCleanup creates a new sandbox and returns its data
+// SetupSandboxWithCleanup creates a new sandbox and returns its data.
+// It acquires a semaphore slot to stay within the tier's concurrent instance
+// limit; the slot is released after the sandbox is torn down in t.Cleanup.
 func SetupSandboxWithCleanup(t *testing.T, c *api.ClientWithResponses, options ...SandboxOption) *api.Sandbox {
 	t.Helper()
+
+	release := AcquireSandboxSlot(t)
 
 	// t.Context() doesn't work with go vet, so we use our own context
 	ctx, cancel := context.WithCancel(t.Context())
@@ -111,6 +150,7 @@ func SetupSandboxWithCleanup(t *testing.T, c *api.ClientWithResponses, options .
 			Timeout:             &config.timeout,
 			Metadata:            &config.metadata,
 			AutoPause:           &config.autoPause,
+			AutoPauseMemory:     config.autoPauseMemory,
 			AutoResume:          config.autoResume,
 			Network:             config.network,
 			AllowInternetAccess: config.allowInternetAccess,
@@ -136,10 +176,14 @@ func SetupSandboxWithCleanup(t *testing.T, c *api.ClientWithResponses, options .
 
 		t.Cleanup(func() {
 			TeardownSandbox(t, c, sbx.SandboxID)
+			release()
 		})
 
 		return sbx
 	}
+
+	// Release the slot since we never created a sandbox.
+	release()
 
 	t.Logf("Sandbox creation failed after 10 retries")
 	t.FailNow()

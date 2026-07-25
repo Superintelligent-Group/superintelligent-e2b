@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/posthog/posthog-go"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
@@ -36,6 +37,11 @@ func (a *APIStore) DeleteVolumesVolumeID(c *gin.Context, volumeID api.VolumeID) 
 		return
 	}
 
+	a.posthog.CreateAnalyticsTeamEvent(ctx, team.ID.String(), "deleted_volume", posthog.NewProperties().
+		Set("volume_id", volume.ID.String()).
+		Set("volume_name", volume.Name),
+	)
+
 	go func(ctx context.Context) {
 		// if this fails, we can clean it up later
 		if err := a.deleteVolume(ctx, clusterID, volume); err != nil {
@@ -47,7 +53,7 @@ func (a *APIStore) DeleteVolumesVolumeID(c *gin.Context, volumeID api.VolumeID) 
 }
 
 func (a *APIStore) deleteVolume(ctx context.Context, clusterID uuid.UUID, volume queries.Volume) error {
-	return a.executeOnOrchestratorByClusterID(ctx, clusterID, func(ctx context.Context, client *clusters.GRPCClient) error {
+	return a.executeOnOrchestratorByClusterID(ctx, clusterID, volume, func(ctx context.Context, client *clusters.GRPCClient) error {
 		_, err := client.Volumes.DeleteVolume(ctx, &orchestrator.DeleteVolumeRequest{
 			Volume: toVolumeKey(volume),
 		})

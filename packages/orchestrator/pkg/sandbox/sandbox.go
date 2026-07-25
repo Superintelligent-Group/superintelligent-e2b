@@ -1,3 +1,5 @@
+//go:build linux
+
 package sandbox
 
 import (
@@ -6,10 +8,10 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -30,6 +32,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/prefetch"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/scheduling"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
@@ -42,10 +45,33 @@ import (
 )
 
 var (
-	meter                        = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox")
-	envdInitCalls                = utils.Must(telemetry.GetCounter(meter, telemetry.EnvdInitCalls))
-	waitForEnvdDurationHistogram = utils.Must(telemetry.GetHistogram(meter, telemetry.WaitForEnvdDurationHistogramName))
+	meter                         = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox")
+	envdInitCalls                 = utils.Must(telemetry.GetCounter(meter, telemetry.EnvdInitCalls))
+	waitForEnvdDurationHistogram  = utils.Must(telemetry.GetHistogram(meter, telemetry.WaitForEnvdDurationHistogramName))
+	envdCollapseDurationHistogram = utils.Must(telemetry.GetHistogram(meter, telemetry.EnvdCollapseDurationHistogramName))
+	envdCollapseChunks            = utils.Must(telemetry.GetCounter(meter, telemetry.EnvdCollapseChunks))
+	guestSyncDurationHistogram    = utils.Must(telemetry.GetHistogram(meter, telemetry.GuestSyncDurationHistogramName))
+
+	uffdStartupPagesHistogram       = utils.Must(telemetry.GetHistogram(meter, telemetry.UffdStartupPagesHistogramName))
+	uffdStartupSourcePagesHistogram = utils.Must(telemetry.GetHistogram(meter, telemetry.UffdStartupSourcePagesHistogramName))
+	uffdStartupBytesHistogram       = utils.Must(telemetry.GetHistogram(meter, telemetry.UffdStartupBytesHistogramName))
 )
+
+// Sandbox start types recorded on sandbox start/init metrics via the
+// start_type attribute.
+type StartType string
+
+const (
+	StartTypeCreate StartType = "create" // cold boot (template build)
+	StartTypeResume StartType = "resume" // resume from a snapshot (the common runtime path)
+	StartTypeReboot StartType = "reboot" // cold boot from a snapshot rootfs (filesystem-only resume)
+)
+
+// ErrWaitForEnvdTimeout is the cancel cause used when WaitForEnvd exceeds its timeout.
+var ErrWaitForEnvdTimeout = errors.New("syncing took too long")
+
+// ErrFcProcessExited is the cancel cause used when the Firecracker process exits during WaitForEnvd.
+var ErrFcProcessExited = errors.New("fc process exited prematurely")
 
 var SandboxHttpTransport = otelhttp.NewTransport(
 	&http.Transport{
@@ -69,14 +95,24 @@ type Config struct {
 	RamMB int64
 
 	// TotalDiskSizeMB optional, now used only for metrics.
-	TotalDiskSizeMB int64
-	HugePages       bool
+	TotalDiskSizeMB   int64
+	HugePages         bool
+	FreePageReporting bool
+	FreePageHinting   bool
 
 	Envd EnvdMetadata
 
 	FirecrackerConfig fc.Config
 
+	// SkipEnvdWait skips the post-resume wait for envd readiness. Used by the
+	// resume-build gdb debugging flow: the guest is held at a gdb entry
+	// breakpoint and never boots envd, so the readiness wait would otherwise
+	// time out and tear the sandbox down before a debugger can attach.
+	SkipEnvdWait bool
+
 	VolumeMounts []VolumeMountConfig
+
+	MaxSandboxLengthHours int64
 
 	// mu protects mutable sub-fields of Network (Egress, Ingress).
 	// The Network pointer itself is set once at construction and never replaced.
@@ -157,12 +193,26 @@ type RuntimeMetadata struct {
 	SandboxID   string
 	ExecutionID string
 
-	// TeamID optional, used only for logging
+	// TeamID is best-effort metadata; not always populated so do not use for
+	// decisions or feature-flag targeting.
 	TeamID string
 
-	// BuildID is the ID of the associated template build.
 	BuildID     string
 	SandboxType SandboxType
+}
+
+// sandboxLDContext builds an LD context with envd/kernel/FC-version attributes for
+// per-sandbox flag targeting. Team/template targeting comes from the team and
+// template contexts the caller embeds in ctx.
+func sandboxLDContext(runtime RuntimeMetadata, config *Config) ldcontext.Context {
+	return ldcontext.NewBuilder(runtime.SandboxID).
+		Kind(featureflags.SandboxKind).
+		SetString(featureflags.SandboxTemplateAttribute, runtime.TemplateID).
+		SetString(featureflags.SandboxKernelVersionAttribute, config.FirecrackerConfig.KernelVersion).
+		SetString(featureflags.SandboxFirecrackerVersionAttribute, config.FirecrackerConfig.FirecrackerVersion).
+		SetString(featureflags.SandboxEnvdVersionAttribute, config.Envd.Version).
+		SetString(featureflags.SandboxTypeAttribute, runtime.SandboxType.String()).
+		Build()
 }
 
 type Resources struct {
@@ -173,6 +223,12 @@ type Resources struct {
 
 type internalConfig struct {
 	EnvdInitRequestTimeout time.Duration
+
+	// envdServerURLOverride, when non-empty, replaces the default
+	// http://<slot-ip>:<envd-port> base address used for envd HTTP calls.
+	// Test-only: it lets unit tests point envd ops (e.g. fsfreeze/fsthaw) at an
+	// httptest server.
+	envdServerURLOverride string
 }
 
 type Metadata struct {
@@ -205,6 +261,8 @@ type Sandbox struct {
 	*Resources
 	*Metadata
 
+	updateMu sync.Mutex
+
 	// LifecycleID is a unique identifier for each Firecracker process.
 	// It is used internally by the orchestrator for map eviction guards
 	// and proxy connection pooling. Unlike ExecutionID (which is stable
@@ -212,9 +270,16 @@ type Sandbox struct {
 	// every time a new Firecracker VM is started.
 	LifecycleID string
 
+	// Fresh host timestamp marking lifecycle start.
+	LifecycleStartedAt time.Time
+
 	config  cfg.BuilderConfig
 	files   *storage.SandboxFiles
 	cleanup *Cleanup
+
+	sandboxes *Map
+
+	featureFlags *featureflags.Client
 
 	process      *fc.Process
 	cgroupHandle *cgroup.CgroupHandle
@@ -229,11 +294,32 @@ type Sandbox struct {
 	// It was used to store the config to allow API restarts
 	APIStoredConfig *orchestrator.SandboxConfig
 
+	CABundle string
+
 	exit *utils.ErrorOnce
 
 	stop utils.Lazy[error]
 
-	started atomic.Bool
+	// startupStatsOnce guards the orchestrator.sandbox.uffd.startup.* recording
+	// so it fires only on the first WaitForEnvd — the actual sandbox start.
+	// ServeStats() is lifetime-cumulative on the UFFD handler, so a later
+	// WaitForEnvd on the same handler (e.g. the envd-binary swap + restart in a
+	// template build) would otherwise emit a sample inflated with post-startup
+	// faults rather than that init's working set.
+	startupStatsOnce sync.Once
+
+	// skipStartupMetrics suppresses the per-start KPI histograms (envd-init
+	// duration, uffd startup pages/source-pages/bytes) for a throwaway resume,
+	// so the warm harvest never pollutes the customer resume distributions. Set
+	// from the WithoutLiveRegistration resume option.
+	skipStartupMetrics bool
+}
+
+func (s *Sandbox) RunUpdate(update func() error) error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	return update()
 }
 
 func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
@@ -242,11 +328,6 @@ func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
 		TemplateID: s.Runtime.TemplateID,
 		TeamID:     s.Runtime.TeamID,
 	}
-}
-
-// IsRunning returns whether the sandbox has finished starting and is running.
-func (s *Sandbox) IsRunning() bool {
-	return s.started.Load()
 }
 
 // GetStartedAt returns the sandbox start time in a thread-safe manner.
@@ -273,6 +354,8 @@ type Factory struct {
 	featureFlags      *featureflags.Client
 	hostStatsDelivery hoststats.Delivery
 	cgroupManager     cgroup.Manager
+	egressProxy       network.EgressProxy
+	networkAssignHook NetworkAssignHook
 }
 
 func NewFactory(
@@ -282,8 +365,14 @@ func NewFactory(
 	featureFlags *featureflags.Client,
 	hostStatsDelivery hoststats.Delivery,
 	cgroupManager cgroup.Manager,
+	egressProxy network.EgressProxy,
+	networkAssignHook NetworkAssignHook,
 	sandboxes *Map,
 ) *Factory {
+	if networkAssignHook == nil {
+		networkAssignHook = NoopNetworkAssignHook{}
+	}
+
 	return &Factory{
 		Sandboxes:         sandboxes,
 		config:            config,
@@ -292,7 +381,44 @@ func NewFactory(
 		featureFlags:      featureFlags,
 		hostStatsDelivery: hostStatsDelivery,
 		cgroupManager:     cgroupManager,
+		egressProxy:       egressProxy,
+		networkAssignHook: networkAssignHook,
 	}
+}
+
+// runNetworkAssignHook calls the configured NetworkAssignHook.OnNetworkAssign
+// synchronously and imposes no timeout. The implementation is responsible for
+// constraining its own duration. The code recovers any panic here to keep it from
+// crashing the whole process because there is no other recovery layer between
+// this call and the process's main goroutine.
+//
+// The synchronous call ensures the hook finishes before the resource becomes
+// active, preserving that ordering guarantee.
+func (f *Factory) runNetworkAssignHook(ctx context.Context, sbx *Sandbox, reason NetworkAssignReason) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.L().Error(ctx, "sandbox network-assign hook panicked, continuing",
+				logger.WithSandboxID(sbx.Runtime.SandboxID),
+				logger.WithLifecycleID(sbx.LifecycleID),
+				zap.Any("panic", r))
+		}
+	}()
+
+	if err := f.networkAssignHook.OnNetworkAssign(ctx, sbx, reason); err != nil {
+		logger.L().Warn(ctx, "sandbox network-assign hook failed, continuing",
+			logger.WithSandboxID(sbx.Runtime.SandboxID),
+			logger.WithLifecycleID(sbx.LifecycleID),
+			zap.Error(err))
+	}
+}
+
+func (f *Factory) EgressProxy() network.EgressProxy {
+	return f.egressProxy
+}
+
+// NewDirectPathMount opens host-side NBD access without a Firecracker VM.
+func (f *Factory) NewDirectPathMount(backend block.Device) *nbd.DirectPathMount {
+	return nbd.NewDirectPathMount(backend, f.devicePool, f.featureFlags)
 }
 
 // PreBootFn is an optional callback invoked after the rootfs is ready but before
@@ -300,6 +426,25 @@ func NewFactory(
 // DirectProvider or /dev/nbdX for NBDProvider) and may modify the filesystem
 // on the host side.
 type PreBootFn func(ctx context.Context, rootfsPath string) error
+
+type createOptions struct {
+	deferMarkRunning    bool
+	networkAssignReason NetworkAssignReason
+}
+
+type CreateOption func(*createOptions)
+
+// WithDeferredMarkRunning skips marking the sandbox running inside CreateSandbox
+// so the caller can mark it only after envd is ready, matching ResumeSandbox.
+// Used by the reboot path, where the guest is cold-booting and must not be
+// routable until envd answers.
+func WithDeferredMarkRunning() CreateOption {
+	return func(o *createOptions) { o.deferMarkRunning = true }
+}
+
+func withNetworkAssignReason(reason NetworkAssignReason) CreateOption {
+	return func(o *createOptions) { o.networkAssignReason = reason }
+}
 
 // CreateSandbox creates the sandbox.
 // IMPORTANT: You must Close() the sandbox after you are done with it.
@@ -313,10 +458,16 @@ func (f *Factory) CreateSandbox(
 	processOptions fc.ProcessOptions,
 	apiConfigToStore *orchestrator.SandboxConfig,
 	preBootFn PreBootFn,
+	opts ...CreateOption,
 ) (s *Sandbox, e error) {
 	ctx, span := tracer.Start(ctx, "create sandbox")
 	defer span.End()
 	defer handleSpanError(span, &e)
+
+	createOpts := createOptions{networkAssignReason: NetworkAssignReasonCreate}
+	for _, opt := range opts {
+		opt(&createOpts)
+	}
 
 	execCtx, execSpan := startExecutionSpan(ctx)
 
@@ -332,7 +483,9 @@ func (f *Factory) CreateSandbox(
 		}
 	}()
 
-	ipsPromise := getNetworkSlot(ctx, f.networkPool, cleanup, config.Network)
+	lifecycleID := uuid.NewString()
+
+	ipsPromise := getNetworkSlot(ctx, f.networkPool, cleanup, config.Network, f.Sandboxes.NetworkReleased)
 
 	sandboxFiles := template.Files().NewSandboxFiles(runtime.SandboxID)
 	cleanup.Add(ctx, cleanupFiles(f.config, sandboxFiles))
@@ -400,8 +553,12 @@ func (f *Factory) CreateSandbox(
 		}
 	}
 
-	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName(), cleanup)
+	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName())
 	defer releaseCgroupFD(ctx, cgroupHandle, runtime.SandboxID)
+
+	cleanup.Add(ctx, func(ctx context.Context) error {
+		return cgroupHandle.Remove(ctx)
+	})
 
 	fcHandle, err := fc.NewProcess(
 		ctx,
@@ -418,13 +575,18 @@ func (f *Factory) CreateSandbox(
 	}
 
 	throttleConfig := featureflags.GetTCPFirewallEgressThrottleConfig(ctx, f.featureFlags)
+	driveThrottleConfig := featureflags.GetBlockDriveThrottleConfig(ctx, f.featureFlags)
 
 	telemetry.ReportEvent(ctx, "created fc client")
 
+	fcPageSize := int64(header.PageSize)
+	if config.HugePages {
+		fcPageSize = int64(header.HugepageSize)
+	}
 	resources := &Resources{
 		Slot:   ips,
 		rootfs: rootfsProvider,
-		memory: uffd.NewNoopMemory(memfileSize, memfile.BlockSize()),
+		memory: uffd.NewNoopMemory(memfileSize, fcPageSize),
 	}
 
 	metadata := &Metadata{
@@ -440,30 +602,53 @@ func (f *Factory) CreateSandbox(
 	}
 
 	sbx := &Sandbox{
-		LifecycleID: uuid.NewString(),
+		LifecycleID:        lifecycleID,
+		LifecycleStartedAt: time.Now().UTC(),
 
 		Resources:    resources,
 		Metadata:     metadata,
 		cgroupHandle: cgroupHandle,
 
-		Template: template,
-		config:   f.config,
-		files:    sandboxFiles,
-		process:  fcHandle,
+		Template:  template,
+		config:    f.config,
+		files:     sandboxFiles,
+		process:   fcHandle,
+		sandboxes: f.Sandboxes,
 
-		cleanup: cleanup,
+		cleanup:      cleanup,
+		featureFlags: f.featureFlags,
 
 		APIStoredConfig: apiConfigToStore,
+
+		CABundle: f.egressProxy.CABundle(),
 
 		exit: exit,
 	}
 
-	f.Sandboxes.Insert(ctx, sbx)
+	f.Sandboxes.AssignNetwork(ctx, sbx)
 	cleanup.Add(ctx, func(ctx context.Context) error {
-		f.Sandboxes.RemoveByLifecycleID(ctx, runtime.SandboxID, sbx.LifecycleID)
+		f.Sandboxes.MarkStopping(ctx, runtime.SandboxID, sbx.LifecycleID)
 
 		return nil
 	})
+
+	// Do not move this call: it must run after AssignNetwork above and
+	// before fcHandle.Create below, so OnNetworkAssign always runs before
+	// the guest can execute.
+	f.runNetworkAssignHook(ctx, sbx, createOpts.networkAssignReason)
+
+	initializeHostStatsCollector(execCtx, sbx, runtime, config, f.hostStatsDelivery)
+
+	// Collect a final stats sample on cleanup while the cgroup is still alive.
+	cleanup.Add(ctx, func(ctx context.Context) error {
+		if sbx.hostStatsCollector != nil {
+			sbx.hostStatsCollector.Stop(ctx)
+		}
+
+		return nil
+	})
+
+	freePageHinting := fc.FCSupportsFreePageHinting(config.FirecrackerConfig.FirecrackerVersion) && config.FreePageHinting
 
 	err = fcHandle.Create(
 		ctx,
@@ -475,10 +660,16 @@ func (f *Factory) CreateSandbox(
 		config.Vcpu,
 		config.RamMB,
 		config.HugePages,
+		config.FreePageReporting,
+		freePageHinting,
 		processOptions,
-		fc.TxRateLimiterConfig{
+		fc.RateLimiterConfig{
 			Ops:       fc.TokenBucketConfig(throttleConfig.Ops),
 			Bandwidth: fc.TokenBucketConfig(throttleConfig.Bandwidth),
+		},
+		fc.RateLimiterConfig{
+			Ops:       fc.TokenBucketConfig(driveThrottleConfig.Ops),
+			Bandwidth: fc.TokenBucketConfig(driveThrottleConfig.Bandwidth),
 		},
 		cgroupFD,
 	)
@@ -487,14 +678,10 @@ func (f *Factory) CreateSandbox(
 	}
 	telemetry.ReportEvent(ctx, "created fc process")
 
-	useClickhouseMetrics := f.featureFlags.BoolFlag(ctx, featureflags.MetricsWriteFlag)
-	sbx.Checks = NewChecks(sbx, useClickhouseMetrics)
+	sbx.Checks = NewChecks(sbx)
 
 	// Stop the sandbox first if it is still running, otherwise do nothing
 	cleanup.AddPriority(ctx, sbx.Stop)
-
-	samplingInterval := time.Duration(f.featureFlags.IntFlag(execCtx, featureflags.HostStatsSamplingInterval)) * time.Millisecond
-	initializeHostStatsCollector(execCtx, sbx, fcHandle, runtime, config, f.hostStatsDelivery, samplingInterval)
 
 	go func() {
 		defer execSpan.End()
@@ -509,7 +696,9 @@ func (f *Factory) CreateSandbox(
 		exit.SetError(errors.Join(err, fcErr))
 	}()
 
-	f.Sandboxes.MarkRunning(ctx, sbx)
+	if !createOpts.deferMarkRunning {
+		f.Sandboxes.MarkRunning(ctx, sbx)
+	}
 
 	return sbx, nil
 }
@@ -523,6 +712,48 @@ func handleSpanError(span trace.Span, err *error) {
 	}
 }
 
+// resumeOptions carries the optional knobs of ResumeSandbox.
+type resumeOptions struct {
+	// denyEgress isolates the resumed sandbox from the network (except the
+	// orchestrator control path) before it is resumed.
+	denyEgress bool
+	// skipLiveRegistration keeps the resumed sandbox out of the live registry
+	// (not addressable, not counted, no health checks) for throwaways the caller
+	// reaps itself.
+	skipLiveRegistration bool
+}
+
+// ResumeOption customizes a ResumeSandbox call.
+type ResumeOption func(*resumeOptions)
+
+// WithDenyEgress denies all network egress for the resumed sandbox — except the
+// orchestrator control path — before Firecracker is resumed, so neither envd
+// init nor any briefly unfrozen workload can reach the network. It is used for
+// the throwaway pause-resume prefetch harvest sandbox, which is reaped as soon
+// as its resume working set has been recorded.
+func WithDenyEgress() ResumeOption {
+	return func(o *resumeOptions) { o.denyEgress = true }
+}
+
+// WithoutLiveRegistration resumes the sandbox without adding it to the live
+// registry and without starting health checks. The sandbox is not addressable
+// via the sandbox map, is not counted in the node's reported allocation, and
+// emits no per-sandbox metrics — for throwaways (e.g. the pause-resume prefetch
+// harvest) that the caller reaps itself rather than promoting to a live
+// sandbox. The network IP mapping is still assigned so the resume's own
+// teardown stays symmetric.
+func WithoutLiveRegistration() ResumeOption {
+	return func(o *resumeOptions) { o.skipLiveRegistration = true }
+}
+
+// ThrowawayResumeOptions are the resume options for a caller-reaped throwaway
+// (e.g. the pause-resume prefetch harvest): network-isolated and kept out of the
+// live registry. It is the single source of truth for that option set so callers
+// can't drift, and so the set can be asserted in one place.
+func ThrowawayResumeOptions() []ResumeOption {
+	return []ResumeOption{WithDenyEgress(), WithoutLiveRegistration()}
+}
+
 // ResumeSandbox resumes the sandbox from already saved template or snapshot.
 // IMPORTANT: You must Close() the sandbox after you are done with it.
 func (f *Factory) ResumeSandbox(
@@ -533,10 +764,16 @@ func (f *Factory) ResumeSandbox(
 	startedAt time.Time,
 	endAt time.Time,
 	apiConfigToStore *orchestrator.SandboxConfig,
+	opts ...ResumeOption,
 ) (s *Sandbox, e error) {
 	ctx, span := tracer.Start(ctx, "resume sandbox")
 	defer span.End()
 	defer handleSpanError(span, &e)
+
+	var ropts resumeOptions
+	for _, opt := range opts {
+		opt(&ropts)
+	}
 
 	execCtx, execSpan := startExecutionSpan(ctx)
 
@@ -551,6 +788,8 @@ func (f *Factory) ResumeSandbox(
 			execSpan.End()
 		}
 	}()
+
+	lifecycleID := uuid.NewString()
 
 	sandboxFiles := t.Files().NewSandboxFiles(runtime.SandboxID)
 	cleanup.Add(ctx, cleanupFiles(f.config, sandboxFiles))
@@ -612,7 +851,7 @@ func (f *Factory) ResumeSandbox(
 	}()
 
 	// Slot initialization
-	ipsPromise := getNetworkSlot(ctx, f.networkPool, cleanup, config.Network)
+	ipsPromise := getNetworkSlot(ctx, f.networkPool, cleanup, config.Network, f.Sandboxes.NetworkReleased)
 
 	// Rootfs initialization
 	overlayPromise := utils.NewPromise(func() (rootfs.Provider, error) {
@@ -678,6 +917,18 @@ func (f *Factory) ResumeSandbox(
 
 	telemetry.ReportEvent(ctx, "got network slot")
 
+	// Isolate the sandbox from the network before it is resumed, so that neither
+	// envd init nor any briefly unfrozen workload can egress while it runs. This
+	// must happen before fcHandle.Resume below — denying on the returned handle
+	// would be too late, as ResumeSandbox blocks until envd init has completed.
+	if ropts.denyEgress {
+		if err := ips.DenyEgress(ctx); err != nil {
+			return nil, fmt.Errorf("failed to deny egress for resumed sandbox: %w", err)
+		}
+
+		telemetry.ReportEvent(ctx, "denied egress for resumed sandbox")
+	}
+
 	overlay, err := overlayPromise.Wait(ctx)
 	if err != nil {
 		return nil, err
@@ -700,8 +951,12 @@ func (f *Factory) ResumeSandbox(
 	}
 
 	// Create cgroup for sandbox resource accounting
-	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName(), cleanup)
+	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName())
 	defer releaseCgroupFD(ctx, cgroupHandle, runtime.SandboxID)
+
+	cleanup.Add(ctx, func(ctx context.Context) error {
+		return cgroupHandle.Remove(ctx)
+	})
 
 	fcHandle, fcErr := fc.NewProcess(
 		ctx,
@@ -723,6 +978,7 @@ func (f *Factory) ResumeSandbox(
 	}
 
 	resumeThrottleConfig := featureflags.GetTCPFirewallEgressThrottleConfig(ctx, f.featureFlags)
+	resumeDriveThrottleConfig := featureflags.GetBlockDriveThrottleConfig(ctx, f.featureFlags)
 
 	telemetry.ReportEvent(ctx, "created FC process")
 
@@ -758,47 +1014,81 @@ func (f *Factory) ResumeSandbox(
 	}
 
 	sbx := &Sandbox{
-		LifecycleID: uuid.NewString(),
+		LifecycleID:        lifecycleID,
+		LifecycleStartedAt: time.Now().UTC(),
 
 		Resources:    resources,
 		Metadata:     metadata,
 		cgroupHandle: cgroupHandle,
 
-		Template: t,
-		config:   f.config,
-		files:    sandboxFiles,
-		process:  fcHandle,
+		Template:  t,
+		config:    f.config,
+		files:     sandboxFiles,
+		process:   fcHandle,
+		sandboxes: f.Sandboxes,
 
-		cleanup: cleanup,
+		cleanup:      cleanup,
+		featureFlags: f.featureFlags,
 
 		APIStoredConfig: apiConfigToStore,
+		CABundle:        f.egressProxy.CABundle(),
 
 		exit: exit,
+
+		// A throwaway resume keeps its warm, customer-indistinguishable start out
+		// of the per-resume KPI histograms (see WaitForEnvd).
+		skipStartupMetrics: ropts.skipLiveRegistration,
 	}
 
-	useClickhouseMetrics := f.featureFlags.BoolFlag(ctx, featureflags.MetricsWriteFlag)
+	useMemfd := fc.FCSupportsMemfd(config.FirecrackerConfig.FirecrackerVersion) &&
+		f.featureFlags.BoolFlag(ctx, featureflags.UseMemFdFlag, sandboxLDContext(runtime, config))
 
 	// Part of the sandbox as we need to stop Checks before pausing the sandbox
 	// This is to prevent race condition of reporting unhealthy sandbox
-	sbx.Checks = NewChecks(sbx, useClickhouseMetrics)
+	sbx.Checks = NewChecks(sbx)
 
 	cleanup.AddPriority(ctx, func(ctx context.Context) error {
 		// Stop the sandbox first if it is still running, otherwise do nothing
 		return sbx.Stop(ctx)
 	})
 
-	// Insert the sandbox into the map before Resume so it is findable by source address
+	// Register the sandbox IP before Resume so it is findable by source address
 	// during the resume (e.g. for TCP firewall lookups). On failure the deferred cleanup
 	// will remove it.
-	f.Sandboxes.Insert(ctx, sbx)
+	f.Sandboxes.AssignNetwork(ctx, sbx)
 	cleanup.Add(ctx, func(ctx context.Context) error {
-		f.Sandboxes.RemoveByLifecycleID(ctx, runtime.SandboxID, sbx.LifecycleID)
+		f.Sandboxes.MarkStopping(ctx, runtime.SandboxID, sbx.LifecycleID)
+
+		return nil
+	})
+
+	reason := NetworkAssignReasonResume
+	if ropts.skipLiveRegistration {
+		reason = NetworkAssignReasonThrowawayResume
+	}
+	// Do not move this call: it must run after AssignNetwork above and
+	// before fcHandle.Resume below, so OnNetworkAssign always runs before
+	// the guest can resume (and, with it, resume any live connection).
+	f.runNetworkAssignHook(ctx, sbx, reason)
+
+	// A throwaway also skips host-stats collection, so it emits no per-sandbox
+	// host stats under its (unregistered) identity — consistent with not being in
+	// the live registry. The cleanup below is nil-safe when the collector is unset.
+	if !ropts.skipLiveRegistration {
+		initializeHostStatsCollector(execCtx, sbx, runtime, config, f.hostStatsDelivery)
+	}
+
+	// Collect a final stats sample on cleanup while the cgroup is still alive.
+	cleanup.Add(ctx, func(ctx context.Context) error {
+		if sbx.hostStatsCollector != nil {
+			sbx.hostStatsCollector.Stop(ctx)
+		}
 
 		return nil
 	})
 
 	uffdStartCtx, cancelUffdStartCtx := context.WithCancelCause(ctx)
-	defer cancelUffdStartCtx(fmt.Errorf("uffd finished starting"))
+	defer cancelUffdStartCtx(errors.New("uffd finished starting"))
 	go func() {
 		uffdWaitErr := fcUffd.Exit().Wait()
 
@@ -816,9 +1106,14 @@ func (f *Factory) ResumeSandbox(
 		fcUffd.Ready(),
 		config.Envd.AccessToken,
 		cgroupFD,
-		fc.TxRateLimiterConfig{
+		useMemfd,
+		fc.RateLimiterConfig{
 			Ops:       fc.TokenBucketConfig(resumeThrottleConfig.Ops),
 			Bandwidth: fc.TokenBucketConfig(resumeThrottleConfig.Bandwidth),
+		},
+		fc.RateLimiterConfig{
+			Ops:       fc.TokenBucketConfig(resumeDriveThrottleConfig.Ops),
+			Bandwidth: fc.TokenBucketConfig(resumeDriveThrottleConfig.Bandwidth),
 		},
 	)
 
@@ -828,24 +1123,37 @@ func (f *Factory) ResumeSandbox(
 
 	telemetry.ReportEvent(ctx, "initialized FC")
 
-	telemetry.ReportEvent(execCtx, "waiting for envd")
+	if config.SkipEnvdWait {
+		// gdb debugging: the guest is frozen at the entry breakpoint and never
+		// boots envd, so skip the readiness wait (it would time out and tear the
+		// sandbox down). The caller drives the VM via the gdb stub instead.
+		telemetry.ReportEvent(execCtx, "skipping envd wait (gdb mode)")
+	} else {
+		telemetry.ReportEvent(execCtx, "waiting for envd")
 
-	err = sbx.WaitForEnvd(
-		ctx,
-		f.config.EnvdTimeout,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to wait for sandbox start: %w", err)
+		err = sbx.WaitForEnvd(
+			ctx,
+			StartTypeResume,
+			f.GetEnvdTimeout(ctx),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to wait for sandbox start: %w", err)
+		}
 	}
 
-	f.Sandboxes.MarkRunning(ctx, sbx)
+	// A throwaway (e.g. the pause-resume prefetch harvest) is never promoted to a
+	// live sandbox: keep it out of the live registry so it is not addressable and
+	// does not inflate the node's reported allocation or emit per-sandbox metrics,
+	// and skip health checks it would never need.
+	if !ropts.skipLiveRegistration {
+		f.Sandboxes.MarkRunning(ctx, sbx)
+	}
 
 	telemetry.ReportEvent(execCtx, "envd initialized")
 
-	samplingInterval := time.Duration(f.featureFlags.IntFlag(execCtx, featureflags.HostStatsSamplingInterval)) * time.Millisecond
-	initializeHostStatsCollector(execCtx, sbx, fcHandle, runtime, config, f.hostStatsDelivery, samplingInterval)
-
-	go sbx.Checks.Start(execCtx)
+	if !ropts.skipLiveRegistration {
+		go sbx.Checks.Start(execCtx)
+	}
 
 	go func() {
 		defer execSpan.End()
@@ -888,6 +1196,10 @@ func (s *Sandbox) Wait(ctx context.Context) error {
 
 func (s *Sandbox) Close(ctx context.Context) error {
 	err := s.cleanup.Run(ctx)
+	if s.sandboxes != nil {
+		s.sandboxes.MarkStopped(context.WithoutCancel(ctx), s)
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to cleanup sandbox: %w", err)
 	}
@@ -910,11 +1222,6 @@ func (s *Sandbox) doStop(ctx context.Context) error {
 
 	var errs []error
 
-	// Stop host stats collector and collect final sample
-	if s.hostStatsCollector != nil {
-		s.hostStatsCollector.Stop(ctx)
-	}
-
 	// Stop the health checks before stopping the sandbox
 	s.Checks.Stop()
 
@@ -923,17 +1230,19 @@ func (s *Sandbox) doStop(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("failed to stop FC: %w", fcStopErr))
 	}
 
-	// The process exited, we can continue with the rest of the cleanup.
-	// We could use select with ctx.Done() to wait for cancellation, but if the process is not exited the whole cleanup will be in a bad state and will result in unexpected behavior.
-	<-s.process.Exit.Done()
+	cgroupKillErr := s.cgroupHandle.Kill(ctx)
+	if cgroupKillErr != nil {
+		errs = append(errs, fmt.Errorf("failed to kill sandbox cgroup: %w", cgroupKillErr))
+	}
 
-	// Remove cgroup after process has exited
-	if s.cgroupHandle != nil {
-		if cgroupErr := s.cgroupHandle.Remove(ctx); cgroupErr != nil {
-			logger.L().Warn(ctx, "failed to remove cgroup during cleanup",
-				logger.WithSandboxID(s.Runtime.SandboxID),
-				zap.Error(cgroupErr))
-		}
+	// The process should exit before the rest of cleanup, but memory shutdown
+	// must still run if the wait context is canceled so UFFD can exit.
+	// FC's own exit error is reported via the exit waiters, not as a stop
+	// failure, so only a canceled wait counts as an error here.
+	select {
+	case <-s.process.Exit.Done():
+	case <-ctx.Done():
+		errs = append(errs, fmt.Errorf("failed waiting for FC exit: %w", ctx.Err()))
 	}
 
 	uffdStopErr := s.Resources.memory.Stop()
@@ -956,16 +1265,16 @@ func (s *Sandbox) Shutdown(ctx context.Context) error {
 	}
 
 	// This is required because the FC API doesn't support passing /dev/null
-	tf, err := storage.TemplateFiles{
+	cachePaths, err := storage.Paths{
 		BuildID: uuid.New().String(),
-	}.CacheFiles(s.config.StorageConfig)
+	}.Cache(s.config.StorageConfig)
 	if err != nil {
-		return fmt.Errorf("failed to create template files: %w", err)
+		return fmt.Errorf("failed to create cache paths: %w", err)
 	}
-	defer tf.Close()
+	defer cachePaths.Close()
 
 	// The snapfile is required only because the FC API doesn't support passing /dev/null
-	snapfile := template.NewLocalFileLink(tf.CacheSnapfilePath())
+	snapfile := template.NewLocalFileLink(cachePaths.CacheSnapfile())
 	defer snapfile.Close()
 
 	err = s.process.CreateSnapshot(ctx, snapfile.Path())
@@ -982,6 +1291,20 @@ func (s *Sandbox) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+type pauseOptions struct {
+	filesystemSnapshot bool
+}
+
+type PauseOption func(*pauseOptions)
+
+// WithFilesystemSnapshot makes the pause produce a filesystem-only snapshot:
+// guest memory is not snapshotted, only the filesystem (rootfs) is persisted.
+// Resuming such a snapshot reboots the guest instead of restoring memory state.
+// The default (no option) is a full memory snapshot.
+func WithFilesystemSnapshot() PauseOption {
+	return func(o *pauseOptions) { o.filesystemSnapshot = true }
+}
+
 // Pause creates a snapshot of the sandbox.
 //
 // Currently the memory snapshotting works like this:
@@ -993,11 +1316,25 @@ func (s *Sandbox) Shutdown(ctx context.Context) error {
 //     that returns info about resident memory pages and about empty memory pages.
 //  5. Base on the info from the custom FC endpoint or from Uffd we copy the pages directly from the FC process to a local cache.
 //  6. We then can either close the sandbox or resume it.
+//
+// With WithFilesystemSnapshot(), steps 3-5 are skipped: a guest sync flushes
+// the page cache to disk before pause, CreateSnapshot is still called for its
+// disk drain+flush side effect (the snapfile is not uploaded), and the memfile
+// diff is empty (NoDiff).
 func (s *Sandbox) Pause(
 	ctx context.Context,
 	m metadata.Template,
+	useCase SnapshotUseCase,
+	opts ...PauseOption,
 ) (st *Snapshot, e error) {
-	ctx, span := tracer.Start(ctx, "sandbox-snapshot")
+	var pauseOpts pauseOptions
+	for _, opt := range opts {
+		opt(&pauseOpts)
+	}
+
+	ctx, span := tracer.Start(ctx, "sandbox-snapshot", trace.WithAttributes(
+		attribute.Bool("fs-only-snapshot", pauseOpts.filesystemSnapshot),
+	))
 	defer span.End()
 
 	cleanup := NewCleanup()
@@ -1009,13 +1346,13 @@ func (s *Sandbox) Pause(
 		}
 	}()
 
-	snapshotTemplateFiles, err := storage.TemplateFiles{BuildID: m.Template.BuildID}.CacheFiles(s.config.StorageConfig)
+	cachePaths, err := storage.Paths{BuildID: m.Template.BuildID}.Cache(s.config.StorageConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get template files: %w", err)
+		return nil, fmt.Errorf("failed to create cache paths: %w", err)
 	}
-	cleanup.AddNoContext(ctx, snapshotTemplateFiles.Close)
+	cleanup.AddNoContext(ctx, cachePaths.Close)
 
-	buildID, err := uuid.Parse(snapshotTemplateFiles.BuildID)
+	buildID, err := uuid.Parse(cachePaths.BuildID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse build id: %w", err)
 	}
@@ -1023,50 +1360,97 @@ func (s *Sandbox) Pause(
 	// Stop the health check before pausing the VM
 	s.Checks.Stop()
 
+	// Best-effort pre-pause guest reclaim (fstrim, sync, drop_caches,
+	// compact_memory) on the live VM via envd. Per-step caps are LD-flag-driven;
+	// all default to 0 which disables the chain entirely. Non-fatal.
+	s.bestEffortReclaim(ctx)
+	// reclaim freezes user cgroups; if pause/snapshot fails the sandbox stays
+	// live, so unfreeze on error to avoid a permanently frozen live VM.
+	// Only runs via cleanup.Run on the error path; success leaves the frozen
+	// state intact so it persists into the snapshot.
+	cleanup.Add(ctx, func(ctx context.Context) error {
+		s.bestEffortUnfreeze(ctx)
+
+		return nil
+	})
+
+	if pauseOpts.filesystemSnapshot {
+		// FC never flushes the guest page cache and no memory snapshot will
+		// preserve it, so the rootfs must be quiesced before pause or it would
+		// persist missing acknowledged writes. This is mandatory, unlike the
+		// best-effort reclaim above.
+		if err := s.guestPrepareFsForPause(ctx, cleanup); err != nil {
+			return nil, err
+		}
+
+		// Memory prefetch refers to the memfile, which is not persisted.
+		m.Prefetch = nil
+	}
+
+	// Record the snapshot kind in metadata so the resume path picks reboot vs
+	// memory-resume from the snapshot's own metadata (see metadata.IsFilesystemOnly).
+	// Set unconditionally so a memory pause of a previously-rebooted (fs-only)
+	// sandbox correctly clears the flag. MarkFilesystemOnly also upgrades the
+	// metadata version when needed so the flag survives deserialize for snapshots
+	// taken from a V1 template.
+	m = m.MarkFilesystemOnly(pauseOpts.filesystemSnapshot)
+
+	// Drain free-page-hinting before pause so the snapshot doesn't capture
+	// pages the guest already considers free. Timeout per use case; 0 disables.
+	if t := featureflags.GetFreePageHintingTimeout(ctx, s.featureFlags, string(useCase), sandboxLDContext(s.Runtime, s.Config)); t > 0 {
+		drainCtx, cancel := context.WithTimeout(ctx, t)
+		if err := s.process.DrainBalloon(drainCtx); err != nil {
+			telemetry.ReportError(ctx, "balloon hinting drain failed (continuing pause)", err)
+		}
+		cancel()
+	}
+
 	if err := s.process.Pause(ctx); err != nil {
 		return nil, fmt.Errorf("failed to pause VM: %w", err)
 	}
 
+	// Best-effort flush before the rootfs export goroutine closes the FC API
+	// socket. Non-blocking on the reader; trades precision for pause latency.
+	_ = s.process.FlushMetrics(ctx)
+
 	// Snapfile is not closed as it's returned and cached for later use (like resume)
-	snapfile := template.NewLocalFileLink(snapshotTemplateFiles.CacheSnapfilePath())
+	snapfile := template.NewLocalFileLink(cachePaths.CacheSnapfile())
 	cleanup.AddNoContext(ctx, snapfile.Close)
 
+	// CreateSnapshot also drains and flushes the virtio disk in our custom FC, so
+	// it runs even for a filesystem-only pause (which needs the disk flush); the
+	// resulting snapfile is just not uploaded in that case.
 	err = s.process.CreateSnapshot(ctx, snapfile.Path())
 	if err != nil {
 		return nil, fmt.Errorf("error creating snapshot: %w", err)
 	}
 
 	// Gather data for postprocessing
-	originalMemfile, err := s.Template.Memfile(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get original memfile: %w", err)
-	}
-
 	originalRootfs, err := s.Template.Rootfs()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get original rootfs: %w", err)
 	}
 
-	memfileDiffMetadata, err := s.Resources.memory.DiffMetadata(ctx, s.process)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get memfile metadata: %w", err)
-	}
-
 	// Start POSTPROCESSING
-	memfileDiff, memfileDiffHeader, err := pauseProcessMemory(
-		ctx,
-		buildID,
-		originalMemfile.Header(),
-		memfileDiffMetadata,
-		s.config.DefaultCacheDir,
-		s.process,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error while post processing: %w", err)
+	//
+	// For a filesystem-only pause the memory snapshot is skipped entirely: the
+	// memfile diff stays NoDiff with no header, and the memfile-derived fields
+	// stay zero so the snapshot and scheduling metadata carry rootfs only.
+	mem := MemorySnapshot{
+		Diff:       build.Diff(&build.NoDiff{}),
+		DiffHeader: NewResolvedDiffHeader(nil),
 	}
-	cleanup.AddNoContext(ctx, memfileDiff.Close)
+	if !pauseOpts.filesystemSnapshot {
+		mem, err = s.processMemorySnapshot(ctx, buildID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// NoDiff.Close is a no-op, so registering it for the filesystem-only case is
+	// harmless and keeps the cleanup ordering identical to the memory path.
+	cleanup.AddNoContext(ctx, mem.Diff.Close)
 
-	rootfsDiff, rootfsDiffHeader, err := pauseProcessRootfs(
+	rootfsDiff, rootfsHeader, err := pauseProcessRootfs(
 		ctx,
 		buildID,
 		originalRootfs.Header(),
@@ -1081,7 +1465,19 @@ func (s *Sandbox) Pause(
 	}
 	cleanup.AddNoContext(ctx, rootfsDiff.Close)
 
-	metadataFileLink := template.NewLocalFileLink(snapshotTemplateFiles.CacheMetadataPath())
+	rootfsDiffHeader := NewResolvedDiffHeader(rootfsHeader)
+	// Derive scheduling metadata synchronously so Pause never blocks on the
+	// async memfile-dedup header: the memfile chain comes from the resolved
+	// parent header plus the new build, whose exact bytes aren't known yet, so
+	// we pass the pre-dedup dirty size as an upper bound. It is block-granular
+	// (dirty blocks * diff block size) and counts pages before dedup drops the
+	// base-identical ones, so it over-estimates. The rootfs copy is synchronous
+	// today, so its new header carries the exact rootfs chain and bytes; if it
+	// ever becomes async, switch it to the parent plus a dirty proxy like memfile.
+	// mem.header is nil for a filesystem-only pause → rootfs-only metadata.
+	schedulingMetadata := scheduling.FromHeaders(buildID, mem.header, rootfsHeader, mem.newBytes)
+
+	metadataFileLink := template.NewLocalFileLink(cachePaths.CacheMetadata())
 	cleanup.AddNoContext(ctx, metadataFileLink.Close)
 
 	err = m.ToFile(metadataFileLink.Path())
@@ -1090,15 +1486,134 @@ func (s *Sandbox) Pause(
 	}
 
 	return &Snapshot{
-		Snapfile:          snapfile,
-		Metafile:          metadataFileLink,
-		MemfileDiff:       memfileDiff,
-		MemfileDiffHeader: memfileDiffHeader,
-		RootfsDiff:        rootfsDiff,
-		RootfsDiffHeader:  rootfsDiffHeader,
+		Snapfile:           snapfile,
+		Metafile:           metadataFileLink,
+		MemorySnapshot:     mem,
+		RootfsDiff:         rootfsDiff,
+		RootfsDiffHeader:   rootfsDiffHeader,
+		SchedulingMetadata: schedulingMetadata,
+		FilesystemSnapshot: pauseOpts.filesystemSnapshot,
+		RootfsBlockSize:    originalRootfs.Header().Metadata.BlockSize,
+
+		BuildID: buildID,
 
 		cleanup: cleanup,
 	}, nil
+}
+
+// MemorySnapshot bundles the products of memory postprocessing during a Pause:
+// the memfile diff, its (async-resolved) header, and the block size. It is
+// embedded in Snapshot. For a filesystem-only pause it is zero-valued except for
+// an empty NoDiff and a resolved-nil header (see Snapshot.FilesystemSnapshot).
+type MemorySnapshot struct {
+	Diff       build.Diff
+	DiffHeader *DiffHeader
+	// ProvisionalDiffHeader + ProvisionalDiff, when non-nil, let the local
+	// template serve immediately from the still-mapped memfd via a distinct
+	// provisional build id while dedup runs, instead of blocking a concurrent
+	// resume in storage-template-memfile on the deduped header. They feed only
+	// the local AddSnapshot path; the upload still uses DiffHeader (deduped).
+	ProvisionalDiffHeader *header.Header
+	ProvisionalDiff       build.Diff
+	// ProvisionalSwapDone, when non-nil, is invoked by the AddSnapshot swap
+	// goroutine once it has swapped the deduped header in; it lets the dedup
+	// goroutine release the memfd the provisional source was serving from.
+	ProvisionalSwapDone func()
+	// BlockSize is captured synchronously at Pause time because NewUpload's
+	// compression validation needs it before the async dedup header resolves;
+	// the dedup memfile path produces a page-granular Diff.BlockSize() that
+	// doesn't match the chunker-read granularity on restore.
+	BlockSize uint64
+
+	// header (base memfile) and newBytes (pre-dedup dirty-byte upper bound) are
+	// scheduling inputs consumed only at Pause time, so they stay unexported.
+	header   *header.Header
+	newBytes uint64
+}
+
+// processMemorySnapshot copies the dirty guest memory pages into a local diff
+// and builds its header — steps 3-5 of Pause. Only called for a full memory
+// snapshot; a filesystem-only pause skips it. The returned diff's Close must be
+// registered for cleanup by the caller.
+func (s *Sandbox) processMemorySnapshot(ctx context.Context, buildID uuid.UUID) (MemorySnapshot, error) {
+	originalMemfile, err := s.Template.Memfile(ctx)
+	if err != nil {
+		return MemorySnapshot{}, fmt.Errorf("failed to get original memfile: %w", err)
+	}
+	// Parent off the durable (deduped) header, never a provisional (local-only)
+	// one: a provisional header maps dirty pages to a synthetic build id with no
+	// storage object, so an uploaded header inheriting those mappings would be
+	// unreadable on a cold or cross-node resume. DurableHeader waits for the
+	// deduped header if a provisional swap is still pending; devices without one
+	// return their current header immediately.
+	memfileHeader := originalMemfile.Header()
+	if dh, ok := originalMemfile.(interface {
+		DurableHeader(ctx context.Context) (*header.Header, error)
+	}); ok {
+		memfileHeader, err = dh.DurableHeader(ctx)
+		if err != nil {
+			return MemorySnapshot{}, fmt.Errorf("failed to resolve durable memfile header: %w", err)
+		}
+	}
+
+	memfileDiffMetadata, err := s.Resources.memory.DiffMetadata(ctx, s.process)
+	if err != nil {
+		return MemorySnapshot{}, fmt.Errorf("failed to get memfile metadata: %w", err)
+	}
+	recordSnapshotDiff(ctx, "memfile", memfileDiffMetadata, memfileHeader)
+
+	var dedupBase block.ReadonlyDevice
+	var dedupBestEffort, dedupDirectIO bool
+	var dedupBudget block.DedupBudget
+	dedupCfg := s.featureFlags.JSONFlag(ctx, featureflags.MemfileDiffDedupFlag, sandboxLDContext(s.Runtime, s.Config)).AsValueMap()
+	if dedupCfg.Get("enabled").BoolValue() {
+		dedupBase = originalMemfile
+		dedupBestEffort = dedupCfg.Get("bestEffort").BoolValue()
+		dedupDirectIO = dedupCfg.Get("directIO").BoolValue()
+		dedupBudget = block.DedupBudget{
+			MaxFetchWindowsPerBlock:        dedupCfg.Get("maxFetchWindowsPerBlock").IntValue(),
+			MaxPromotedParentPagesPerBlock: dedupCfg.Get("maxPromotedParentPagesPerBlock").IntValue(),
+			MaxPagesPerPromotedFrame:       dedupCfg.Get("maxPagesPerPromotedFrame").IntValue(),
+			BlockFaultPct:                  dedupCfg.Get("blockFaultPct").IntValue(),
+			FetchRunWindowPages:            dedupCfg.Get("fetchRunWindowPages").IntValue(),
+		}
+	}
+
+	memfileDiff, memfileDiffHeader, provMemfileHeader, provMemfileDiff, provMemfileSwapDone, err := pauseProcessMemory(
+		ctx,
+		buildID,
+		memfileHeader,
+		memfileDiffMetadata,
+		s.config.DefaultCacheDir,
+		s.process,
+		s.memory.Memfd(ctx),
+		s.featureFlags.BoolFlag(ctx, featureflags.MemfdBackgroundCopyFlag, sandboxLDContext(s.Runtime, s.Config)),
+		dedupBase,
+		dedupBestEffort,
+		dedupDirectIO,
+		dedupBudget,
+		s.featureFlags.BoolFlag(ctx, featureflags.MemfdDedupInflightServeFlag, sandboxLDContext(s.Runtime, s.Config)),
+	)
+	if err != nil {
+		return MemorySnapshot{}, fmt.Errorf("error while post processing: %w", err)
+	}
+
+	return MemorySnapshot{
+		Diff:                  memfileDiff,
+		DiffHeader:            memfileDiffHeader,
+		ProvisionalDiffHeader: provMemfileHeader,
+		ProvisionalDiff:       provMemfileDiff,
+		ProvisionalSwapDone:   provMemfileSwapDone,
+		BlockSize:             memfileHeader.Metadata.BlockSize,
+		header:                memfileHeader,
+		newBytes:              memfileDiffMetadata.Dirty.GetCardinality() * uint64(memfileDiffMetadata.BlockSize),
+	}, nil
+}
+
+// FlushAndReadBalloonMetrics triggers an FC metrics flush and returns the
+// updated cumulative virtio-balloon counters. Used by the FPH bench.
+func (s *Sandbox) FlushAndReadBalloonMetrics(ctx context.Context) (fc.BalloonMetricsSnapshot, error) {
+	return s.process.FlushAndReadBalloonMetrics(ctx)
 }
 
 // MemoryPrefetchData returns the ordered page fault data for prefetch mapping.
@@ -1118,25 +1633,27 @@ func pauseProcessMemory(
 	diffMetadata *header.DiffMetadata,
 	cacheDir string,
 	fc *fc.Process,
-) (d build.Diff, h *header.Header, e error) {
+	memfd *block.Memfd,
+	bgCopy bool,
+	originalMemfile block.ReadonlyDevice,
+	dedupBestEffort bool,
+	dedupDirectIO bool,
+	dedupBudget block.DedupBudget,
+	dedupInflightServe bool,
+) (d build.Diff, h *DiffHeader, provisionalHeader *header.Header, provisionalDiff build.Diff, provisionalSwapDone func(), e error) {
 	ctx, span := tracer.Start(ctx, "process-memory")
 	defer span.End()
 
-	header, err := diffMetadata.ToDiffHeader(ctx, originalHeader, buildID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create memfile header: %w", err)
-	}
-
 	memfileDiffPath := build.GenerateDiffCachePath(cacheDir, buildID.String(), build.Memfile)
-
+	metaOut := utils.NewSetOnce[*header.DiffMetadata]()
+	// ExportMemory owns memfd and closes it on all paths.
 	cache, err := fc.ExportMemory(
-		ctx,
-		diffMetadata.Dirty,
-		memfileDiffPath,
-		diffMetadata.BlockSize,
+		ctx, diffMetadata.Dirty, memfileDiffPath, diffMetadata.BlockSize, memfd, bgCopy,
+		originalMemfile, dedupBestEffort, dedupDirectIO, dedupBudget, diffMetadata.Empty, metaOut,
+		dedupInflightServe,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to export memory: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("failed to export memory: %w", err)
 	}
 
 	diff, err := build.NewLocalDiffFromCache(
@@ -1144,11 +1661,93 @@ func pauseProcessMemory(
 		cache,
 	)
 	if err != nil {
-		// Close the cache even if the diff creation fails.
-		return nil, nil, fmt.Errorf("failed to create local diff from cache: %w", errors.Join(err, cache.Close()))
+		return nil, nil, nil, nil, nil, fmt.Errorf("failed to create local diff from cache: %w", errors.Join(err, cache.Close()))
 	}
 
-	return diff, header, nil
+	// Provisional local header: while the deduped header is still
+	// being computed, let a same-node resume serve dirty pages from the memfd via
+	// a distinct provisional build id at identity offsets. Gated on the memfd
+	// dedup path + the inflight-serve flag; best-effort (fall back to the deduped
+	// header on any error). The upload always uses the deduped header below.
+	provisionalHeader, provisionalDiff, provisionalSwapDone = buildProvisionalMemfile(ctx, cache, dedupInflightServe, originalMemfile, originalHeader, diffMetadata)
+
+	// Build the diff header on a goroutine so Pause returns without waiting
+	// on memfd-dedup compare. ExportMemory resolves metaOut sync for every
+	// other path, so Wait there is non-blocking; the goroutine is harmless.
+	headerOut := utils.NewSetOnce[*header.Header]()
+	go func() {
+		setHeader := func(h *header.Header, err error) {
+			if setErr := headerOut.SetResult(h, err); setErr != nil {
+				logger.L().Warn(ctx, "set memfile diff header", zap.Error(setErr))
+			}
+		}
+		meta, err := metaOut.Wait()
+		if err != nil {
+			setHeader(nil, err)
+
+			return
+		}
+		// post == nil signals "no dedup ran" to the metric so it records
+		// kind="none" with zero savings.
+		post := meta
+		if originalMemfile == nil {
+			post = nil
+		}
+		recordSnapshotDedup(ctx, "memfile", diffMetadata, post, dedupBestEffort)
+		setHeader(meta.ToDiffHeader(ctx, originalHeader, buildID))
+	}()
+
+	return diff, headerOut, provisionalHeader, provisionalDiff, provisionalSwapDone, nil
+}
+
+// buildProvisionalMemfile builds the provisional local header + its memfd-backed
+// diff source, plus a swap-done callback the AddSnapshot swap goroutine invokes
+// once it has swapped the deduped header in (it lets the dedup goroutine release
+// the memfd). Returns (nil, nil, nil) — falling back to the deduped header —
+// when the path doesn't apply or on any error, so it never blocks a pause. The
+// provisional source is keyed by a fresh build id so a header swap to the
+// deduped header (after dedup) is race-free (see MemfdIdentitySource).
+func buildProvisionalMemfile(
+	ctx context.Context,
+	cache block.DiffSource,
+	enabled bool,
+	originalMemfile block.ReadonlyDevice,
+	originalHeader *header.Header,
+	diffMetadata *header.DiffMetadata,
+) (*header.Header, build.Diff, func()) {
+	dc, ok := cache.(*block.DedupedMemfdCache)
+	if !ok {
+		return nil, nil, nil
+	}
+	// From here dc != nil. On every path that declines to build a provisional
+	// source, signal MarkSwapped so runDedup's inflight memfd-hold releases at
+	// drain-time instead of waiting out the swap grace — nothing will serve from
+	// the memfd, so there's no reason to hold it.
+	if !enabled || originalMemfile == nil || originalHeader == nil || diffMetadata == nil {
+		dc.MarkSwapped()
+
+		return nil, nil, nil
+	}
+
+	provisionalBuildID := uuid.New()
+	provisionalHeader, err := diffMetadata.ToProvisionalDiffHeader(ctx, originalHeader, provisionalBuildID)
+	if err != nil {
+		logger.L().Warn(ctx, "build provisional memfile header; using deduped header", zap.Error(err))
+		dc.MarkSwapped()
+
+		return nil, nil, nil
+	}
+
+	provisionalSource := block.NewMemfdIdentitySource(dc, int64(originalHeader.Metadata.Size))
+	provisionalDiff, err := build.NewLocalDiffFromCache(build.GetDiffStoreKey(provisionalBuildID.String(), build.Memfile), provisionalSource)
+	if err != nil {
+		logger.L().Warn(ctx, "build provisional memfile diff; using deduped header", zap.Error(err))
+		dc.MarkSwapped()
+
+		return nil, nil, nil
+	}
+
+	return provisionalHeader, provisionalDiff, dc.MarkSwapped
 }
 
 func pauseProcessRootfs(
@@ -1166,13 +1765,14 @@ func pauseProcessRootfs(
 		return nil, nil, fmt.Errorf("failed to create rootfs diff: %w", err)
 	}
 
-	rootfsDiffMetadata, err := diffCreator.process(ctx, rootfsDiffFile)
+	rootfsDiffMetadata, err := diffCreator.process(ctx, rootfsDiffFile.File)
 	if err != nil {
 		err = errors.Join(err, rootfsDiffFile.Close())
 
 		return nil, nil, fmt.Errorf("error creating diff: %w", err)
 	}
 	telemetry.ReportEvent(ctx, "exported rootfs")
+	recordSnapshotDiff(ctx, "rootfs", rootfsDiffMetadata, originalHeader)
 
 	rootfsDiff, err := rootfsDiffFile.CloseToDiff(int64(originalHeader.Metadata.BlockSize))
 	if err != nil {
@@ -1190,21 +1790,16 @@ func pauseProcessRootfs(
 	return rootfsDiff, rootfsHeader, nil
 }
 
-// createCgroup creates a cgroup for sandbox resource accounting if cgroup
-// accounting is enabled (cgroupManager is non-nil). It registers cleanup with
-// the provided Cleanup so the cgroup is removed on error paths.
+// createCgroup creates a cgroup for sandbox resource accounting.
+// The caller is responsible for registering cleanup to remove the cgroup.
 //
 // Returns the CgroupHandle and the cgroup directory FD to pass to the
-// Firecracker process. If cgroup accounting is disabled, returns (nil, cgroup.NoCgroupFD).
-func createCgroup(ctx context.Context, cgroupManager cgroup.Manager, cgroupName string, cleanup *Cleanup) (*cgroup.CgroupHandle, int) {
+// Firecracker process or (nil, cgroup.NoCgroupFD) on error.
+func createCgroup(ctx context.Context, cgroupManager cgroup.Manager, cgroupName string) (*cgroup.CgroupHandle, int) {
 	ctx, span := tracer.Start(ctx, "sandbox-create-cgroup", trace.WithAttributes(
 		attribute.String("cgroup_name", cgroupName),
 	))
 	defer span.End()
-
-	if cgroupManager == nil {
-		return nil, cgroup.NoCgroupFD
-	}
 
 	handle, err := cgroupManager.Create(ctx, cgroupName)
 	if err != nil {
@@ -1217,10 +1812,6 @@ func createCgroup(ctx context.Context, cgroupManager cgroup.Manager, cgroupName 
 		return nil, cgroup.NoCgroupFD
 	}
 
-	cleanup.Add(ctx, func(ctx context.Context) error {
-		return handle.Remove(ctx)
-	})
-
 	return handle, handle.GetFD()
 }
 
@@ -1229,6 +1820,7 @@ func getNetworkSlot(
 	networkPool *network.Pool,
 	cleanup *Cleanup,
 	networkConfig *orchestrator.SandboxNetworkConfig,
+	networkReleased network.ReleaseNotify,
 ) *utils.Promise[*network.Slot] {
 	return utils.NewPromise(func() (*network.Slot, error) {
 		ctx, span := tracer.Start(ctx, "get network-slot")
@@ -1243,15 +1835,9 @@ func getNetworkSlot(
 			ctx, span := tracer.Start(ctx, "clean network-slot")
 			defer span.End()
 
-			// We can run this cleanup asynchronously, as it is not important for the sandbox lifecycle
-			go func(ctx context.Context) {
-				returnErr := networkPool.Return(ctx, slot)
-				if returnErr != nil {
-					logger.L().Error(ctx, "failed to return network slot", zap.Error(returnErr))
-				}
-			}(context.WithoutCancel(ctx))
-
-			return nil
+			// Async so sandbox cleanup doesn't block on the return delay or
+			// network teardown; the pool's Close waits for in-flight returns.
+			return networkPool.ReturnAsync(ctx, slot, networkReleased, network.ReturnDelay)
 		})
 
 		return slot, nil
@@ -1297,7 +1883,7 @@ func (s *Sandbox) WaitForExit(ctx context.Context) error {
 
 	select {
 	case <-time.After(timeout):
-		return fmt.Errorf("waiting for exit took too long")
+		return errors.New("waiting for exit took too long")
 	case <-ctx.Done():
 		return nil
 	case <-s.exit.Done():
@@ -1312,6 +1898,7 @@ func (s *Sandbox) WaitForExit(ctx context.Context) error {
 
 func (s *Sandbox) WaitForEnvd(
 	ctx context.Context,
+	startType StartType,
 	timeout time.Duration,
 ) (e error) {
 	start := time.Now()
@@ -1319,14 +1906,47 @@ func (s *Sandbox) WaitForEnvd(
 	defer span.End()
 
 	defer func() {
+		// A throwaway (the pause-resume prefetch harvest) is warm by construction
+		// and must not pollute the customer resume KPIs (envd-init duration,
+		// startup pages/source-pages — the consume-side payoff signals) or even be
+		// distinguishable in them, so it records none of these. It is otherwise
+		// kept out of Prometheus (registration-skip); the harvest's own metrics
+		// cover its timing/size.
+		if !s.skipStartupMetrics {
+			duration := time.Since(start).Milliseconds()
+			// success is kept for backward compatibility until consumers move to exit_type.
+			waitForEnvdDurationHistogram.Record(ctx, duration, metric.WithAttributes(
+				telemetry.WithEnvdVersion(s.Config.Envd.Version),
+				attribute.Int64("timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
+				attribute.Bool("success", e == nil),
+				attribute.String("start_type", string(startType)),
+				attribute.String("exit_type", string(classifyEnvdInitExit(e))),
+			))
+
+			// Record the demand-fault working set the guest needed to reach this
+			// point. Only on the first WaitForEnvd: it is the actual start, and
+			// ServeStats() is cumulative since resume, so at this instant it equals
+			// the startup counts. A later WaitForEnvd on the same handler (e.g. the
+			// envd-binary swap + restart during a template build) would otherwise
+			// re-report a cumulative total polluted with intervening faults.
+			// Recorded for both outcomes (success label) so slow/failed starts can
+			// be correlated with page volume.
+			s.startupStatsOnce.Do(func() {
+				stats := s.memory.ServeStats()
+				startupAttrs := metric.WithAttributes(
+					attribute.String("start_type", string(startType)),
+					attribute.Bool("success", e == nil),
+				)
+				uffdStartupPagesHistogram.Record(ctx, stats.Pages, startupAttrs)
+				uffdStartupSourcePagesHistogram.Record(ctx, stats.SourcePages, startupAttrs)
+				uffdStartupBytesHistogram.Record(ctx, stats.Bytes, startupAttrs)
+			})
+		}
+
 		if e != nil {
 			return
 		}
-		duration := time.Since(start).Milliseconds()
-		waitForEnvdDurationHistogram.Record(ctx, duration, metric.WithAttributes(
-			telemetry.WithEnvdVersion(s.Config.Envd.Version),
-			attribute.Int64("timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
-		))
+
 		// Update the sandbox as started now
 		s.SetStartedAt(time.Now())
 	}()
@@ -1337,17 +1957,17 @@ func (s *Sandbox) WaitForEnvd(
 		select {
 		// Ensure the syncing takes at most timeout seconds.
 		case <-time.After(timeout):
-			cancel(fmt.Errorf("syncing took too long"))
+			cancel(ErrWaitForEnvdTimeout)
 		case <-ctx.Done():
 			return
 		case <-s.process.Exit.Done():
 			err := s.process.Exit.Error()
 
-			cancel(fmt.Errorf("fc process exited prematurely: %w", err))
+			cancel(fmt.Errorf("%w: %w", ErrFcProcessExited, err))
 		}
 	}()
 
-	if err := s.initEnvd(ctx); err != nil {
+	if err := s.initEnvd(ctx, startType); err != nil {
 		return fmt.Errorf("failed to init new envd: %w", err)
 	}
 
@@ -1357,12 +1977,10 @@ func (s *Sandbox) WaitForEnvd(
 }
 
 func releaseCgroupFD(ctx context.Context, cgroupHandle *cgroup.CgroupHandle, sandboxID string) {
-	if cgroupHandle != nil {
-		if releaseErr := cgroupHandle.ReleaseCgroupFD(); releaseErr != nil {
-			logger.L().Warn(ctx, "failed to release cgroup directory FD",
-				logger.WithSandboxID(sandboxID),
-				zap.Error(releaseErr))
-		}
+	if releaseErr := cgroupHandle.ReleaseCgroupFD(); releaseErr != nil {
+		logger.L().Warn(ctx, "failed to release cgroup directory FD",
+			logger.WithSandboxID(sandboxID),
+			zap.Error(releaseErr))
 	}
 }
 
@@ -1370,4 +1988,10 @@ func (f *Factory) GetEnvdInitRequestTimeout(ctx context.Context) time.Duration {
 	envdInitRequestTimeoutMs := f.featureFlags.IntFlag(ctx, featureflags.EnvdInitTimeoutMilliseconds)
 
 	return time.Duration(envdInitRequestTimeoutMs) * time.Millisecond
+}
+
+func (f *Factory) GetEnvdTimeout(ctx context.Context) time.Duration {
+	envdTimeoutMs := f.featureFlags.IntFlag(ctx, featureflags.EnvdTimeoutMilliseconds)
+
+	return time.Duration(envdTimeoutMs) * time.Millisecond
 }

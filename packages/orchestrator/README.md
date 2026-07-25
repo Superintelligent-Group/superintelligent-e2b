@@ -35,8 +35,9 @@ Flags:
 - `-from-build <uuid>` - Base build ID for incremental builds
 - `-template <id>` - Template ID (default: `local-template`)
 - `-storage <path>` - Local path or `gs://bucket` (enables local mode with auto-download of kernel/FC)
-- `-kernel <version>` - Kernel version (default: `vmlinux-6.1.102`)
-- `-firecracker <version>` - Firecracker version (default: `v1.12.1_a41d3fb`)
+- `-sandbox-dir <path>` - Override `SANDBOX_DIR` (the rootfs path baked into the snapshot)
+- `-kernel <version>` - Kernel version (default: `vmlinux-6.1.158`)
+- `-firecracker <version>` - Firecracker version (default: `v1.14.1_458ca91`)
 - `-vcpu <n>` - vCPUs (default: `1`)
 - `-memory <mb>` - Memory in MB (default: `512`)
 - `-disk <mb>` - Disk in MB (default: `1000`)
@@ -74,6 +75,7 @@ Flags:
 - `-from-build <uuid>` - Build ID (UUID) to resume from (required)
 - `-to-build <uuid>` - Output build ID (UUID) for pause snapshot (auto-generated if not specified)
 - `-storage <path>` - Local path or `gs://bucket` (default: `.local-build`)
+- `-sandbox-dir <path>` - Override `SANDBOX_DIR` (the rootfs path baked into the snapshot)
 - `-iterations <n>` - Number of iterations, 0 = interactive (default: `0`)
 - `-cold` - Clear cache between iterations (cold start each time)
 - `-no-prefetch` - Disable memory prefetching
@@ -217,13 +219,88 @@ Flags:
 
 ---
 
+## Architecture (ARM64) Support
+
+The orchestrator supports both `amd64` (x86_64) and `arm64` (aarch64) architectures. Architecture is detected automatically via `runtime.GOARCH` at compile time.
+
+### Architecture naming convention
+
+This project uses **Go/Docker/Debian naming** (`amd64`/`arm64`) for architecture directories in binary paths and GCS buckets:
+
+| Convention | x86_64 name | ARM64 name | Used by |
+|------------|-------------|------------|---------|
+| **Go/Docker/Debian** | `amd64` | `arm64` | This repo, Docker, `dpkg --print-architecture` |
+| Linux/GNU | `x86_64` | `aarch64` | `uname -m`, kernel Makefiles |
+
+Binary paths follow the `{version}/{arch}/` layout:
+
+```
+# Firecracker (GCS bucket or FIRECRACKER_VERSIONS_DIR)
+fc-versions/v1.12.1_210cbac/amd64/firecracker
+fc-versions/v1.12.1_210cbac/arm64/firecracker
+
+# Kernels (GCS bucket or HOST_KERNELS_DIR)
+kernels/vmlinux-6.1.158/amd64/vmlinux.bin
+kernels/vmlinux-6.1.158/arm64/vmlinux.bin
+```
+
+> **Note:** The [fc-kernels](https://github.com/e2b-dev/fc-kernels) repo currently uses `x86_64` instead of `amd64` for its directory names. This will be aligned in a follow-up change.
+
+### ARM64-specific behavior
+
+- **SMT** is disabled (ARM processors don't support simultaneous multi-threading)
+- **CPU detection** uses fallback values since `gopsutil` doesn't populate Family/Model on ARM64
+- **OCI platform** is set to the target architecture instead of hardcoded `amd64`
+- **Busybox binaries** are committed for both architectures and selected automatically via Go build tags
+
+### Cross-architecture deployment
+
+`TARGET_ARCH` is a **runtime** environment variable that overrides the architecture used for path resolution and OCI image pulls. When unset, defaults to the host architecture (`runtime.GOARCH`).
+
+```bash
+# Run orchestrator targeting amd64 paths from an arm64 host
+TARGET_ARCH=amd64 ./bin/orchestrator
+
+# Or in .env file (read at runtime)
+echo "TARGET_ARCH=amd64" >> .env.local
+```
+
+`TARGET_ARCH` affects:
+- Firecracker and kernel binary path resolution (`{version}/{arch}/...`)
+- OCI image platform for container pulls
+
+It does **not** affect:
+- Makefile compilation (see `BUILD_ARCH` below)
+- Hardware-dependent runtime behavior (SMT detection, CPU info) which always uses the actual host architecture
+
+### Building for ARM64
+
+`BUILD_ARCH` defaults to `amd64`. To build ARM64 binaries:
+
+```bash
+# Single command
+BUILD_ARCH=arm64 make build-local
+
+# Or set in .env.local for persistent override
+echo "BUILD_ARCH=arm64" >> .env.local
+```
+
+This applies to all services: orchestrator, envd, client-proxy.
+
+---
+
 ## Environment Variables
 
 Automatically set in local mode. Set before running to override:
 
+- `TARGET_ARCH` - Target architecture override (`amd64` or `arm64`; default: host architecture)
 - `HOST_ENVD_PATH` - Envd binary path (default: `../envd/bin/envd`)
 - `HOST_KERNELS_DIR` - Kernel versions dir (local: `{storage}/kernels`, prod: `/fc-kernels`)
 - `FIRECRACKER_VERSIONS_DIR` - Firecracker versions dir (local: `{storage}/fc-versions`, prod: `/fc-versions`)
 - `ORCHESTRATOR_BASE_PATH` - Base orchestrator data (local: `{storage}/orchestrator`, prod: `/orchestrator`)
 - `SNAPSHOT_CACHE_DIR` - Snapshot cache, ideally on NVMe (local: `{storage}/snapshot-cache`, prod: `/mnt/snapshot-cache`)
-- `SANDBOX_DIR` - Sandbox working dir (local: `{storage}/sandbox`, prod: `/fc-vm`)
+- `SANDBOX_DIR` - Sandbox working dir (default: `/fc-vm`)
+
+## Limitations
+
+- Custom template builds require Debian/Ubuntu-based base images (images that provide the `apt` package manager). Non-Debian images such as Alpine, CentOS/RHEL, or other distributions without `apt` are not supported and will fail during the template build/provisioning process. The provisioning scripts used during template build call `apt` and expect Debian-specific package names and file locations.

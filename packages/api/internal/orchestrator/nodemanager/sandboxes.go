@@ -15,7 +15,6 @@ import (
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
-	ut "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager")
@@ -64,7 +63,7 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 
 			if ingress := config.GetNetwork().GetIngress(); ingress != nil {
 				network.Ingress = &types.SandboxNetworkIngressConfig{
-					AllowPublicAccess: ut.ToPtr(networkTrafficAccessToken == nil),
+					AllowPublicAccess: new(networkTrafficAccessToken == nil),
 					MaskRequestHost:   ingress.MaskRequestHost,
 				}
 			}
@@ -72,9 +71,29 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 			if egress := config.GetNetwork().GetEgress(); egress != nil {
 				// Combine allowed CIDRs and domains back into AllowedAddresses
 				allowedAddresses := slices.Concat(egress.GetAllowedCidrs(), egress.GetAllowedDomains())
+
+				var dbRules map[string][]types.SandboxNetworkRule
+				if protoRules := egress.GetRules(); len(protoRules) > 0 {
+					dbRules = make(map[string][]types.SandboxNetworkRule, len(protoRules))
+					for domain, domainRules := range protoRules {
+						ruleList := make([]types.SandboxNetworkRule, 0, len(domainRules.GetRules()))
+						for _, r := range domainRules.GetRules() {
+							dbRule := types.SandboxNetworkRule{}
+							if t := r.GetTransform(); t != nil {
+								dbRule.Transform = &types.SandboxNetworkTransform{
+									Headers: t.GetHeaders(),
+								}
+							}
+							ruleList = append(ruleList, dbRule)
+						}
+						dbRules[domain] = ruleList
+					}
+				}
+
 				network.Egress = &types.SandboxNetworkEgressConfig{
 					AllowedAddresses: allowedAddresses,
 					DeniedAddresses:  egress.GetDeniedCidrs(),
+					Rules:            dbRules,
 				}
 			}
 		}
@@ -83,9 +102,10 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 
 		var autoResume *types.SandboxAutoResumeConfig
 		if autoResumeCfg := config.GetAutoResume(); autoResumeCfg != nil {
-			p := autoResumeCfg.GetPolicy()
-			policy := types.SandboxAutoResumePolicy(p)
-			autoResume = &types.SandboxAutoResumeConfig{Policy: policy}
+			autoResume = &types.SandboxAutoResumeConfig{
+				Policy:  types.SandboxAutoResumePolicy(autoResumeCfg.GetPolicy()),
+				Timeout: autoResumeCfg.GetTimeoutSeconds(),
+			}
 		}
 
 		sandboxesInfo = append(
@@ -111,6 +131,7 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 				n.ID,
 				n.ClusterID,
 				config.GetAutoPause(),
+				config.GetAutoPauseFilesystemOnly(),
 				autoResume,
 				config.EnvdAccessToken,     //nolint:protogetter // we need the nil check too
 				config.AllowInternetAccess, //nolint:protogetter // we need the nil check too
@@ -119,11 +140,31 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 				network,
 				networkTrafficAccessToken,
 				volumeMounts,
+				iamFromProto(config.GetIam()),
 			),
 		)
 	}
 
 	return sandboxesInfo, nil
+}
+
+// iamFromProto maps the stored orchestrator workload identity configuration
+// back into the API's typed representation on re-sync. Returns nil when none is
+// set (older configs).
+func iamFromProto(iam *orchestrator.SandboxIam) *types.SandboxIam {
+	if iam == nil || len(iam.GetTokens()) == 0 {
+		return nil
+	}
+
+	tokens := make(map[string]types.SandboxIamToken, len(iam.GetTokens()))
+	for name, def := range iam.GetTokens() {
+		tokens[name] = types.SandboxIamToken{
+			Audience:  def.GetAudience(),
+			TokenType: def.GetTokenType(),
+		}
+	}
+
+	return &types.SandboxIam{Tokens: tokens}
 }
 
 func ConvertOrchestratorMountsToDatabaseMounts(mounts []*orchestrator.SandboxVolumeMount) []*types.SandboxVolumeMountConfig {

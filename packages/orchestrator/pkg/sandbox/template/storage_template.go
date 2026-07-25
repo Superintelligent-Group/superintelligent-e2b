@@ -1,3 +1,5 @@
+//go:build linux
+
 package template
 
 import (
@@ -14,7 +16,9 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	blockmetrics "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/scheduling"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
+	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
@@ -23,17 +27,22 @@ import (
 )
 
 type storageTemplate struct {
-	files storage.TemplateCacheFiles
+	paths storage.CachePaths
 
 	memfile  *utils.SetOnce[block.ReadonlyDevice]
 	rootfs   *utils.SetOnce[block.ReadonlyDevice]
 	snapfile *utils.SetOnce[File]
 	metafile *utils.SetOnce[File]
 
-	memfileHeader *header.Header
-	rootfsHeader  *header.Header
-	localSnapfile File
-	localMetafile File
+	memfileHeader *utils.SetOnce[*header.Header]
+	rootfsHeader  *utils.SetOnce[*header.Header]
+	// durableMemfileHeader, when non-nil, is the header the memfile will settle
+	// on (the deduped header while a provisional header is served); Fetch wires
+	// it into the memfile device as its durable header before publishing the
+	// device, so a pause parents off it rather than the provisional header.
+	durableMemfileHeader *utils.SetOnce[*header.Header]
+	localSnapfile        File
+	localMetafile        File
 
 	metrics     blockmetrics.Metrics
 	persistence storage.StorageProvider
@@ -42,38 +51,40 @@ type storageTemplate struct {
 func newTemplateFromStorage(
 	config cfg.BuilderConfig,
 	buildId string,
-	memfileHeader *header.Header,
-	rootfsHeader *header.Header,
+	memfileHeader *utils.SetOnce[*header.Header],
+	rootfsHeader *utils.SetOnce[*header.Header],
 	persistence storage.StorageProvider,
 	metrics blockmetrics.Metrics,
 	localSnapfile File,
 	localMetafile File,
+	durableMemfileHeader *utils.SetOnce[*header.Header],
 ) (*storageTemplate, error) {
-	files, err := storage.TemplateFiles{
+	paths, err := storage.Paths{
 		BuildID: buildId,
-	}.CacheFiles(config.StorageConfig)
+	}.Cache(config.StorageConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create template cache files: %w", err)
+		return nil, fmt.Errorf("failed to create cache paths: %w", err)
 	}
 
 	return &storageTemplate{
-		files:         files,
-		localSnapfile: localSnapfile,
-		localMetafile: localMetafile,
-		memfileHeader: memfileHeader,
-		rootfsHeader:  rootfsHeader,
-		metrics:       metrics,
-		persistence:   persistence,
-		memfile:       utils.NewSetOnce[block.ReadonlyDevice](),
-		rootfs:        utils.NewSetOnce[block.ReadonlyDevice](),
-		snapfile:      utils.NewSetOnce[File](),
-		metafile:      utils.NewSetOnce[File](),
+		paths:                paths,
+		localSnapfile:        localSnapfile,
+		localMetafile:        localMetafile,
+		memfileHeader:        memfileHeader,
+		rootfsHeader:         rootfsHeader,
+		durableMemfileHeader: durableMemfileHeader,
+		metrics:              metrics,
+		persistence:          persistence,
+		memfile:              utils.NewSetOnce[block.ReadonlyDevice](),
+		rootfs:               utils.NewSetOnce[block.ReadonlyDevice](),
+		snapfile:             utils.NewSetOnce[File](),
+		metafile:             utils.NewSetOnce[File](),
 	}, nil
 }
 
 func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore) {
 	ctx, span := tracer.Start(ctx, "fetch storage template", trace.WithAttributes(
-		telemetry.WithBuildID(t.files.BuildID),
+		telemetry.WithBuildID(t.paths.BuildID),
 	))
 	defer span.End()
 
@@ -91,9 +102,8 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 		snapfile, snapfileErr := newStorageFile(
 			ctx,
 			t.persistence,
-			t.files.StorageSnapfilePath(),
-			t.files.CacheSnapfilePath(),
-			storage.SnapfileObjectType,
+			t.paths.Snapfile(),
+			t.paths.CacheSnapfile(),
 		)
 		if snapfileErr != nil {
 			errMsg := fmt.Errorf("failed to fetch snapfile: %w", snapfileErr)
@@ -124,9 +134,8 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 		meta, err := newStorageFile(
 			ctx,
 			t.persistence,
-			t.files.StorageMetadataPath(),
-			t.files.CacheMetadataPath(),
-			storage.MetadataObjectType,
+			t.paths.Metadata(),
+			t.paths.CacheMetadata(),
 		)
 		if err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
 			sourceErr := fmt.Errorf("failed to fetch metafile: %w", err)
@@ -141,11 +150,11 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 			// If we can't find the metadata, we still want to return the metafile.
 			// This is used for templates that don't have metadata, like v1 templates.
 			logger.L().Info(ctx, "failed to fetch metafile, falling back to v1 template metadata",
-				logger.WithBuildID(t.files.BuildID),
+				logger.WithBuildID(t.paths.BuildID),
 				zap.Error(err),
 			)
 			oldTemplateMetadata := metadata.V1TemplateVersion()
-			err := oldTemplateMetadata.ToFile(t.files.CacheMetadataPath())
+			err := oldTemplateMetadata.ToFile(t.paths.CacheMetadata())
 			if err != nil {
 				sourceErr := fmt.Errorf("failed to write v1 template metadata to a file: %w", err)
 				if err := t.metafile.SetError(sourceErr); err != nil {
@@ -156,7 +165,7 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 			}
 
 			if err := t.metafile.SetValue(&storageFile{
-				path: t.files.CacheMetadataPath(),
+				path: t.paths.CacheMetadata(),
 			}); err != nil {
 				return fmt.Errorf("failed to set metafile v1: %w", err)
 			}
@@ -172,12 +181,22 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 	})
 
 	wg.Go(func() error {
+		memHdr, hdrErr := t.memfileHeader.WaitWithContext(ctx)
+		if hdrErr != nil {
+			errMsg := fmt.Errorf("failed to resolve memfile header: %w", hdrErr)
+			if err := t.memfile.SetError(errMsg); err != nil {
+				return fmt.Errorf("failed to set memfile error: %w", errors.Join(errMsg, err))
+			}
+
+			return nil
+		}
+
 		memfileStorage, memfileErr := NewStorage(
 			ctx,
 			buildStore,
-			t.files.BuildID,
+			t.paths.BuildID,
 			build.Memfile,
-			t.memfileHeader,
+			memHdr,
 			t.persistence,
 			t.metrics,
 		)
@@ -185,11 +204,25 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 		if memfileErr != nil {
 			errMsg := fmt.Errorf("failed to create memfile storage: %w", memfileErr)
 
+			logger.L().Warn(ctx, "caching template with failed memfile resolution; reused until cache eviction",
+				logger.WithBuildID(t.paths.BuildID),
+				zap.Duration("min_cache_ttl", templateExpiration),
+				zap.Error(memfileErr),
+			)
+
 			if err := t.memfile.SetError(errMsg); err != nil {
 				return fmt.Errorf("failed to set memfile error: %w", errors.Join(errMsg, err))
 			}
 
 			return nil
+		}
+
+		// Wire the durable header before publishing the device (SetValue), so no
+		// caller can observe the memfile with its durable header unset: a pause
+		// then always parents off the deduped header rather than the provisional
+		// one being served.
+		if t.durableMemfileHeader != nil {
+			memfileStorage.SetDurableHeader(t.durableMemfileHeader)
 		}
 
 		if err := t.memfile.SetValue(memfileStorage); err != nil {
@@ -200,17 +233,33 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 	})
 
 	wg.Go(func() error {
+		rootHdr, hdrErr := t.rootfsHeader.WaitWithContext(ctx)
+		if hdrErr != nil {
+			errMsg := fmt.Errorf("failed to resolve rootfs header: %w", hdrErr)
+			if err := t.rootfs.SetError(errMsg); err != nil {
+				return fmt.Errorf("failed to set rootfs error: %w", errors.Join(errMsg, err))
+			}
+
+			return nil
+		}
+
 		rootfsStorage, rootfsErr := NewStorage(
 			ctx,
 			buildStore,
-			t.files.BuildID,
+			t.paths.BuildID,
 			build.Rootfs,
-			t.rootfsHeader,
+			rootHdr,
 			t.persistence,
 			t.metrics,
 		)
 		if rootfsErr != nil {
 			errMsg := fmt.Errorf("failed to create rootfs storage: %w", rootfsErr)
+
+			logger.L().Warn(ctx, "caching template with failed rootfs resolution; reused until cache eviction",
+				logger.WithBuildID(t.paths.BuildID),
+				zap.Duration("min_cache_ttl", templateExpiration),
+				zap.Error(rootfsErr),
+			)
 
 			if err := t.rootfs.SetError(errMsg); err != nil {
 				return fmt.Errorf("failed to set rootfs error: %w", errors.Join(errMsg, err))
@@ -231,8 +280,8 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 
-		logger.L().Error(ctx, "failed to fetch template files",
-			logger.WithBuildID(t.files.BuildID),
+		logger.L().Error(ctx, "failed to fetch template storage",
+			logger.WithBuildID(t.paths.BuildID),
 			zap.Error(err),
 		)
 
@@ -244,8 +293,51 @@ func (t *storageTemplate) Close(ctx context.Context) error {
 	return closeTemplate(ctx, t)
 }
 
-func (t *storageTemplate) Files() storage.TemplateCacheFiles {
-	return t.files
+func (t *storageTemplate) Files() storage.CachePaths {
+	return t.paths
+}
+
+// SchedulingMetadata reads the headers from the resolved memfile/rootfs devices
+// rather than the header holders, which stay unset for templates loaded from
+// storage (the headers are resolved internally by NewStorage during Fetch).
+func (t *storageTemplate) SchedulingMetadata(ctx context.Context) *orchestrator.SchedulingMetadata {
+	// The rootfs is always present; its header carries the build ID and is the
+	// minimum needed for scheduling metadata.
+	rootfs, rootfsErr := t.rootfs.WaitWithContext(ctx)
+	if rootfsErr != nil {
+		return nil
+	}
+
+	rh := rootfs.Header()
+	if rh == nil || rh.Metadata == nil {
+		return nil
+	}
+
+	// Filesystem-only snapshots have no memfile object, so memfile.WaitWithContext
+	// errors on reload. Tolerate that and report rootfs-only scheduling metadata
+	// (FromHeaders treats a nil memfile header as rootfs-only) instead of
+	// dropping the rootfs affinity data too.
+	var mh *header.Header
+	if memfile, memfileErr := t.memfile.WaitWithContext(ctx); memfileErr == nil {
+		// Use the durable (deduped) header, not the live one: during the
+		// provisional window memfile.Header() maps dirty pages to a synthetic build
+		// id that is never uploaded or registered, which would put a nonexistent
+		// layer into scheduling metadata. Non-blocking: this runs on the
+		// create/resume response path, so while a provisional swap is still pending
+		// (deduped header not yet known) report rootfs-only metadata rather than
+		// block the response for the whole dedup. No swap pending → live header.
+		if dh, ok := memfile.(interface {
+			DurableHeaderNow() (*header.Header, bool)
+		}); ok {
+			if h, ready := dh.DurableHeaderNow(); ready {
+				mh = h
+			}
+		} else {
+			mh = memfile.Header()
+		}
+	}
+
+	return scheduling.FromHeaders(rh.Metadata.BuildId, mh, rh, 0)
 }
 
 func (t *storageTemplate) Memfile(ctx context.Context) (block.ReadonlyDevice, error) {
@@ -278,5 +370,5 @@ func (t *storageTemplate) UpdateMetadata(meta metadata.Template) error {
 		return fmt.Errorf("failed to get metafile: %w", err)
 	}
 
-	return meta.ToFile(metafile.Path())
+	return meta.ReplaceFile(metafile.Path())
 }

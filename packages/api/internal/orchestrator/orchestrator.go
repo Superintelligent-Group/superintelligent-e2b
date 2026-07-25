@@ -7,23 +7,21 @@ import (
 	"net/http"
 	"time"
 
-	nomadapi "github.com/hashicorp/nomad/api"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/api/internal/metrics"
+	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/evictor"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
-	"github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations"
 	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
-	"github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/memory"
-	"github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/populate_redis"
 	redisbackend "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
@@ -45,34 +43,66 @@ type SnapshotCacheInvalidator interface {
 }
 
 type Orchestrator struct {
-	httpClient              *http.Client
-	nomadClient             *nomadapi.Client
-	sandboxStore            *sandbox.Store
-	nodes                   *smap.Map[*nodemanager.Node]
-	placementAlgorithm      *placement.BestOfK
-	featureFlagsClient      *featureflags.Client
-	analytics               *analyticscollector.Analytics
-	posthogClient           *analyticscollector.PosthogClient
-	routingCatalog          e2bcatalog.SandboxesCatalog
-	sqlcDB                  *sqlcdb.Client
-	tel                     *telemetry.Client
-	clusters                *clusters.Pool
-	metricsRegistration     metric.Registration
-	createdSandboxesCounter metric.Int64Counter
-	teamMetricsObserver     *metrics.TeamObserver
-	accessTokenGenerator    *sandbox.AccessTokenGenerator
-	sandboxCounter          metric.Int64UpDownCounter
-	createdCounter          metric.Int64Counter
-	snapshotCache           SnapshotCacheInvalidator
+	httpClient                    *http.Client
+	nodeDiscovery                 discovery.Discovery
+	sandboxStore                  *sandbox.Store
+	nodes                         *smap.Map[*nodemanager.Node]
+	placementAlgorithm            *placement.BestOfK
+	featureFlagsClient            *featureflags.Client
+	analytics                     *analyticscollector.Analytics
+	posthogClient                 *analyticscollector.PosthogClient
+	routingCatalog                e2bcatalog.SandboxesCatalog
+	sqlcDB                        *sqlcdb.Client
+	tel                           *telemetry.Client
+	clusters                      *clusters.Pool
+	metricsRegistration           metric.Registration
+	sandboxCountGaugeRegistration metric.Registration
+	createdSandboxesCounter       metric.Int64Counter
+	resumeOriginNodeRemapCounter  metric.Int64Counter
+	teamMetricsObserver           *metrics.TeamObserver
+	accessTokenGenerator          *sandbox.AccessTokenGenerator
+	createdCounter                metric.Int64Counter
+	snapshotCache                 SnapshotCacheInvalidator
 
 	snapshotUpsertSem *utils.AdjustableSemaphore
+	redisStorage      *redisbackend.Storage
+
+	// localClusterOwnsOrchestrators makes connectToClusterNode register
+	// local-cluster instances that report the Orchestrator role as nodes.
+	//
+	// It is only set when the node discovery loop is disabled (see
+	// skipNomadSync in New), which is the case in the local environment: there
+	// the local clusters registry is the single source of orchestrator nodes.
+	//
+	// Otherwise local-cluster orchestrators are owned by the node discovery
+	// path (connectToNode), which identifies nodes by the ID they report over
+	// the Info RPC, while the clusters registry identifies instances by their
+	// discovery item ID. An instance serving both the orchestrator and the
+	// template-builder role would then register twice under two different node
+	// IDs and have its capacity and sandboxes counted twice.
+	localClusterOwnsOrchestrators bool
+
+	// connectGroup deduplicates concurrent dial+register attempts for the same
+	// physical node. It is keyed by NomadNodeShortID (Nomad-managed nodes) or
+	// scopedNodeID(clusterID, instanceNodeID) (cluster nodes) and is held inside
+	// connectToNode / connectToClusterNode, so it guards every connection path
+	// regardless of what triggered the attempt.
+	connectGroup singleflight.Group
+
+	// discoveryGroup deduplicates concurrent on-demand discovery attempts in
+	// getOrConnectNode that target the same missing orchestrator node. It is
+	// intentionally separate from connectGroup to avoid a deadlock: for cluster
+	// nodes the outer discoveryGroup key and the inner connectGroup key are the
+	// same string, and nesting Do calls for the same key on the same Group would
+	// block forever.
+	discoveryGroup singleflight.Group
 }
 
 func New(
 	ctx context.Context,
 	config cfg.Config,
 	tel *telemetry.Client,
-	nomadClient *nomadapi.Client,
+	nodeDiscovery discovery.Discovery,
 	posthogClient *analyticscollector.PosthogClient,
 	redisClient redis.UniversalClient,
 	sqlcDB *sqlcdb.Client,
@@ -83,7 +113,6 @@ func New(
 	snapshotUpsertSem *utils.AdjustableSemaphore,
 ) (*Orchestrator, error) {
 	analyticsInstance, err := analyticscollector.NewAnalytics(
-		ctx,
 		config.AnalyticsCollectorHost,
 		config.AnalyticsCollectorAPIToken,
 	)
@@ -92,23 +121,13 @@ func New(
 
 		return nil, err
 	}
+	analyticsInstance.Init(ctx)
 
-	var routingCatalog e2bcatalog.SandboxesCatalog
-	if redisClient != nil {
-		routingCatalog = e2bcatalog.NewRedisSandboxesCatalog(redisClient, featureFlags)
-	} else {
-		routingCatalog = e2bcatalog.NewMemorySandboxesCatalog()
-	}
+	routingCatalog := e2bcatalog.NewRedisSandboxCatalog(redisClient)
 
 	// We will need to either use Redis or Consul's KV for storing active sandboxes to keep everything in sync,
 	// right now we load them from Orchestrator
 	meter := tel.MeterProvider.Meter("github.com/e2b-dev/infra/packages/api/internal/orchestrator")
-	sandboxCounter, err := telemetry.GetUpDownCounter(meter, telemetry.SandboxCountMeterName)
-	if err != nil {
-		logger.L().Error(ctx, "error getting counter", zap.Error(err))
-
-		return nil, err
-	}
 
 	createdCounter, err := telemetry.GetCounter(meter, telemetry.SandboxCreateMeterName)
 	if err != nil {
@@ -123,11 +142,21 @@ func New(
 
 	bestOfKAlgorithm := placement.NewBestOfK(getBestOfKConfig(ctx, featureFlags)).(*placement.BestOfK)
 
+	redisStorage, err := redisbackend.NewStorage(redisClient, tel.MeterProvider, featureFlags)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create redis sandbox storage: %w", err)
+	}
+	go redisStorage.Start(ctx)
+
+	// For local development and testing, we skip the Nomad sync
+	// Local cluster is used for single-node setups instead
+	skipNomadSync := env.IsLocal()
+
 	o := Orchestrator{
 		httpClient:           httpClient,
 		analytics:            analyticsInstance,
 		posthogClient:        posthogClient,
-		nomadClient:          nomadClient,
+		nodeDiscovery:        nodeDiscovery,
 		nodes:                smap.New[*nodemanager.Node](),
 		placementAlgorithm:   bestOfKAlgorithm,
 		featureFlagsClient:   featureFlags,
@@ -137,42 +166,32 @@ func New(
 		snapshotCache:        snapshotCache,
 		tel:                  tel,
 		clusters:             clusters,
+		redisStorage:         redisStorage,
 
-		sandboxCounter: sandboxCounter,
 		createdCounter: createdCounter,
 
 		snapshotUpsertSem: snapshotUpsertSem,
-	}
 
-	var reservationStorage sandbox.ReservationStorage
-	var sandboxStorage sandbox.Storage
-	redisStorage := redisbackend.NewStorage(redisClient)
-
-	switch config.SandboxStorageBackend {
-	case cfg.SandboxStorageBackendMemory:
-		reservationStorage = reservations.NewReservationStorage()
-		sandboxStorage = populate_redis.NewStorage(memory.NewStorage(), redisStorage)
-		logger.L().Info(ctx, "Using populate_redis sandbox storage backend")
-	case cfg.SandboxStorageBackendRedis:
-		reservationStorage = redisreservations.NewReservationStorage(redisClient)
-		sandboxStorage = redisStorage
-		logger.L().Info(ctx, "Using redis sandbox storage backend")
-	default:
-		return nil, fmt.Errorf("invalid sandbox storage backend: %s", config.SandboxStorageBackend)
+		// Without the node discovery loop, the local clusters registry is the
+		// only source of orchestrator nodes.
+		localClusterOwnsOrchestrators: skipNomadSync,
 	}
 
 	o.sandboxStore = sandbox.NewStore(
-		sandboxStorage,
-		reservationStorage,
+		redisStorage,
+		redisreservations.NewReservationStorage(redisClient, redisStorage.Notifier()),
 		sandbox.Callbacks{
 			AddSandboxToRoutingTable: o.addSandboxToRoutingTable,
-			AsyncSandboxCounter:      o.sandboxCounterInsert,
 			AsyncNewlyCreatedSandbox: o.handleNewlyCreatedSandbox,
+			RemoveSandboxFromNode:    o.killOrphanSandbox,
 		},
 	)
 
 	// Evict old sandboxes
-	sandboxEvictor := evictor.New(o.sandboxStore, o.RemoveSandbox)
+	sandboxEvictor, err := evictor.New(ctx, o.sandboxStore, o.RemoveSandbox, o.featureFlagsClient, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sandbox evictor: %w", err)
+	}
 	go sandboxEvictor.Start(ctx)
 
 	teamMetricsObserver, err := metrics.NewTeamObserver(ctx, o.sandboxStore)
@@ -184,9 +203,6 @@ func New(
 
 	o.teamMetricsObserver = teamMetricsObserver
 
-	// For local development and testing, we skip the Nomad sync
-	// Local cluster is used for single-node setups instead
-	skipNomadSync := env.IsLocal()
 	go o.keepInSync(ctx, o.sandboxStore, skipNomadSync)
 
 	if err := o.setupMetrics(tel.MeterProvider); err != nil {
@@ -213,6 +229,7 @@ func (o *Orchestrator) startStatusLogging(ctx context.Context) {
 			return
 		case <-ticker.C:
 			connectedNodes := make([]map[string]any, 0, o.nodes.Count())
+			templateManagers := make([]map[string]any, 0)
 
 			for _, nodeItem := range o.nodes.Items() {
 				if nodeItem == nil {
@@ -228,9 +245,23 @@ func (o *Orchestrator) startStatusLogging(ctx context.Context) {
 				}
 			}
 
+			for _, cluster := range o.clusters.GetClusters() {
+				for _, templateManager := range cluster.GetTemplateBuilders() {
+					info := templateManager.GetInfo()
+					templateManagers = append(templateManagers, map[string]any{
+						"cluster_id":          templateManager.ClusterID,
+						"node_id":             templateManager.NodeID,
+						"service_instance_id": info.ServiceInstanceID,
+						"status":              info.Status.String(),
+					})
+				}
+			}
+
 			logger.L().Info(ctx, "API internal status",
 				zap.Int("nodes_count", o.nodes.Count()),
 				zap.Any("nodes", connectedNodes),
+				zap.Int("template_managers_count", len(templateManagers)),
+				zap.Any("template_managers", templateManagers),
 			)
 		}
 	}
@@ -254,6 +285,12 @@ func (o *Orchestrator) Close(ctx context.Context) error {
 		}
 	}
 
+	if o.sandboxCountGaugeRegistration != nil {
+		if err := o.sandboxCountGaugeRegistration.Unregister(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to unregister sandbox count gauge: %w", err))
+		}
+	}
+
 	if o.teamMetricsObserver != nil {
 		if err := o.teamMetricsObserver.Close(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close team metrics observer: %w", err))
@@ -267,6 +304,8 @@ func (o *Orchestrator) Close(ctx context.Context) error {
 	if err := o.routingCatalog.Close(ctx); err != nil {
 		errs = append(errs, err)
 	}
+
+	o.redisStorage.Close(ctx)
 
 	return errors.Join(errs...)
 }
@@ -296,19 +335,13 @@ func getBestOfKConfig(ctx context.Context, featureFlagsClient *featureflags.Clie
 
 	alphaPercent := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKAlpha)
 
-	canFit := featureFlagsClient.BoolFlag(ctx, featureflags.BestOfKCanFitFlag)
-
-	tooManyStarting := featureFlagsClient.BoolFlag(ctx, featureflags.BestOfKTooManyStartingFlag)
-
 	// Convert percentage to decimal
 	alpha := float64(alphaPercent) / 100.0
 	maxOvercommit := float64(maxOvercommitPercent) / 100.0
 
 	return placement.BestOfKConfig{
-		R:               maxOvercommit,
-		K:               k,
-		Alpha:           alpha,
-		CanFit:          canFit,
-		TooManyStarting: tooManyStarting,
+		R:     maxOvercommit,
+		K:     k,
+		Alpha: alpha,
 	}
 }

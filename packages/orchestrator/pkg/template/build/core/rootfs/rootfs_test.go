@@ -1,3 +1,5 @@
+//go:build linux
+
 package rootfs
 
 import (
@@ -7,6 +9,8 @@ import (
 	"io"
 	"maps"
 	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -29,9 +33,18 @@ func TestAdditionalOCILayers(t *testing.T) {
 		err := os.WriteFile(envdPath, []byte("echo hello"), 0o755)
 		require.NoError(t, err)
 
+		busyboxVersion := "1.36.1"
+		busyboxDir := tempDir + "/busybox"
+		err = os.MkdirAll(filepath.Join(busyboxDir, busyboxVersion, runtime.GOARCH), 0o755)
+		require.NoError(t, err)
+		err = os.WriteFile(filepath.Join(busyboxDir, busyboxVersion, runtime.GOARCH, "busybox"), []byte("busybox-binary"), 0o755)
+		require.NoError(t, err)
+
 		buildContext := buildcontext.BuildContext{
 			BuilderConfig: cfg.BuilderConfig{
-				HostEnvdPath: envdPath,
+				HostEnvdPath:   envdPath,
+				HostBusyboxDir: busyboxDir,
+				BusyboxVersion: busyboxVersion,
 			},
 			Config: config.TemplateConfig{
 				MemoryMB: 100,
@@ -77,12 +90,33 @@ func TestAdditionalOCILayers(t *testing.T) {
 
 		keysIter := maps.Keys(actualFiles)
 		keys := slices.Collect(keysIter)
-		assert.Len(t, keys, 13)
+		assert.Len(t, keys, 14)
 		assert.Equal(t, "e2b.local", actualFiles["etc/hostname"])
 		assert.Equal(t, "nameserver 8.8.8.8", actualFiles["etc/resolv.conf"])
 
 		// verify that memory function works
 		assert.Contains(t, actualFiles["etc/systemd/system/envd.service"], `"GOMEMLIMIT=50MiB"`)
+
+		// verify that systemd is configured to retry envd forever
+		assert.Contains(t, actualFiles["etc/systemd/system/envd.service"], "StartLimitIntervalSec=0")
+
+		// Regression guard: envd must be ordered after systemd-tmpfiles-setup.service.
+		// updateEnvd stages its replacement binary in /tmp during early boot, and on
+		// our Ubuntu/Debian base images systemd-tmpfiles-setup.service wipes /tmp's
+		// contents at boot (`D /tmp` rule run with --remove). Without this ordering
+		// envd can answer the build's upload before the wipe, and the staged
+		// /tmp/envd_updated is deleted, so the follow-up chmod/mv fails with ENOENT.
+		envdAfter := ""
+		for line := range strings.SplitSeq(actualFiles["etc/systemd/system/envd.service"], "\n") {
+			if strings.HasPrefix(line, "After=") {
+				envdAfter = line
+
+				break
+			}
+		}
+		require.NotEmpty(t, envdAfter, "envd.service must declare an After= ordering")
+		assert.Contains(t, envdAfter, "systemd-tmpfiles-setup.service",
+			"envd.service After= must order envd after the boot-time /tmp wipe")
 
 		// ensure that both files have identical content
 		disabledContent := strings.TrimSpace(`

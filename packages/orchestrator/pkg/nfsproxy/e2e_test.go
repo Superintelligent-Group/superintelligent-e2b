@@ -1,3 +1,5 @@
+//go:build linux
+
 package nfsproxy
 
 import (
@@ -12,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -108,7 +110,7 @@ func TestIntegrationTest(t *testing.T) {
 	volumeName := "test-volume-1"
 	volumeID := uuid.New()
 	sandboxes := sandbox.NewSandboxesMap()
-	sandboxes.Insert(t.Context(), &sandbox.Sandbox{
+	sandboxes.AssignNetwork(t.Context(), &sandbox.Sandbox{
 		Metadata: &sandbox.Metadata{
 			Runtime: sandbox.RuntimeMetadata{
 				SandboxID: sandboxID,

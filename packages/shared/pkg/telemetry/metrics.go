@@ -8,9 +8,13 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/exemplar"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 )
+
+// Keep this aligned with the collector's max_recv_msg_size_mib setting.
+const otelCollectorMaxRequestSize = 100 << 20
 
 type noopMetricExporter struct{}
 
@@ -38,6 +42,7 @@ func NewMeterExporter(ctx context.Context, extraOption ...otlpmetricgrpc.Option)
 	opts := []otlpmetricgrpc.Option{
 		otlpmetricgrpc.WithInsecure(),
 		otlpmetricgrpc.WithEndpoint(otelCollectorGRPCEndpoint),
+		otlpmetricgrpc.WithMaxRequestSize(otelCollectorMaxRequestSize),
 	}
 	opts = append(opts, extraOption...)
 
@@ -52,6 +57,39 @@ func NewMeterExporter(ctx context.Context, extraOption ...otlpmetricgrpc.Option)
 	return metricExporter, nil
 }
 
+// snapshotBytesView routes the per-snapshot byte histograms to a base-2
+// exponential aggregation. The SDK's default explicit buckets max out at
+// 10_000 (tuned for ms), which collapses byte values into +Inf and makes
+// percentile queries unusable for the large byte ranges these metrics
+// cover.
+var snapshotBytesView = sdkmetric.NewView(
+	sdkmetric.Instrument{
+		Kind: sdkmetric.InstrumentKindHistogram,
+		Name: "orchestrator.sandbox.snapshot.*",
+		Unit: "{By}",
+	},
+	sdkmetric.Stream{
+		Aggregation: sdkmetric.AggregationBase2ExponentialHistogram{
+			MaxSize:  160,
+			MaxScale: 20,
+		},
+	},
+)
+
+var uploadBytesView = sdkmetric.NewView(
+	sdkmetric.Instrument{
+		Kind: sdkmetric.InstrumentKindHistogram,
+		Name: "orchestrator.sandbox.upload.*",
+		Unit: "{By}",
+	},
+	sdkmetric.Stream{
+		Aggregation: sdkmetric.AggregationBase2ExponentialHistogram{
+			MaxSize:  160,
+			MaxScale: 20,
+		},
+	},
+)
+
 func NewMeterProvider(metricsExporter sdkmetric.Exporter, metricExportPeriod time.Duration, res *resource.Resource, extraOption ...sdkmetric.Option) (metric.MeterProvider, error) {
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(
@@ -60,6 +98,10 @@ func NewMeterProvider(metricsExporter sdkmetric.Exporter, metricExportPeriod tim
 				sdkmetric.WithInterval(metricExportPeriod),
 			),
 		),
+		// Disable exemplars: they count 1:1 against the Mimir tenant items/s
+		// limit and we don't query them in any dashboard. Callers can still
+		// override this via extraOption since later options take precedence.
+		sdkmetric.WithExemplarFilter(exemplar.AlwaysOffFilter),
 	}
 
 	if res != nil {
@@ -67,6 +109,7 @@ func NewMeterProvider(metricsExporter sdkmetric.Exporter, metricExportPeriod tim
 	}
 
 	opts = append(opts, extraOption...)
+	opts = append(opts, sdkmetric.WithView(snapshotBytesView, uploadBytesView))
 
 	return sdkmetric.NewMeterProvider(opts...), nil
 }

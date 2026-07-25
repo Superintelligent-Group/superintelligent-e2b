@@ -15,7 +15,6 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
-	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 type ClusterResource interface {
@@ -94,10 +93,10 @@ func apiLogDirectionToEdgeSandboxLogsDirection(direction *api.LogsDirection) *ed
 	}
 
 	if *direction == api.LogsDirectionBackward {
-		return utils.ToPtr(edgeapi.V1SandboxLogsParamsDirectionBackward)
+		return new(edgeapi.V1SandboxLogsParamsDirectionBackward)
 	}
 
-	return utils.ToPtr(edgeapi.V1SandboxLogsParamsDirectionForward)
+	return new(edgeapi.V1SandboxLogsParamsDirectionForward)
 }
 
 func apiLogDirectionToEdgeBuildLogsDirection(direction *api.LogsDirection) *edgeapi.V1TemplateBuildLogsParamsDirection {
@@ -106,10 +105,10 @@ func apiLogDirectionToEdgeBuildLogsDirection(direction *api.LogsDirection) *edge
 	}
 
 	if *direction == api.LogsDirectionBackward {
-		return utils.ToPtr(edgeapi.V1TemplateBuildLogsParamsDirectionBackward)
+		return new(edgeapi.V1TemplateBuildLogsParamsDirectionBackward)
 	}
 
-	return utils.ToPtr(edgeapi.V1TemplateBuildLogsParamsDirectionForward)
+	return new(edgeapi.V1TemplateBuildLogsParamsDirectionForward)
 }
 
 func logToEdgeLevel(level *logs.LogLevel) *edgeapi.LogLevel {
@@ -140,11 +139,11 @@ func logsFromBuilderInstance(ctx context.Context, instance *Instance, templateID
 				TemplateID: templateID,
 				BuildID:    buildID,
 				Offset:     &offset,
-				Limit:      utils.ToPtr(uint32(limit)),
+				Limit:      new(uint32(limit)),
 				Level:      lvlReq,
 				Start:      timestamppb.New(start),
 				End:        timestamppb.New(end),
-				Direction:  utils.ToPtr(logDirectionToTemplateManagerDirection(direction)),
+				Direction:  new(logDirectionToTemplateManagerDirection(direction)),
 			},
 		)
 		if err != nil {
@@ -223,11 +222,13 @@ func getBuildLogsWithSources(
 		sources = append(sources, persistentLogFetcher)
 	}
 
-	// Iterate through sources and return the first successful fetch
+	// Iterate through sources and return the first successful fetch.
+	var lastErr *api.APIError
 	for _, sourceFetch := range sources {
 		entries, err := sourceFetch()
 		if err != nil {
 			logger.L().Warn(ctx, "Error fetching build logs", logger.WithTemplateID(templateID), logger.WithBuildID(buildID), zap.Error(err))
+			lastErr = err
 
 			continue
 		}
@@ -235,5 +236,5 @@ func getBuildLogsWithSources(
 		return entries, nil
 	}
 
-	return nil, nil
+	return nil, lastErr
 }

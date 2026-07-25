@@ -1,3 +1,5 @@
+//go:build linux
+
 package userfaultfd
 
 import (
@@ -41,6 +43,7 @@ func TestAsyncWriteProtection(t *testing.T) {
 		operations    []operation
 		expectedDirty []int
 		expectedClean []int
+		alwaysWP      bool
 	}{
 		{
 			name:          "4k read then write same page",
@@ -229,52 +232,101 @@ func TestAsyncWriteProtection(t *testing.T) {
 			expectedDirty: []int{0, 2},
 			expectedClean: []int{1, 3},
 		},
+
+		// alwaysWP tests: handler copies with UFFDIO_COPY_MODE_WP for all faults,
+		// including writes. WP_ASYNC must automatically clear the WP bit when the
+		// original access was a write. This validates the assumption that independent
+		// prefaulting (always copy with WP) works correctly.
+		{
+			name:          "4k alwaysWP write to missing page",
+			pagesize:      header.PageSize,
+			numberOfPages: 4,
+			alwaysWP:      true,
+			operations: []operation{
+				{offset: 0, mode: operationModeWrite},
+			},
+			expectedDirty: []int{0},
+		},
+		{
+			name:          "4k alwaysWP mixed writes and reads",
+			pagesize:      header.PageSize,
+			numberOfPages: 4,
+			alwaysWP:      true,
+			operations: []operation{
+				{offset: 0 * header.PageSize, mode: operationModeWrite},
+				{offset: 1 * header.PageSize, mode: operationModeRead},
+				{offset: 2 * header.PageSize, mode: operationModeWrite},
+				{offset: 3 * header.PageSize, mode: operationModeRead},
+			},
+			expectedDirty: []int{0, 2},
+			expectedClean: []int{1, 3},
+		},
+		{
+			name:          "hugepage alwaysWP write to missing page",
+			pagesize:      header.HugepageSize,
+			numberOfPages: 4,
+			alwaysWP:      true,
+			operations: []operation{
+				{offset: 0, mode: operationModeWrite},
+			},
+			expectedDirty: []int{0},
+		},
+		{
+			name:          "hugepage alwaysWP mixed writes and reads",
+			pagesize:      header.HugepageSize,
+			numberOfPages: 4,
+			alwaysWP:      true,
+			operations: []operation{
+				{offset: 0 * header.HugepageSize, mode: operationModeWrite},
+				{offset: 1 * header.HugepageSize, mode: operationModeRead},
+				{offset: 2 * header.HugepageSize, mode: operationModeWrite},
+				{offset: 3 * header.HugepageSize, mode: operationModeRead},
+			},
+			expectedDirty: []int{0, 2},
+			expectedClean: []int{1, 3},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			h, err := configureCrossProcessTest(t, testConfig{
+			runMatrix(t, testConfig{
 				pagesize:      tt.pagesize,
 				numberOfPages: tt.numberOfPages,
-			})
-			require.NoError(t, err)
+				alwaysWP:      tt.alwaysWP,
+			}, func(t *testing.T, cfg testConfig) {
+				t.Helper()
 
-			for i, op := range tt.operations {
-				switch op.mode {
-				case operationModeRead:
-					err := h.executeRead(t.Context(), op)
-					require.NoError(t, err, "step %d: read at offset %d", i, op.offset)
-				case operationModeWrite:
-					err := h.executeWrite(t.Context(), op)
-					require.NoError(t, err, "step %d: write at offset %d", i, op.offset)
+				h, err := configureCrossProcessTest(t.Context(), t, cfg)
+				require.NoError(t, err)
+
+				h.executeAll(t, tt.operations)
+
+				pagemap, err := testutils.NewPagemapReader()
+				require.NoError(t, err)
+				defer pagemap.Close()
+
+				memStart := uintptr(unsafe.Pointer(&(*h.memoryArea)[0]))
+
+				for _, p := range tt.expectedDirty {
+					addr := memStart + uintptr(p)*uintptr(tt.pagesize)
+					entry, err := pagemap.ReadEntry(addr)
+					require.NoError(t, err, "pagemap read for dirty page %d", p)
+
+					assert.True(t, entry.IsPresent(), "dirty page %d should be present", p)
+					assert.False(t, entry.IsWriteProtected(), "dirty page %d should have WP cleared", p)
 				}
-			}
 
-			pagemap, err := testutils.NewPagemapReader()
-			require.NoError(t, err)
-			defer pagemap.Close()
+				for _, p := range tt.expectedClean {
+					addr := memStart + uintptr(p)*uintptr(tt.pagesize)
+					entry, err := pagemap.ReadEntry(addr)
+					require.NoError(t, err, "pagemap read for clean page %d", p)
 
-			memStart := uintptr(unsafe.Pointer(&(*h.memoryArea)[0]))
-
-			for _, p := range tt.expectedDirty {
-				addr := memStart + uintptr(p)*uintptr(tt.pagesize)
-				entry, err := pagemap.ReadEntry(addr)
-				require.NoError(t, err, "pagemap read for dirty page %d", p)
-
-				assert.True(t, entry.IsPresent(), "dirty page %d should be present", p)
-				assert.False(t, entry.IsWriteProtected(), "dirty page %d should have WP cleared", p)
-			}
-
-			for _, p := range tt.expectedClean {
-				addr := memStart + uintptr(p)*uintptr(tt.pagesize)
-				entry, err := pagemap.ReadEntry(addr)
-				require.NoError(t, err, "pagemap read for clean page %d", p)
-
-				assert.True(t, entry.IsPresent(), "clean page %d should be present", p)
-				assert.True(t, entry.IsWriteProtected(), "clean page %d should have WP set", p)
-			}
+					assert.True(t, entry.IsPresent(), "clean page %d should be present", p)
+					assert.True(t, entry.IsWriteProtected(), "clean page %d should have WP set", p)
+				}
+			})
 		})
 	}
 }

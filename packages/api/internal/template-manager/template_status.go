@@ -2,12 +2,12 @@ package template_manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/flowchartsman/retry"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
@@ -47,8 +47,11 @@ func (tm *TemplateManager) BuildStatusSync(ctx context.Context, buildID uuid.UUI
 			err = tm.SetStatus(ctx, buildID, types.BuildStatusGroupFailed, &templatemanagergrpc.TemplateBuildStatusReason{
 				Message: "build is in waiting state for too long",
 			})
+			if err != nil {
+				logger.L().Error(ctx, "error when setting build status to failed after waiting for too long", zap.Error(err), logger.WithBuildID(buildID.String()), logger.WithTemplateID(templateID))
+			}
 
-			return fmt.Errorf("build is in waiting state for too long, failing it: %w", err)
+			return errors.New("build is in waiting state for too long, failing it")
 		}
 
 		// just wait for next sync
@@ -81,7 +84,7 @@ func (tm *TemplateManager) BuildStatusSync(ctx context.Context, buildID uuid.UUI
 
 type templateManagerClient interface {
 	SetStatus(ctx context.Context, buildID uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) error
-	SetFinished(ctx context.Context, buildID uuid.UUID, rootfsSize int64, envdVersion string) error
+	SetFinished(ctx context.Context, buildID uuid.UUID, rootfsSize int64, envdVersion, kernelVersion, firecrackerVersion string) error
 	GetStatus(ctx context.Context, buildId uuid.UUID, templateID string, clusterID uuid.UUID, nodeID string) (*templatemanagergrpc.TemplateBuildStatusResponse, error)
 }
 
@@ -151,14 +154,14 @@ func (e terminalError) Error() string {
 
 func newTerminalError(err error) error {
 	return terminalError{
-		err: retry.Stop(errors.WithStack(err)),
+		err: retry.Stop(err),
 	}
 }
 
 func (c *PollBuildStatus) setStatus(ctx context.Context) error {
 	status, err := c.client.GetStatus(ctx, c.buildID, c.templateID, c.clusterID, c.nodeID)
 	if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		return errors.Wrap(err, "context deadline exceeded")
+		return fmt.Errorf("context deadline exceeded: %w", err)
 	} else if err != nil { // retry only on context deadline exceeded
 		c.logger.Error(ctx, "terminal error when polling build status", zap.Error(err))
 
@@ -186,7 +189,7 @@ func (c *PollBuildStatus) dispatchBasedOnStatus(ctx context.Context, status *tem
 		// build failed
 		err := c.client.SetStatus(ctx, c.buildID, types.BuildStatusGroupFailed, status.GetReason())
 		if err != nil {
-			return false, errors.Wrap(err, "error when setting build status")
+			return false, fmt.Errorf("error when setting build status: %w", err)
 		}
 
 		return true, nil
@@ -197,9 +200,16 @@ func (c *PollBuildStatus) dispatchBasedOnStatus(ctx context.Context, status *tem
 			return false, errors.New("nil metadata")
 		}
 
-		err := c.client.SetFinished(ctx, c.buildID, int64(meta.GetRootfsSizeKey()), meta.GetEnvdVersionKey())
+		err := c.client.SetFinished(
+			ctx,
+			c.buildID,
+			int64(meta.GetRootfsSizeKey()),
+			meta.GetEnvdVersionKey(),
+			meta.GetKernelVersion(),
+			meta.GetFirecrackerVersion(),
+		)
 		if err != nil {
-			return false, errors.Wrap(err, "error when finishing build")
+			return false, fmt.Errorf("error when finishing build: %w", err)
 		}
 
 		return true, nil
@@ -230,7 +240,7 @@ func (c *PollBuildStatus) checkBuildStatus(ctx context.Context) (bool, error) {
 
 	buildCompleted, err := c.dispatchBasedOnStatus(ctx, c.status)
 	if err != nil {
-		return false, errors.Wrap(err, "error when dispatching build status")
+		return false, fmt.Errorf("error when dispatching build status: %w", err)
 	}
 
 	return buildCompleted, nil
@@ -272,6 +282,11 @@ func (tm *TemplateManager) SetStatus(ctx context.Context, buildID uuid.UUID, sta
 
 	var err error
 	if statusGroup.IsTerminal() {
+		logger.L().Warn(ctx, "Setting template build status to terminal failure",
+			logger.WithBuildID(buildID.String()),
+			zap.String("reason", buildReason.Message),
+		)
+
 		err = tm.sqlcDB.FailTemplateBuildAndDeactivate(ctx, queries.FailTemplateBuildAndDeactivateParams{
 			Status:     buildStatus(statusGroup),
 			FinishedAt: &now,
@@ -292,14 +307,16 @@ func (tm *TemplateManager) SetStatus(ctx context.Context, buildID uuid.UUID, sta
 	return err
 }
 
-func (tm *TemplateManager) SetFinished(ctx context.Context, buildID uuid.UUID, rootfsSize int64, envdVersion string) error {
+func (tm *TemplateManager) SetFinished(ctx context.Context, buildID uuid.UUID, rootfsSize int64, envdVersion, kernelVersion, firecrackerVersion string) error {
 	// first do database update to prevent race condition while calling status
 	// TODO(ENG-3469): Switch to types.BuildStatusReady once all consumers are migrated.
 	err := tm.sqlcDB.FinishTemplateBuild(ctx, queries.FinishTemplateBuildParams{
-		TotalDiskSizeMb: &rootfsSize,
-		Status:          types.BuildStatusUploaded,
-		EnvdVersion:     &envdVersion,
-		BuildID:         buildID,
+		TotalDiskSizeMb:    &rootfsSize,
+		Status:             types.BuildStatusUploaded,
+		EnvdVersion:        &envdVersion,
+		KernelVersion:      kernelVersion,
+		FirecrackerVersion: firecrackerVersion,
+		BuildID:            buildID,
 	})
 
 	tm.buildCache.Invalidate(ctx, buildID)

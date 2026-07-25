@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,8 +38,16 @@ func init() {
 type Database struct {
 	SqlcClient  *db.Client
 	AuthDb      *authdb.Client
+	AuthDB      *authdb.Client
 	TestQueries *queries.Queries
+	connStr     string
 }
+
+// gooseMu serializes goose operations across parallel tests.
+// goose.OpenDBWithDriver calls goose.SetDialect which writes to package-level
+// globals (dialect, store) without synchronization. Concurrent test goroutines
+// race on these globals, triggering the race detector on ARM64.
+var gooseMu sync.Mutex
 
 // SetupDatabase creates a fresh PostgreSQL container with migrations applied
 func SetupDatabase(t *testing.T) *Database {
@@ -92,22 +101,33 @@ func SetupDatabase(t *testing.T) *Database {
 	})
 
 	// Create the auth db client
-	authDb, err := authdb.NewClient(t.Context(), connStr, connStr)
+	authDB, err := authdb.NewClient(t.Context(), connStr)
 	require.NoError(t, err, "Failed to create auth db client")
 	t.Cleanup(func() {
-		err := authDb.Close()
+		err := authDB.Close()
 		assert.NoError(t, err)
 	})
 
 	return &Database{
 		SqlcClient:  sqlcClient,
-		AuthDb:      authDb,
+		AuthDb:      authDB,
+		AuthDB:      authDB,
 		TestQueries: testQueries,
+		connStr:     connStr,
 	}
 }
 
-// runDatabaseMigrations executes all required database migrations
-func runDatabaseMigrations(t *testing.T, connStr string) {
+func (db *Database) ApplyMigrations(t *testing.T, migrationDirs ...string) {
+	t.Helper()
+
+	db.applyGooseMigrations(t, migrationDirs...)
+}
+
+func (db *Database) ConnStr() string {
+	return db.connStr
+}
+
+func (db *Database) applyGooseMigrations(t *testing.T, migrationDirs ...string) {
 	t.Helper()
 
 	cmd := exec.CommandContext(t.Context(), "git", "rev-parse", "--show-toplevel")
@@ -115,20 +135,33 @@ func runDatabaseMigrations(t *testing.T, connStr string) {
 	require.NoError(t, err, "Failed to find git root")
 	repoRoot := strings.TrimSpace(string(output))
 
-	db, err := goose.OpenDBWithDriver("pgx", connStr)
+	gooseMu.Lock()
+	defer gooseMu.Unlock()
+
+	sqlDB, err := goose.OpenDBWithDriver("pgx", db.connStr)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		err := db.Close()
+		err := sqlDB.Close()
 		assert.NoError(t, err)
 	})
 
-	// run the db migration
-	err = goose.RunWithOptionsContext(
-		t.Context(),
-		"up",
-		db,
-		filepath.Join(repoRoot, "packages", "db", "migrations"),
-		nil,
-	)
-	require.NoError(t, err)
+	for _, migrationsDir := range migrationDirs {
+		err = goose.RunWithOptionsContext(
+			t.Context(),
+			"up",
+			sqlDB,
+			filepath.Join(repoRoot, migrationsDir),
+			nil,
+		)
+
+		require.NoError(t, err)
+	}
+}
+
+// runDatabaseMigrations executes all required database migrations
+func runDatabaseMigrations(t *testing.T, connStr string) {
+	t.Helper()
+
+	db := &Database{connStr: connStr}
+	db.ApplyMigrations(t, filepath.Join("packages", "db", "migrations"))
 }

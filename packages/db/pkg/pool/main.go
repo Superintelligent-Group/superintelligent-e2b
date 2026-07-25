@@ -5,6 +5,9 @@ import (
 	"fmt"
 
 	"github.com/exaring/otelpgx"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/attribute"
 
@@ -28,6 +31,34 @@ func New(ctx context.Context, databaseURL string, poolName string, options ...Op
 	// expose otel traces
 	config.ConnConfig.Tracer = otelpgx.NewTracer()
 
+	// Disable statement caching to avoid issues with prepared statements in transactions
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+
+	previousAfterConnect := config.AfterConnect
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		if previousAfterConnect != nil {
+			if err := previousAfterConnect(ctx, conn); err != nil {
+				return err
+			}
+		}
+
+		typeMap := conn.TypeMap()
+		typeMap.RegisterType(&pgtype.Type{
+			Name: "uuid[]",
+			OID:  pgtype.UUIDArrayOID,
+			Codec: &pgtype.ArrayCodec{
+				ElementType: &pgtype.Type{
+					Name:  "uuid",
+					OID:   pgtype.UUIDOID,
+					Codec: pgtype.UUIDCodec{},
+				},
+			},
+		})
+		typeMap.RegisterDefaultPgType([]uuid.UUID{}, "uuid[]")
+
+		return nil
+	}
+
 	// Create the connection pool
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
@@ -40,10 +71,6 @@ func New(ctx context.Context, databaseURL string, poolName string, options ...Op
 
 		return nil, nil, fmt.Errorf("failed to record stats: %w", err)
 	}
-
-	// TODO [ENG-3437]: Uncomment
-	// Disable statement caching to avoid issues with prepared statements in transactions
-	// config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 
 	return retry.Wrap(pool, retryConfig), pool, nil
 }

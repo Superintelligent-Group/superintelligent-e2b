@@ -1,11 +1,16 @@
+//go:build linux
+
 package fc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
 
-	"github.com/bits-and-blooms/bitset"
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/firecracker-microvm/firecracker-go-sdk"
+	openapiruntime "github.com/go-openapi/runtime"
 	"github.com/go-openapi/strfmt"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
@@ -15,8 +20,9 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/fc/models"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
-	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+const archARM64 = "arm64"
 
 type apiClient struct {
 	client *client.Firecracker
@@ -38,6 +44,7 @@ func (c *apiClient) loadSnapshot(
 	uffdSocketPath string,
 	uffdReady chan struct{},
 	snapfile template.File,
+	useMemfd bool,
 ) error {
 	ctx, span := tracer.Start(ctx, "load-snapshot")
 	defer span.End()
@@ -46,6 +53,9 @@ func (c *apiClient) loadSnapshot(
 	backend := &models.MemoryBackend{
 		BackendPath: &uffdSocketPath,
 		BackendType: &backendType,
+	}
+	if useMemfd {
+		backend.UseMemfd = &useMemfd
 	}
 
 	snapfilePath := snapfile.Path()
@@ -202,19 +212,20 @@ func (c *apiClient) setBootSource(ctx context.Context, kernelArgs string, kernel
 	return err
 }
 
-func (c *apiClient) setRootfsDrive(ctx context.Context, rootfsPath string, ioEngine *string) error {
-	rootfs := "rootfs"
+func (c *apiClient) setRootfsDrive(ctx context.Context, rootfsPath string, ioEngine *string, rateLimiter *models.RateLimiter) error {
+	driveID := rootfsDriveID
 
 	isRootDevice := true
 	driversConfig := operations.PutGuestDriveByIDParams{
 		Context: ctx,
-		DriveID: rootfs,
+		DriveID: driveID,
 		Body: &models.Drive{
-			DriveID:      &rootfs,
+			DriveID:      &driveID,
 			PathOnHost:   rootfsPath,
 			IsRootDevice: &isRootDevice,
 			IsReadOnly:   false,
 			IoEngine:     ioEngine,
+			RateLimiter:  rateLimiter,
 		},
 	}
 
@@ -245,10 +256,10 @@ func buildTokenBucket(b TokenBucketConfig) *models.TokenBucket {
 	return bucket
 }
 
-// buildTxRateLimiter constructs a Firecracker RateLimiter from a TxRateLimiterConfig.
+// buildRateLimiter constructs a Firecracker RateLimiter from a RateLimiterConfig.
 // Either bucket is omitted when its BucketSize is < 0.
 // Returns nil only when both buckets are disabled.
-func buildTxRateLimiter(config TxRateLimiterConfig) *models.RateLimiter {
+func buildRateLimiter(config RateLimiterConfig) *models.RateLimiter {
 	ops := buildTokenBucket(config.Ops)
 	bw := buildTokenBucket(config.Bandwidth)
 
@@ -263,8 +274,8 @@ func buildTxRateLimiter(config TxRateLimiterConfig) *models.RateLimiter {
 // Both buckets are disabled when their BucketSize < 0; if all are disabled an empty
 // RateLimiter is sent to reset any limit persisted in a snapshot.
 // This always sends a PATCH so snapshot-persisted limits are overwritten.
-func (c *apiClient) setTxRateLimit(ctx context.Context, ifaceID string, config TxRateLimiterConfig) error {
-	limiter := buildTxRateLimiter(config)
+func (c *apiClient) setTxRateLimit(ctx context.Context, ifaceID string, config RateLimiterConfig) error {
+	limiter := buildRateLimiter(config)
 	if limiter == nil {
 		limiter = &models.RateLimiter{} // empty = reset
 	}
@@ -281,6 +292,33 @@ func (c *apiClient) setTxRateLimit(ctx context.Context, ifaceID string, config T
 	_, err := c.client.Operations.PatchGuestNetworkInterfaceByID(&params)
 	if err != nil {
 		return fmt.Errorf("error setting TX rate limit: %w", err)
+	}
+
+	return nil
+}
+
+// setDriveRateLimit applies or clears a Firecracker VMM-level block device rate limit.
+// Both buckets are disabled when their BucketSize < 0; if all are disabled an empty
+// RateLimiter is sent to reset any limit persisted in a snapshot.
+// This always sends a PATCH so snapshot-persisted limits are overwritten.
+func (c *apiClient) setDriveRateLimit(ctx context.Context, driveID string, config RateLimiterConfig) error {
+	limiter := buildRateLimiter(config)
+	if limiter == nil {
+		limiter = &models.RateLimiter{} // empty = reset
+	}
+
+	params := operations.PatchGuestDriveByIDParams{
+		Context: ctx,
+		DriveID: driveID,
+		Body: &models.PartialDrive{
+			DriveID:     &driveID,
+			RateLimiter: limiter,
+		},
+	}
+
+	_, err := c.client.Operations.PatchGuestDriveByID(&params)
+	if err != nil {
+		return fmt.Errorf("error setting drive rate limit: %w", err)
 	}
 
 	return nil
@@ -326,7 +364,14 @@ func (c *apiClient) setMachineConfig(
 	memoryMB int64,
 	hugePages bool,
 ) error {
-	smt := true
+	// SMT (Simultaneous Multi-Threading / Hyper-Threading) must be disabled on
+	// ARM64 because ARM processors use a different core topology (big.LITTLE,
+	// efficiency/performance cores) rather than hardware threads per core.
+	// Firecracker validates this against the host CPU and rejects SMT=true on ARM.
+	// See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/cpu_templates/cpu-features.md
+	// We use runtime.GOARCH (not TARGET_ARCH) because the orchestrator binary
+	// always runs on the same architecture as Firecracker.
+	smt := runtime.GOARCH != archARM64
 	trackDirtyPages := false
 	machineConfig := &models.MachineConfiguration{
 		VcpuCount:       &vCPUCount,
@@ -356,9 +401,9 @@ func (c *apiClient) setEntropyDevice(ctx context.Context) error {
 		Body: &models.EntropyDevice{
 			RateLimiter: &models.RateLimiter{
 				Bandwidth: &models.TokenBucket{
-					OneTimeBurst: utils.ToPtr(entropyOneTimeBurst),
-					Size:         utils.ToPtr(entropyBytesSize),
-					RefillTime:   utils.ToPtr(entropyRefillTime),
+					OneTimeBurst: new(entropyOneTimeBurst),
+					Size:         new(entropyBytesSize),
+					RefillTime:   new(entropyRefillTime),
 				},
 			},
 		},
@@ -389,6 +434,68 @@ func (c *apiClient) startVM(ctx context.Context) error {
 	return nil
 }
 
+// installBalloon attaches a zero-MiB balloon device. Individual balloon
+// features (free-page-reporting, free-page-hinting) are toggled via
+// parameters so callers can opt in to any subset independently.
+func (c *apiClient) installBalloon(ctx context.Context, freePageReporting, freePageHinting bool) error {
+	ctx, span := tracer.Start(ctx, "install-balloon")
+	defer span.End()
+
+	amountMib := int64(0)
+	deflateOnOom := false
+
+	balloonConfig := operations.PutBalloonParams{
+		Context: ctx,
+		Body: &models.Balloon{
+			AmountMib:         &amountMib,
+			DeflateOnOom:      &deflateOnOom,
+			FreePageReporting: freePageReporting,
+			FreePageHinting:   freePageHinting,
+		},
+	}
+
+	_, err := c.client.Operations.PutBalloon(&balloonConfig)
+	if err != nil {
+		return fmt.Errorf("error installing balloon device: %w", err)
+	}
+
+	return nil
+}
+
+func (c *apiClient) startBalloonHinting(ctx context.Context, acknowledgeOnStop bool) error {
+	params := operations.StartBalloonHintingParams{
+		Context: ctx,
+		Body:    &models.BalloonStartCmd{AcknowledgeOnStop: acknowledgeOnStop},
+	}
+	_, err := c.client.Operations.StartBalloonHinting(&params)
+	if err != nil {
+		// FC returns 204 (no content) on success, but the FC OpenAPI spec only
+		// declares 200/400 — go-swagger treats any other 2xx as "unexpected
+		// success" and surfaces it as a *runtime.APIError. Honour the 2xx.
+		var apiErr *openapiruntime.APIError
+		if errors.As(err, &apiErr) && apiErr.IsSuccess() {
+			return nil
+		}
+
+		return fmt.Errorf("error starting balloon hinting: %w", err)
+	}
+
+	return nil
+}
+
+func (c *apiClient) describeBalloonHinting(ctx context.Context) (hostCmd int64, err error) {
+	params := operations.DescribeBalloonHintingParams{Context: ctx}
+	res, err := c.client.Operations.DescribeBalloonHinting(&params)
+	if err != nil {
+		return 0, err
+	}
+	if res.Payload.HostCmd != nil {
+		hostCmd = *res.Payload.HostCmd
+	}
+
+	return hostCmd, nil
+}
+
 func (c *apiClient) memoryMapping(ctx context.Context) (*memory.Mapping, error) {
 	params := operations.GetMemoryMappingsParams{
 		Context: ctx,
@@ -413,8 +520,8 @@ func (c *apiClient) memoryInfo(ctx context.Context, blockSize int64) (*header.Di
 	}
 
 	return &header.DiffMetadata{
-		Dirty:     bitset.From(res.Payload.Resident),
-		Empty:     bitset.From(res.Payload.Empty),
+		Dirty:     roaring.FromDense(res.Payload.Resident, false),
+		Empty:     roaring.FromDense(res.Payload.Empty, false),
 		BlockSize: blockSize,
 	}, nil
 }
@@ -430,8 +537,8 @@ func (c *apiClient) dirtyMemory(ctx context.Context, blockSize int64) (*header.D
 	}
 
 	return &header.DiffMetadata{
-		Dirty:     bitset.From(res.Payload.Bitmap),
-		Empty:     bitset.New(0),
+		Dirty:     roaring.FromDense(res.Payload.Bitmap, false),
+		Empty:     roaring.New(),
 		BlockSize: blockSize,
 	}, nil
 }

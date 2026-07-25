@@ -1,3 +1,5 @@
+//go:build linux
+
 package testutils
 
 import (
@@ -24,7 +26,7 @@ func NewZeroDevice(size int64, blockSize int64) (*ZeroDevice, error) {
 		uint64(blockSize),
 		uint64(size),
 	),
-		[]*header.BuildMap{
+		[]header.BuildMap{
 			{
 				Offset:             0,
 				Length:             uint64(size),
@@ -60,6 +62,10 @@ func (z *ZeroDevice) Slice(_ context.Context, _, length int64) ([]byte, error) {
 
 func (z *ZeroDevice) Header() *header.Header {
 	return z.header
+}
+
+func (z *ZeroDevice) SwapHeader(h *header.Header) {
+	z.header = h
 }
 
 func (z *ZeroDevice) Close() error {

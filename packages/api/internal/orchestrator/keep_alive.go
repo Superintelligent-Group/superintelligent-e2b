@@ -3,12 +3,10 @@ package orchestrator
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
@@ -16,7 +14,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
-var errMaxInstanceLengthExceeded = fmt.Errorf("max instance length exceeded")
+var errMaxInstanceLengthExceeded = errors.New("max instance length exceeded")
 
 func (o *Orchestrator) KeepAliveFor(ctx context.Context, teamID uuid.UUID, sandboxID string, duration time.Duration, allowShorter bool) (*sandbox.Sandbox, *api.APIError) {
 	now := time.Now()
@@ -39,7 +37,7 @@ func (o *Orchestrator) KeepAliveFor(ctx context.Context, teamID uuid.UUID, sandb
 			return sbx, nil
 		}
 
-		logger.L().Debug(ctx, "sandbox ttl updated", logger.WithSandboxID(sbx.SandboxID), zap.Time("end_time", endTime))
+		logger.L().Debug(ctx, "sandbox ttl updated", logger.WithSandboxID(sbx.SandboxID), logger.Time("end_time", endTime))
 		sbx.EndTime = endTime
 
 		return sbx, nil

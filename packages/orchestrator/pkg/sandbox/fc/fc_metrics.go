@@ -1,3 +1,5 @@
+//go:build linux
+
 package fc
 
 import (
@@ -5,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -24,7 +28,6 @@ const (
 	metricsReaderBufSize = 1 * 1024 * 1024 // 1 MB
 
 	// metricsFlushInterval controls how often we trigger a Firecracker metrics flush.
-	// Matches the host stats sampling interval (HostStatsSamplingInterval, default 5 s).
 	metricsFlushInterval = 5 * time.Second
 )
 
@@ -35,6 +38,8 @@ var (
 	directionKey = attribute.Key("direction")
 	attrTX       = metric.WithAttributes(directionKey.String("tx"))
 	attrRX       = metric.WithAttributes(directionKey.String("rx"))
+	attrRead     = metric.WithAttributes(directionKey.String("read"))
+	attrWrite    = metric.WithAttributes(directionKey.String("write"))
 
 	// Counters — global totals, no sandbox_id to avoid high cardinality.
 	fcNetFails         = utils.Must(telemetry.GetCounter(fcMeter, telemetry.SandboxFCNetFails))
@@ -49,12 +54,83 @@ var (
 	// TX-only: no RX equivalent in Firecracker metrics.
 	fcNetRateLimiterEventCount = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCNetRateLimiterEventCount))
 	fcNetRemainingReqs         = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCNetRemainingReqs))
+
+	// Block counters.
+	fcBlockFails         = utils.Must(telemetry.GetCounter(fcMeter, telemetry.SandboxFCBlockFails))
+	fcBlockNoAvailBuffer = utils.Must(telemetry.GetCounter(fcMeter, telemetry.SandboxFCBlockNoAvailBuffer))
+
+	// Block histograms.
+	fcBlockBytes                 = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCBlockBytes))
+	fcBlockCount                 = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCBlockCount))
+	fcBlockRateLimiterThrottled  = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCBlockRateLimiterThrottled))
+	fcBlockRateLimiterEventCount = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCBlockRateLimiterEventCount))
+	fcBlockIOEngineThrottled     = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCBlockIOEngineThrottled))
+	fcBlockRemainingReqs         = utils.Must(telemetry.GetHistogram(fcMeter, telemetry.SandboxFCBlockRemainingReqs))
+
+	// Counter incremented by the stalled thread count at each 1 s poll.
+	// rate() of this counter shows throttle intensity in real-time and
+	// distinguishes dirty-page throttle (non-zero rate) from GCS cold cache
+	// (zero rate) without requiring a Tempo trace lookup.
+	balanceDirtyPageThreads = utils.Must(telemetry.GetCounter(fcMeter, telemetry.OrchestratorHostBalanceDirtyPagesThreads))
 )
 
-// firecrackerNetMetrics holds the Firecracker net metrics fields we care about.
-// Firecracker serializes SharedIncMetric fields as per-flush deltas (not cumulative totals):
-// each JSON line contains the increment since the previous flush.
-// Flush interval defaults to 60 s; additional flushes are triggered by FlushMetrics API calls.
+// dirtyPollInterval is how often monitorDirtyPageThrottle samples wchan entries.
+// 1 s gives adequate resolution for stall episodes that last several seconds,
+// and is consistent with other host-level pollers in pkg/metrics/host.go.
+const dirtyPollInterval = 1 * time.Second
+
+// balanceDirtyPagesWchan is the kernel wait-channel symbol written to
+// /proc/self/task/*/wchan when a thread is parked in balance_dirty_pages.
+// Fires for both per-BDI and global dirty-page throttle regardless of the
+// global dirty/MemTotal ratio, making it the only reliable userspace signal
+// for per-BDI throttle on large-RAM nodes.
+const balanceDirtyPagesWchan = "balance_dirty_pages"
+
+// countBalanceDirtyThreads returns the number of OS threads of the current
+// process currently stalled in balance_dirty_pages by reading
+// /proc/self/task/*/wchan. Returns 0 on any read error.
+func countBalanceDirtyThreads() int {
+	pid := os.Getpid()
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/wchan", pid, e.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(data)) == balanceDirtyPagesWchan {
+			n++
+		}
+	}
+
+	return n
+}
+
+func init() {
+	go monitorDirtyPageThrottle()
+}
+
+// monitorDirtyPageThrottle runs for the lifetime of the process, sampling
+// balance_dirty_pages thread counts every dirtyPollInterval and incrementing
+// balanceDirtyPageThreads. rate() of the counter gives real-time throttle
+// intensity; 0 means no dirty-page stalls are occurring.
+func monitorDirtyPageThrottle() {
+	ticker := time.NewTicker(dirtyPollInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		// Add even when 0 so the counter exports from process start —
+		// otherwise a node that never stalls has no series at all and
+		// dashboards can't tell "no stalls" from "no metric".
+		balanceDirtyPageThreads.Add(context.Background(), int64(countBalanceDirtyThreads()))
+	}
+}
+
+// firecrackerNetMetrics is a subset of Firecracker's NetDeviceMetrics we export via OTEL.
+// Full metric list: https://github.com/firecracker-microvm/firecracker/blob/main/docs/metrics.md
+// Values are per-flush deltas; flush defaults to 60 s, additional flushes via FlushMetrics API.
 type firecrackerNetMetrics struct {
 	// TX
 	TxBytesCount            uint64 `json:"tx_bytes_count"`
@@ -76,13 +152,119 @@ type firecrackerNetMetrics struct {
 	TapReadFails           uint64 `json:"tap_read_fails"`
 }
 
+// firecrackerBlockMetrics is a subset of Firecracker's BlockDeviceMetrics we export via OTEL.
+// Full metric list: https://github.com/firecracker-microvm/firecracker/blob/main/docs/metrics.md
+// Values are per-flush deltas. The aggregate "block" key sums over all drives; we only have one (rootfs).
+type firecrackerBlockMetrics struct {
+	ReadBytes                  uint64 `json:"read_bytes"`
+	WriteBytes                 uint64 `json:"write_bytes"`
+	ReadCount                  uint64 `json:"read_count"`
+	WriteCount                 uint64 `json:"write_count"`
+	RateLimiterThrottledEvents uint64 `json:"rate_limiter_throttled_events"`
+	RateLimiterEventCount      uint64 `json:"rate_limiter_event_count"`
+	IOEngineThrottledEvents    uint64 `json:"io_engine_throttled_events"`
+	NoAvailBuffer              uint64 `json:"no_avail_buffer"`
+	ExecuteFails               uint64 `json:"execute_fails"`
+	EventFails                 uint64 `json:"event_fails"`
+	RemainingReqsCount         uint64 `json:"remaining_reqs_count"`
+}
+
+// firecrackerBalloonMetrics is a subset of Firecracker's BalloonDeviceMetrics.
+// Counters are SharedIncMetric — each flush emits the delta since the previous
+// serialize, so we accumulate them in the reader.
+type firecrackerBalloonMetrics struct {
+	FreePageHintCount   uint64 `json:"free_page_hint_count"`
+	FreePageHintFreed   uint64 `json:"free_page_hint_freed"`
+	FreePageHintFails   uint64 `json:"free_page_hint_fails"`
+	FreePageReportCount uint64 `json:"free_page_report_count"`
+	FreePageReportFreed uint64 `json:"free_page_report_freed"`
+	FreePageReportFails uint64 `json:"free_page_report_fails"`
+}
+
 // firecrackerMetrics is the top-level structure of one Firecracker metrics JSON line.
 type firecrackerMetrics struct {
-	Net firecrackerNetMetrics `json:"net"`
+	Net     firecrackerNetMetrics     `json:"net"`
+	Block   firecrackerBlockMetrics   `json:"block"`
+	Balloon firecrackerBalloonMetrics `json:"balloon"`
+}
+
+// BalloonMetricsSnapshot is the cumulative-since-FC-start view of
+// virtio-balloon counters, exposed via Process.BalloonMetrics.
+type BalloonMetricsSnapshot struct {
+	HintCount   uint64
+	HintFreed   uint64
+	HintFails   uint64
+	ReportCount uint64
+	ReportFreed uint64
+	ReportFails uint64
+}
+
+// fphFlushReadTimeout caps how long FlushAndReadBalloonMetrics waits for the
+// metrics-reader goroutine to consume FC's response line.
+const fphFlushReadTimeout = 2 * time.Second
+
+func accumulateBalloon(prev *BalloonMetricsSnapshot, b firecrackerBalloonMetrics) BalloonMetricsSnapshot {
+	next := BalloonMetricsSnapshot{
+		HintCount:   b.FreePageHintCount,
+		HintFreed:   b.FreePageHintFreed,
+		HintFails:   b.FreePageHintFails,
+		ReportCount: b.FreePageReportCount,
+		ReportFreed: b.FreePageReportFreed,
+		ReportFails: b.FreePageReportFails,
+	}
+	if prev != nil {
+		next.HintCount += prev.HintCount
+		next.HintFreed += prev.HintFreed
+		next.HintFails += prev.HintFails
+		next.ReportCount += prev.ReportCount
+		next.ReportFreed += prev.ReportFreed
+		next.ReportFails += prev.ReportFails
+	}
+
+	return next
+}
+
+// BalloonMetrics returns the cumulative virtio-balloon counters observed so far.
+func (p *Process) BalloonMetrics() BalloonMetricsSnapshot {
+	if cur := p.balloonAccum.Load(); cur != nil {
+		return *cur
+	}
+
+	return BalloonMetricsSnapshot{}
+}
+
+// FlushMetrics triggers an FC metrics flush. Non-blocking on the reader.
+func (p *Process) FlushMetrics(ctx context.Context) error {
+	return p.client.flushMetrics(ctx)
+}
+
+// FlushAndReadBalloonMetrics flushes and waits for the reader to ingest the
+// resulting line, returning the updated cumulative snapshot. On flush error
+// (e.g. FC already torn down) returns the last observed snapshot.
+func (p *Process) FlushAndReadBalloonMetrics(ctx context.Context) (BalloonMetricsSnapshot, error) {
+	pre := p.balloonAccum.Load()
+	if err := p.client.flushMetrics(ctx); err != nil {
+		return p.BalloonMetrics(), fmt.Errorf("flush metrics: %w", err)
+	}
+
+	deadline := time.Now().Add(fphFlushReadTimeout)
+	for {
+		if cur := p.balloonAccum.Load(); cur != pre {
+			return p.BalloonMetrics(), nil
+		}
+		if time.Now().After(deadline) {
+			return p.BalloonMetrics(), errors.New("timeout waiting for fresh balloon metrics line")
+		}
+		select {
+		case <-time.After(5 * time.Millisecond):
+		case <-ctx.Done():
+			return p.BalloonMetrics(), ctx.Err()
+		}
+	}
 }
 
 // startMetricsReader opens the metrics FIFO and starts a goroutine that reads
-// Firecracker metrics lines and exports net device metrics via OTEL.
+// Firecracker metrics lines and exports metrics via OTEL.
 // It must be called before setMetrics so that the FIFO is open for reading
 // before Firecracker opens the write end in response to PUT /metrics.
 func (p *Process) startMetricsReader(ctx context.Context) {
@@ -204,6 +386,35 @@ func (p *Process) startMetricsReader(ctx context.Context) {
 			if n.TapReadFails > 0 {
 				fcNetTapIOFails.Add(ctx, int64(n.TapReadFails), attrRX)
 			}
+
+			// Block histograms — values are already per-flush deltas from Firecracker.
+			b := &m.Block
+
+			fcBlockBytes.Record(ctx, int64(b.ReadBytes), attrRead)
+			fcBlockBytes.Record(ctx, int64(b.WriteBytes), attrWrite)
+			fcBlockCount.Record(ctx, int64(b.ReadCount), attrRead)
+			fcBlockCount.Record(ctx, int64(b.WriteCount), attrWrite)
+			fcBlockRateLimiterEventCount.Record(ctx, int64(b.RateLimiterEventCount))
+			fcBlockRemainingReqs.Record(ctx, int64(b.RemainingReqsCount))
+
+			if b.RateLimiterThrottledEvents > 0 {
+				fcBlockRateLimiterThrottled.Record(ctx, int64(b.RateLimiterThrottledEvents))
+			}
+			if b.IOEngineThrottledEvents > 0 {
+				fcBlockIOEngineThrottled.Record(ctx, int64(b.IOEngineThrottledEvents))
+			}
+
+			// Block global error/event counters.
+			if b.ExecuteFails > 0 || b.EventFails > 0 {
+				fcBlockFails.Add(ctx, int64(b.ExecuteFails)+int64(b.EventFails))
+			}
+			if b.NoAvailBuffer > 0 {
+				fcBlockNoAvailBuffer.Add(ctx, int64(b.NoAvailBuffer))
+			}
+
+			// Balloon: SharedIncMetric resets on flush, so accumulate.
+			next := accumulateBalloon(p.balloonAccum.Load(), m.Balloon)
+			p.balloonAccum.Store(&next)
 		}
 
 		if err := scanner.Err(); err != nil {

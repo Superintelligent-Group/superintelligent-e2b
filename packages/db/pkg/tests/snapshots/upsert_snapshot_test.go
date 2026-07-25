@@ -1,7 +1,6 @@
 package snapshots
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -19,12 +18,14 @@ func TestUpsertSnapshot_NewSnapshot(t *testing.T) {
 	t.Parallel()
 	// Setup test database with migrations
 	client := testutils.SetupDatabase(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a test team first (required by foreign key constraint)
 	teamID := testutils.CreateTestTeam(t, client)
 	// Create a base env (required by foreign key constraint on snapshots table)
 	baseTemplateID := testutils.CreateTestTemplate(t, client, teamID)
+	// Source build the snapshot copies its CPU info from
+	sourceBuildID := testutils.CreateTestBuild(t, ctx, client, baseTemplateID, "uploaded")
 
 	// Prepare test data for a new snapshot
 	templateID := "test-template-" + uuid.New().String()
@@ -60,8 +61,9 @@ func TestUpsertSnapshot_NewSnapshot(t *testing.T) {
 				},
 			},
 		},
-		OriginNodeID: originNodeID,
-		Status:       "snapshotting",
+		OriginNodeID:  originNodeID,
+		SourceBuildID: sourceBuildID,
+		Status:        "snapshotting",
 	}
 
 	// Execute UpsertSnapshot for a new snapshot
@@ -103,12 +105,14 @@ func TestUpsertSnapshot_ExistingSnapshot(t *testing.T) {
 	t.Parallel()
 	// Setup test database with migrations
 	client := testutils.SetupDatabase(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a test team first (required by foreign key constraint)
 	teamID := testutils.CreateTestTeam(t, client)
 	// Create a base env (required by foreign key constraint on snapshots table)
 	baseTemplateID := testutils.CreateTestTemplate(t, client, teamID)
+	// Source build the snapshots copy their CPU info from
+	sourceBuildID := testutils.CreateTestBuild(t, ctx, client, baseTemplateID, "uploaded")
 
 	// Prepare test data for the first snapshot creation
 	templateID := "test-template-" + uuid.New().String()
@@ -139,8 +143,9 @@ func TestUpsertSnapshot_ExistingSnapshot(t *testing.T) {
 		Config: &types.PausedSandboxConfig{
 			Version: types.PausedSandboxConfigVersion,
 		},
-		OriginNodeID: originNodeID,
-		Status:       "snapshotting",
+		OriginNodeID:  originNodeID,
+		SourceBuildID: sourceBuildID,
+		Status:        "snapshotting",
 	}
 
 	// Create the initial snapshot
@@ -197,6 +202,7 @@ func TestUpsertSnapshot_ExistingSnapshot(t *testing.T) {
 		AutoPause:           true,                // Updated from false
 		Config:              updatedConfig,       // Updated config
 		OriginNodeID:        updatedOriginNodeID, // Updated from node-1
+		SourceBuildID:       sourceBuildID,
 		Status:              "snapshotting",
 	}
 
@@ -254,6 +260,7 @@ func TestUpsertSnapshot_ExistingSnapshot(t *testing.T) {
 		AutoPause:           true,
 		Config:              updatedConfig,
 		OriginNodeID:        "node-3",
+		SourceBuildID:       sourceBuildID,
 		Status:              "snapshotting",
 	}
 

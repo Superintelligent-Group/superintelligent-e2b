@@ -43,7 +43,6 @@ linters:
     - noinlineerr
     - nonamedreturns
     - nosprintfhostport
-    - perfsprint
     - prealloc
     - predeclared
     - tagliatelle
@@ -60,13 +59,33 @@ linters:
     - wsl
     - wsl_v5
 
+  exclusions:
+    rules:
+      - path: '^packages/db/pkg/dberrors/dberrors\.go$'
+        linters:
+          - forbidigo
+      - path: '.*_test\.go$'
+        text: "Use github.com/e2b-dev/infra/packages/db/pkg/dberrors.IsNotFoundError instead."
+        linters:
+          - forbidigo
+      # Pre-existing packages with non-recommended names ("types", "utils").
+      # excluded for now.
+      - path: ".*"
+        text: "package-naming"
+        linters:
+          - revive
+
   settings:
     forbidigo:
       forbid:
-        - pattern: "^new$"
-          msg: "Use &Type{} instead."
-    #        - pattern: os\.Getenv
-    #          msg: "Add your field to the configuration model instead."
+        - pattern: '.*\.ErrNoRows$'
+          pkg: "^database/sql$"
+          msg: "Use github.com/e2b-dev/infra/packages/db/pkg/dberrors.IsNotFoundError instead."
+        - pattern: '.*\.ErrNoRows$'
+          pkg: '^github\.com/jackc/pgx/v5$'
+          msg: "Use github.com/e2b-dev/infra/packages/db/pkg/dberrors.IsNotFoundError instead."
+        #        - pattern: os\.Getenv
+        #          msg: "Add your field to the configuration model instead."
         - pattern: 'zap\.New$'
           pkg: '^go\.uber\.org/zap$'
           msg: "Use github.com/e2b-dev/infra/packages/shared/pkg/logger instead of zap.New()"
@@ -87,11 +106,17 @@ linters:
         - pattern: 'zap\.NewNop$'
           pkg: '^go\.uber\.org/zap$'
           msg: "Use github.com/e2b-dev/infra/packages/shared/pkg/logger.NewNopLogger() instead of zap.NewNop()"
+        - pattern: 'zap\.Time$'
+          pkg: '^go\.uber\.org/zap$'
+          msg: "Use github.com/e2b-dev/infra/packages/shared/pkg/logger.Time() instead of zap.Time()"
 
         # prefer methods that take a context to those that don't
         - pattern: '^retryablehttp\.NewRequest$'
           pkg: ^github\.com/hashicorp/go-retryablehttp$
           msg: "Use github.com/hashicorp/go-retryablehttp.NewRequestWithContext instead of retryablehttp.NewRequest"
+        - pattern: 'gin\.SetMode'
+          pkg: '^github\.com/gin-gonic/gin$'
+          msg: "Do not use gin.SetMode(gin.TestMode) - it causes race conditions. GIN_MODE=test is set in CI workflows."
       analyze-types: true
 
     depguard:
@@ -109,6 +134,22 @@ linters:
       # false failures in CI. See
       # https://github.com/golangci/golangci-lint/issues/3228
       allow-unused: true
+
+    perfsprint:
+      # Scoped to `errorf` only: enforce `errors.New` over `fmt.Errorf("static")`.
+      # Other perfsprint checks are intentionally disabled to keep this rule surgical.
+      # Can be broadened later in a follow-up.
+      error-format: true
+      errorf: true
+      err-error: false
+      integer-format: false
+      int-conversion: false
+      string-format: false
+      sprintf1: false
+      strconcat: false
+      bool-format: false
+      hex-format: false
+      concat-loop: false
 
     gocritic:
       disabled-checks:
@@ -167,7 +208,6 @@ linters:
         - -QF1008 # Omit embedded fields from selector expression
 
 run:
-  go: 1.25.4
   allow-parallel-runners: true
 
 issues:

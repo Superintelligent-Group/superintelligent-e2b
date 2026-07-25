@@ -35,6 +35,21 @@ resource "google_storage_bucket" "envs_docker_context" {
   labels = var.labels
 }
 
+resource "google_storage_bucket" "argocd_apps" {
+  name     = "${var.bucket_prefix}argocd-apps"
+  location = var.gcp_region
+
+  public_access_prevention    = "enforced"
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+
+  labels = var.labels
+
+  versioning {
+    enabled = true
+  }
+}
+
 resource "google_storage_bucket" "setup_bucket" {
   location = var.gcp_region
   name     = "${var.bucket_prefix}instance-setup"
@@ -71,6 +86,17 @@ resource "google_storage_bucket" "fc_versions_bucket" {
 resource "google_storage_bucket" "fc_env_pipeline_bucket" {
   location = var.template_bucket_location
   name     = "${var.bucket_prefix}fc-env-pipeline"
+
+  public_access_prevention    = "enforced"
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+
+  labels = var.labels
+}
+
+resource "google_storage_bucket" "fc_busybox_bucket" {
+  location = var.gcp_region
+  name     = "${var.bucket_prefix}fc-busybox"
 
   public_access_prevention    = "enforced"
   storage_class               = "STANDARD"
@@ -202,6 +228,12 @@ resource "google_storage_bucket_iam_member" "fc_kernels_bucket_iam" {
 
 resource "google_storage_bucket_iam_member" "fc_versions_bucket_iam" {
   bucket = google_storage_bucket.fc_versions_bucket.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.infra_instances_service_account.email}"
+}
+
+resource "google_storage_bucket_iam_member" "fc_busybox_bucket_iam" {
+  bucket = google_storage_bucket.fc_busybox_bucket.name
   role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.infra_instances_service_account.email}"
 }

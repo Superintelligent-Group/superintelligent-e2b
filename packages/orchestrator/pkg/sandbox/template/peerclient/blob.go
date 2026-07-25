@@ -2,9 +2,12 @@ package peerclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -15,72 +18,132 @@ import (
 
 var _ storage.Blob = (*peerBlob)(nil)
 
+// peerBlob reads from the peer first; on fallthrough, opens base lazily.
+// The base path is fixed at construction (blobs are not compressed).
 type peerBlob struct {
-	peerHandle[storage.Blob]
+	peerHandle
+
+	openBase func(ctx context.Context) (storage.Blob, error)
+
+	mu     sync.Mutex
+	base   storage.Blob
+	loaded bool
+}
+
+func (b *peerBlob) getBase(ctx context.Context) (storage.Blob, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.loaded {
+		return b.base, nil
+	}
+
+	base, err := b.openBase(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	b.base = base
+	b.loaded = true
+
+	return base, nil
+}
+
+// Metadata reads custom metadata from the base (GCS-backed) blob, never the
+// peer, so the soft-delete marker reflects authoritative storage state.
+func (b *peerBlob) Metadata(ctx context.Context) (storage.ObjectMetadata, error) {
+	base, err := b.getBase(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return storage.BlobCustomMetadata(ctx, base)
 }
 
 func (b *peerBlob) WriteTo(ctx context.Context, dst io.Writer) (int64, error) {
-	return withPeerFallback(ctx, &b.peerHandle, "peer-blob-write-to", attrOpWriteTo,
+	start := time.Now()
+	res, err := tryPeer(ctx, &b.peerHandle, "peer-blob-write-to",
 		func(ctx context.Context) (peerAttempt[int64], error) {
-			recv, err := openPeerBlobStream(ctx, b.client, &orchestrator.GetBuildBlobRequest{
-				BuildId:  b.buildID,
-				FileName: b.fileName,
+			streamCtx, cancel := context.WithCancel(ctx)
+
+			recv, err := openPeerBlobStream(streamCtx, b.client, &orchestrator.GetBuildBlobRequest{
+				BuildId: b.buildID,
+				Name:    b.name,
 			}, b.uploaded)
 			if err != nil {
-				logger.L().Warn(ctx, "failed to open peer blob stream", logger.WithBuildID(b.buildID), zap.String("file_name", b.fileName), zap.Error(err))
+				cancel()
+				logger.L().Warn(ctx, "failed to open peer blob stream", logger.WithBuildID(b.buildID), zap.String("file_name", b.name), zap.Error(err))
 
 				return peerAttempt[int64]{}, nil
 			}
 
-			n, err := io.Copy(dst, newPeerStreamReader(recv, func() {}))
+			reader := newPeerStreamReader(recv, cancel)
+			defer reader.Close(context.WithoutCancel(ctx))
+
+			n, err := io.Copy(dst, reader)
 			if err != nil {
 				return peerAttempt[int64]{value: n, bytes: n, hit: true},
-					fmt.Errorf("failed to stream file %q from peer: %w", b.fileName, err)
+					fmt.Errorf("failed to stream file %q from peer: %w", b.name, err)
 			}
 
 			return peerAttempt[int64]{value: n, bytes: n, hit: true}, nil
-		},
-		func(ctx context.Context, base storage.Blob) (int64, error) {
-			return base.WriteTo(ctx, dst)
-		},
-	)
+		})
+	if res.hit {
+		storage.RecordReadBlob(ctx, time.Since(start), res.value, b.name, storage.SourcePeer, err)
+
+		return res.value, err
+	}
+
+	base, err := b.getBase(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return base.WriteTo(ctx, dst)
 }
 
 func (b *peerBlob) Exists(ctx context.Context) (bool, error) {
-	return withPeerFallback(ctx, &b.peerHandle, "peer-blob-exists", attrOpExists,
+	res, err := tryPeer(ctx, &b.peerHandle, "peer-blob-exists",
 		func(ctx context.Context) (peerAttempt[bool], error) {
 			resp, err := b.client.GetBuildFileExists(ctx, &orchestrator.GetBuildFileExistsRequest{
-				BuildId:  b.buildID,
-				FileName: b.fileName,
+				BuildId: b.buildID,
+				Name:    b.name,
 			})
 			if err == nil && checkPeerAvailability(resp.GetAvailability(), b.uploaded) {
 				return peerAttempt[bool]{value: true, hit: true}, nil
 			}
 
 			if err != nil {
-				logger.L().Warn(ctx, "failed to check build file exists from peer", logger.WithBuildID(b.buildID), zap.String("file_name", b.fileName), zap.Error(err))
+				logger.L().Warn(ctx, "failed to check build file exists from peer", logger.WithBuildID(b.buildID), zap.String("file_name", b.name), zap.Error(err))
 			}
 
 			return peerAttempt[bool]{}, nil
-		},
-		func(ctx context.Context, base storage.Blob) (bool, error) {
-			return base.Exists(ctx)
-		},
-	)
+		})
+	if res.hit {
+		return res.value, err
+	}
+
+	base, err := b.getBase(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	return base.Exists(ctx)
 }
 
-func (b *peerBlob) Put(ctx context.Context, data []byte) error {
+func (b *peerBlob) Put(ctx context.Context, data []byte, opts ...storage.PutOption) error {
 	// Writes always go to the base provider (GCS/S3); the peer is read-only.
-	fallback, err := b.getOrOpenBase(ctx)
+	fallback, err := b.getBase(ctx)
 	if err != nil {
 		return err
 	}
 
-	return fallback.Put(ctx, data)
+	return fallback.Put(ctx, data, opts...)
 }
 
 // openPeerBlobStream opens a GetBuildBlob stream, checks peer availability,
 // and returns a recv function that yields data chunks starting with the first message's data.
+// The passed context HAS to be canceled by the caller when done with the stream to avoid leaks.
 func openPeerBlobStream(
 	ctx context.Context,
 	client orchestrator.ChunkServiceClient,
@@ -98,7 +161,7 @@ func openPeerBlobStream(
 	}
 
 	if !checkPeerAvailability(msg.GetAvailability(), uploaded) {
-		return nil, fmt.Errorf("peer not available for blob stream")
+		return nil, errors.New("peer not available for blob stream")
 	}
 
 	first := msg.GetData()

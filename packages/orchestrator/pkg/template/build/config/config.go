@@ -3,6 +3,7 @@ package config
 import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/oci/auth"
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
@@ -35,11 +36,18 @@ type TemplateConfig struct {
 	// The amount of RAM memory to allocate to the VM, in MiB.
 	MemoryMB int64
 
-	// The amount of free disk to allocate to the VM, in MiB.
+	// The amount of free rootfs target after build steps and before finalize, in MiB.
+	// ext4 metadata and finalize writes may reduce the available space.
 	DiskSizeMB int64
 
 	// HugePages sets whether the VM use huge pages.
 	HugePages bool
+
+	// FreePageReporting enables Firecracker's balloon free-page-reporting.
+	FreePageReporting bool
+
+	// FreePageHinting enables Firecracker's balloon free-page-hinting.
+	FreePageHinting bool
 
 	// Command to run to check if the template is ready.
 	ReadyCmd string
@@ -64,6 +72,17 @@ type TemplateConfig struct {
 
 	// Kernel version to use
 	KernelVersion string
+}
+
+// ObjectMetadata is the provenance stamped on a build's uploaded objects.
+// buildOrigin distinguishes the final template build from intermediate
+// build-cache layers.
+func (e TemplateConfig) ObjectMetadata(buildOrigin storage.ObjectOrigin) storage.ObjectMetadata {
+	return storage.ObjectMetadata{
+		storage.ObjectMetadataTeamID:      e.TeamID,
+		storage.ObjectMetadataTemplateID:  e.TemplateID,
+		storage.ObjectMetadataBuildOrigin: string(buildOrigin),
+	}
 }
 
 func MemfilePageSize(hugePages bool) int64 {

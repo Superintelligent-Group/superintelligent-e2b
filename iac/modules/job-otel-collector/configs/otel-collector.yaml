@@ -207,6 +207,16 @@ processors:
     timeout: 5s
     send_batch_size: 50000
 
+%{ if provider_name == "gcp" && enable_gcp_telemetry_metrics }
+  batch/gcp_telemetry:
+    timeout: 5s
+    send_batch_size: 200
+    send_batch_max_size: 200
+
+  metricstarttime/gcp_telemetry:
+    strategy: subtract_initial_point
+%{ endif }
+
   # keep only metrics that are used
   filter/otlp:
     # https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/filterprocessor
@@ -215,8 +225,10 @@ processors:
         match_type: regexp
         metric_names:
           - "orchestrator.*"
+          - "nfsclean.*"
           - "template.*"
           - "api.*"
+          - "batcher.*"
           - "db.sql.connection.*"
           - "db.client.*"
           - "vault.*"
@@ -227,9 +239,21 @@ processors:
           - "otelcol.exporter.send.*"
           - "otelcol.exporter.sent.*"
           - "otelcol.receiver.refused.*"
+          - "otel\\.router\\..*"
           - "pgxpool.*"
           - "go\\..*"
           - "traefik.*"
+          - "grpc\\..*"
+          - "rpc\\.client.*"
+      # Drop high-volume / never-queried metrics that dominate the Mimir
+      # items/s budget (samples + their exemplars). Latency is still covered
+      # by rpc.client.call.duration; payload sizes were never used in any
+      # dashboard.
+      exclude:
+        match_type: regexp
+        metric_names:
+          - "rpc\\.client\\.request\\.size.*"
+          - "rpc\\.client\\.response\\.size.*"
 
   filter/only_client_allocs:
     metrics:
@@ -364,6 +388,30 @@ processors:
           enabled: false
 %{ endif }
 
+%{ if provider_name == "gcp" && enable_gcp_telemetry_metrics }
+  resourcedetection/gcp_telemetry:
+    detectors: [gcp]
+    override: true
+    gcp:
+      resource_attributes:
+        cloud.account.id:
+          enabled: true
+        cloud.availability_zone:
+          enabled: true
+        cloud.platform:
+          enabled: true
+        cloud.provider:
+          enabled: true
+        host.id:
+          enabled: true
+        host.name:
+          enabled: true
+%{ if enable_gcp_telemetry_external_metrics }
+        gcp.gce.instance_group_manager.name:
+          enabled: true
+%{ endif }
+%{ endif }
+
   # For some reason, the metrics require us to set datapoint.attribute and won't accept the resource.attribute
   # That is why we can't use the resource/set_attributes processor
   transform/set-name:
@@ -378,6 +426,58 @@ processors:
       - delete_key(datapoint.attributes, "node_class")
       - delete_key(datapoint.attributes, "node_status")
       - delete_key(datapoint.attributes, "service_name")
+
+%{ if provider_name == "gcp" && enable_gcp_telemetry_metrics }
+  transform/gcp_telemetry_labels:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["deployment.environment"], resource.attributes["cloud.account.id"]) where resource.attributes["cloud.account.id"] != nil
+          - delete_key(attributes, "service_name")
+          - delete_key(attributes, "service.instance.id")
+
+%{ if enable_gcp_telemetry_external_metrics }
+  transform/gcp_telemetry_external_labels:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["service.version"], resource.attributes["service.version"]) where resource.attributes["service.version"] != nil
+          - set(attributes["group.name"], resource.attributes["gcp.gce.instance_group_manager.name"]) where resource.attributes["gcp.gce.instance_group_manager.name"] != nil
+          - replace_pattern(attributes["group.name"], "^e2b-orch-(client-)?(.+)-r?ig$", "$2") where attributes["group.name"] != nil
+%{ endif }
+
+  transform/gcp_managed_prometheus_labels:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["exported_location"], attributes["location"]) where attributes["location"] != nil
+          - delete_key(attributes, "location")
+          - set(attributes["exported_cluster"], attributes["cluster"]) where attributes["cluster"] != nil
+          - delete_key(attributes, "cluster")
+          - set(attributes["exported_namespace"], attributes["namespace"]) where attributes["namespace"] != nil
+          - delete_key(attributes, "namespace")
+          - set(attributes["exported_job"], attributes["job"]) where attributes["job"] != nil
+          - delete_key(attributes, "job")
+          - set(attributes["exported_instance"], attributes["instance"]) where attributes["instance"] != nil
+          - delete_key(attributes, "instance")
+          - set(attributes["exported_project_id"], attributes["project_id"]) where attributes["project_id"] != nil
+          - delete_key(attributes, "project_id")
+
+  transform/gcp_prometheus_target_resource:
+    metric_statements:
+      - context: resource
+        statements:
+          - set(attributes["service.instance.id"], attributes["host.name"]) where attributes["host.name"] != nil
+
+  transform/gcp_hostmetrics_target_resource:
+    metric_statements:
+      - context: resource
+        statements:
+          - set(attributes["service.name"], "hostmetrics")
+          - set(attributes["service.instance.id"], attributes["host.name"]) where attributes["host.name"] != nil
+          - set(attributes["service.instance.id"], attributes["host.id"]) where attributes["host.id"] != nil
+
+%{ endif }
 
   filter/rpc_duration_only:
     metrics:
@@ -433,6 +533,10 @@ exporters:
     endpoint: "${grafana_otlp_url}/otlp"
     auth:
       authenticator: basicauth/grafana_cloud
+%{ if provider_name == "gcp" && enable_gcp_telemetry_metrics }
+  googlemanagedprometheus/gcp_telemetry:
+    project: ${gcp_telemetry_project_id}
+%{ endif }
   clickhouse:
     endpoint: tcp://${clickhouse_host}:${clickhouse_port}
     database: ${clickhouse_database}
@@ -445,6 +549,12 @@ exporters:
         name: "metrics_gauge"
       sum:
         name: "metrics_sum"
+%{ if enable_otel_router_metrics }
+  otlp_grpc/otel_router:
+    endpoint: 127.0.0.1:${otel_router_grpc_port}
+    tls:
+      insecure: true
+%{ endif }
 service:
   telemetry:
     logs:
@@ -504,6 +614,71 @@ service:
         - batch
       exporters:
         - otlp_http/grafana_cloud
+%{ if provider_name == "gcp" && enable_gcp_telemetry_metrics }
+    metrics/gcp_telemetry:
+      receivers:
+        - otlp
+      processors:
+        - filter/otlp
+        - resourcedetection/gcp_telemetry
+        - transform/gcp_telemetry_labels
+        - transform/gcp_managed_prometheus_labels
+        - batch/gcp_telemetry
+      exporters:
+        - googlemanagedprometheus/gcp_telemetry
+    metrics/gcp_telemetry/prometheus:
+      receivers:
+        - prometheus
+      processors:
+        - filter/only_client_allocs
+        - resourcedetection/gcp_telemetry
+        - transform/gcp_prometheus_target_resource
+        - transform/gcp_telemetry_labels
+        - transform/gcp_managed_prometheus_labels
+        - metricstarttime/gcp_telemetry
+        - batch/gcp_telemetry
+      exporters:
+        - googlemanagedprometheus/gcp_telemetry
+    metrics/gcp_telemetry/rpc_only:
+      receivers:
+        - otlp
+      processors:
+        - filter/rpc_duration_only
+        - resourcedetection/gcp_telemetry
+        - transform/gcp_telemetry_labels
+        - transform/gcp_managed_prometheus_labels
+        - batch/gcp_telemetry
+      exporters:
+        - googlemanagedprometheus/gcp_telemetry
+    metrics/gcp_telemetry/host:
+      receivers:
+        - hostmetrics
+      processors:
+        - resourcedetection/gcp_telemetry
+        - transform/gcp_hostmetrics_target_resource
+        - transform/gcp_telemetry_labels
+        - transform/gcp_managed_prometheus_labels
+        - metricstransform/single_cpu
+        - transform/aggregate_nvme
+        - metricstransform/aggregate_disks
+        - batch/gcp_telemetry
+      exporters:
+        - googlemanagedprometheus/gcp_telemetry
+%{ if enable_gcp_telemetry_external_metrics }
+    metrics/gcp_telemetry/external:
+      receivers:
+        - otlp
+      processors:
+        - filter/external_metrics
+        - resourcedetection/gcp_telemetry
+        - transform/gcp_telemetry_labels
+        - transform/gcp_telemetry_external_labels
+        - transform/gcp_managed_prometheus_labels
+        - batch/gcp_telemetry
+      exporters:
+        - googlemanagedprometheus/gcp_telemetry
+%{ endif }
+%{ endif }
     metrics/external:
       receivers:
         - otlp
@@ -512,6 +687,16 @@ service:
         - batch/clickhouse
       exporters:
         - clickhouse
+%{ if enable_otel_router_metrics }
+    metrics/external/otel_router:
+      receivers:
+        - otlp
+      processors:
+        - filter/external_metrics
+        - batch
+      exporters:
+        - otlp_grpc/otel_router
+%{ endif }
     traces:
       receivers:
         - otlp

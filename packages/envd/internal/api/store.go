@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/e2b-dev/infra/packages/envd/internal/execcontext"
 	"github.com/e2b-dev/infra/packages/envd/internal/host"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/fsfreeze"
 	"github.com/e2b-dev/infra/packages/envd/internal/utils"
 )
 
@@ -36,18 +40,39 @@ type API struct {
 	mmdsClient    MMDSClient
 
 	lastSetTime *utils.AtomicMax
-	initLock    sync.Mutex
+	initLock    *semaphore.Weighted
+
+	caCertInstaller *host.CACertInstaller
+	cgroupManager   cgroups.Manager
+	// freezeLock serializes the per-cgroup sweep across /freeze, /unfreeze
+	// and the /init deferred unfreeze. PostFreeze acquires with the request
+	// ctx; unfreeze paths acquire with Background so they always land
+	// regardless of HTTP-client cancellation.
+	freezeLock    *semaphore.Weighted
+	isMountingNFS atomic.Bool
+	mountedPaths  sync.Map // map[path]lifecycleID - tracks which lifecycle each path was mounted for
+
+	// fsFreezer freezes/thaws the guest rootfs for filesystem-only pauses;
+	// fsFreezeLock serializes /fsfreeze and /fsthaw.
+	fsFreezer    fsfreeze.Freezer
+	fsFreezeLock *semaphore.Weighted
 }
 
-func New(l *zerolog.Logger, defaults *execcontext.Defaults, mmdsChan chan *host.MMDSOpts, isNotFC bool) *API {
+func New(l *zerolog.Logger, defaults *execcontext.Defaults, mmdsChan chan *host.MMDSOpts, isNotFC bool, cgroupManager cgroups.Manager) *API {
 	return &API{
-		logger:      l,
-		defaults:    defaults,
-		mmdsChan:    mmdsChan,
-		isNotFC:     isNotFC,
-		mmdsClient:  &DefaultMMDSClient{},
-		lastSetTime: utils.NewAtomicMax(),
-		accessToken: &SecureToken{},
+		logger:          l,
+		defaults:        defaults,
+		mmdsChan:        mmdsChan,
+		isNotFC:         isNotFC,
+		mmdsClient:      &DefaultMMDSClient{},
+		lastSetTime:     utils.NewAtomicMax(),
+		accessToken:     &SecureToken{},
+		caCertInstaller: host.NewCACertInstaller(l),
+		cgroupManager:   cgroupManager,
+		initLock:        semaphore.NewWeighted(1),
+		freezeLock:      semaphore.NewWeighted(1),
+		fsFreezer:       fsfreeze.New(),
+		fsFreezeLock:    semaphore.NewWeighted(1),
 	}
 }
 
@@ -82,12 +107,4 @@ func (a *API) GetMetrics(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(metrics); err != nil {
 		a.logger.Error().Err(err).Msg("Failed to encode metrics")
 	}
-}
-
-func (a *API) getLogger(err error) *zerolog.Event {
-	if err != nil {
-		return a.logger.Error().Err(err) //nolint:zerologlint // this is only prep
-	}
-
-	return a.logger.Info() //nolint:zerologlint // this is only prep
 }

@@ -2,11 +2,13 @@ package nodemanager
 
 import (
 	"context"
+	"strconv"
 
 	"google.golang.org/grpc/metadata"
 
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/edge"
+	grpcshared "github.com/e2b-dev/infra/packages/shared/pkg/grpc"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 )
 
@@ -36,7 +38,7 @@ func (n *Node) Metadata() NodeMetadata {
 func (n *Node) GetSandboxCreateCtx(ctx context.Context, req *orchestrator.SandboxCreateRequest) (*clusters.GRPCClient, context.Context) {
 	md := metadata.MD{}
 
-	if !n.IsNomadManaged() {
+	if n.IsClusterNode() {
 		md = edge.SerializeSandboxCatalogCreateEvent(
 			edge.SandboxCatalogCreateEvent{
 				SandboxID:               req.GetSandbox().GetSandboxId(),
@@ -49,6 +51,10 @@ func (n *Node) GetSandboxCreateCtx(ctx context.Context, req *orchestrator.Sandbo
 		)
 	}
 
+	// Pass snapshot (is_resume) via metadata so the server-side stats handler
+	// can include it in otelgrpc metric attributes during TagRPC.
+	md.Set(grpcshared.IsResumeMetadataKey, strconv.FormatBool(req.GetSandbox().GetSnapshot()))
+
 	// Merge medata from client (auth, routing with service instance id) and event metadata.
 	return n.client, appendMetadataCtx(ctx, md)
 }
@@ -56,7 +62,7 @@ func (n *Node) GetSandboxCreateCtx(ctx context.Context, req *orchestrator.Sandbo
 func (n *Node) GetSandboxDeleteCtx(ctx context.Context, sandboxID string, executionID string) (*clusters.GRPCClient, context.Context) {
 	md := metadata.MD{}
 
-	if !n.IsNomadManaged() {
+	if n.IsClusterNode() {
 		md = edge.SerializeSandboxCatalogDeleteEvent(
 			edge.SandboxCatalogDeleteEvent{
 				SandboxID:   sandboxID,

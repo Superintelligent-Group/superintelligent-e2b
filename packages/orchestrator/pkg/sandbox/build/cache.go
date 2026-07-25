@@ -1,23 +1,37 @@
+//go:build linux
+
 package build
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
-	"github.com/e2b-dev/infra/packages/orchestrator/pkg/units"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/units"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-var fallbackDiffSize = units.MBToBytes(100)
+var (
+	fallbackDiffSize = units.MBToBytes(100)
+
+	meter                   = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build")
+	residenceDurationMetric = utils.Must(meter.Int64Histogram("orchestrator.build.cache.residence_duration",
+		metric.WithDescription("How long a diff was kept in the local build cache before eviction"),
+		metric.WithUnit("s")))
+)
 
 type deleteDiff struct {
 	size      int64
@@ -28,6 +42,7 @@ type deleteDiff struct {
 type DiffStore struct {
 	cachePath string
 	cache     *ttlcache.Cache[DiffStoreKey, Diff]
+	initGroup singleflight.Group
 	cancel    func()
 	config    cfg.Config
 	flags     *featureflags.Client
@@ -37,6 +52,14 @@ type DiffStore struct {
 	pdSizes map[DiffStoreKey]*deleteDiff
 	pdMu    sync.RWMutex
 	pdDelay time.Duration
+
+	insertionTimes sync.Map // map[DiffStoreKey]time.Time — tracks when each diff was cached
+
+	// pinned entries are skipped by disk-pressure eviction (TTL eviction still
+	// applies). Used to protect a diff whose Close would tear down state another
+	// live entry depends on — e.g. the memfile diff whose DedupedMemfdCache is
+	// also serving an in-flight provisional resume.
+	pinned sync.Map // map[DiffStoreKey]struct{}
 }
 
 func NewDiffStore(
@@ -65,7 +88,13 @@ func NewDiffStore(
 	}
 
 	cache.OnEviction(func(ctx context.Context, _ ttlcache.EvictionReason, item *ttlcache.Item[DiffStoreKey, Diff]) {
+		if insertedAt, ok := ds.insertionTimes.LoadAndDelete(item.Key()); ok {
+			duration := time.Since(insertedAt.(time.Time))
+			residenceDurationMetric.Record(ctx, int64(duration.Seconds()))
+		}
+
 		buildData := item.Value()
+
 		// buildData will be deleted by calling buildData.Close()
 		defer ds.resetDelete(item.Key())
 
@@ -96,32 +125,58 @@ func (s *DiffStore) Close() {
 	s.cache.Stop()
 }
 
-func (s *DiffStore) Get(ctx context.Context, diff Diff) (Diff, error) {
-	s.resetDelete(diff.CacheKey())
-	source, found := s.cache.GetOrSet(
-		diff.CacheKey(),
-		diff,
-		ttlcache.WithTTL[DiffStoreKey, Diff](ttlcache.DefaultTTL),
-	)
-
-	value := source.Value()
-	if value == nil {
-		return nil, fmt.Errorf("failed to get source from cache: %s", diff.CacheKey())
+// Get returns the cached Diff for key, refreshing TTL and cancelling any
+// pending eviction. Returns (nil, false) if the key isn't present.
+func (s *DiffStore) Get(key DiffStoreKey) (Diff, bool) {
+	s.resetDelete(key)
+	item := s.cache.Get(key)
+	if item == nil {
+		return nil, false
 	}
 
-	if !found {
-		err := diff.Init(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to init source: %w", err)
+	return item.Value(), true
+}
+
+// GetOrCreate returns the cached Diff for key, or calls create inside a
+// singleflight to construct + cache a new one. The create closure is invoked
+// at most once per key across concurrent callers; on success the returned Diff
+// is cached and its insertion time recorded.
+func (s *DiffStore) GetOrCreate(ctx context.Context, key DiffStoreKey, create func(context.Context) (Diff, error)) (Diff, error) {
+	s.resetDelete(key)
+
+	if item := s.cache.Get(key); item != nil {
+		return item.Value(), nil
+	}
+
+	v, err, _ := s.initGroup.Do(string(key), func() (any, error) {
+		// Double-check: another goroutine may have cached it while we waited.
+		if item := s.cache.Get(key); item != nil {
+			return item.Value(), nil
 		}
+
+		insertTime := time.Now()
+
+		diff, err := create(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		s.cache.Set(key, diff, ttlcache.DefaultTTL)
+		s.insertionTimes.Store(diff.CacheKey(), insertTime)
+
+		return diff, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create diff: %w", err)
 	}
 
-	return value, nil
+	return v.(Diff), nil
 }
 
 func (s *DiffStore) Add(d Diff) {
 	s.resetDelete(d.CacheKey())
 	s.cache.Set(d.CacheKey(), d, ttlcache.DefaultTTL)
+	s.insertionTimes.LoadOrStore(d.CacheKey(), time.Now())
 }
 
 func (s *DiffStore) Has(d Diff) bool {
@@ -174,15 +229,7 @@ func (s *DiffStore) startDiskSpaceEviction(
 			used := int64(dUsed) - pUsed
 			percentage := float64(used) / float64(dTotal) * 100
 
-			threshold := featureflags.BuildCacheMaxUsagePercentage.Fallback()
-			// When multiple services (template manager, orchestrator) are defined, take the lowest threshold
-			// to ensure we don't exceed any of the set limits
-			for _, s := range services {
-				st := flags.IntFlag(ctx, featureflags.BuildCacheMaxUsagePercentage, featureflags.ServiceContext(string(s)))
-				if st < threshold {
-					threshold = st
-				}
-			}
+			threshold := evictionThreshold(ctx, flags, services)
 
 			if percentage <= float64(threshold) {
 				timer.Reset(getDelay(false))
@@ -202,6 +249,28 @@ func (s *DiffStore) startDiskSpaceEviction(
 			timer.Reset(getDelay(succ))
 		}
 	}
+}
+
+// evictionThreshold returns the maximum allowed disk usage percentage for the
+// build cache. When multiple services (template manager, orchestrator) are
+// defined, the lowest of their configured thresholds wins to ensure none of
+// the set limits is exceeded. Flag evaluation already falls back per service
+// inside IntFlag, so the flag fallback is only used directly when no services
+// are configured; a flag value above the fallback is honored.
+func evictionThreshold(ctx context.Context, flags *featureflags.Client, services cfg.Services) int {
+	if len(services) == 0 {
+		return featureflags.BuildCacheMaxUsagePercentage.Fallback()
+	}
+
+	threshold := math.MaxInt
+	for _, svc := range services {
+		st := flags.IntFlag(ctx, featureflags.BuildCacheMaxUsagePercentage, featureflags.ServiceContext(string(svc)))
+		if st < threshold {
+			threshold = st
+		}
+	}
+
+	return threshold
 }
 
 func (s *DiffStore) getPendingDeletesSize() int64 {
@@ -236,7 +305,13 @@ func (s *DiffStore) deleteOldestFromCache(ctx context.Context) (suc bool, e erro
 			return true
 		}
 
-		sfSize, err := item.Value().FileSize()
+		// Skip pinned entries (e.g. a memfile diff still backing an in-flight
+		// provisional resume); closing them would tear down shared state.
+		if s.isPinned(item.Key()) {
+			return true
+		}
+
+		sfSize, err := item.Value().FileSize(ctx)
 		if err != nil {
 			logger.L().Warn(ctx, "failed to get size of deleted item from cache", zap.Error(err))
 			sfSize = fallbackDiffSize
@@ -276,6 +351,19 @@ func (s *DiffStore) isBeingDeleted(key DiffStoreKey) bool {
 	return f
 }
 
+// Pin protects a cached entry from disk-pressure eviction (TTL eviction still
+// applies). Idempotent; pair every Pin with an Unpin.
+func (s *DiffStore) Pin(key DiffStoreKey) { s.pinned.Store(key, struct{}{}) }
+
+// Unpin lifts a Pin, making the entry eligible for disk-pressure eviction again.
+func (s *DiffStore) Unpin(key DiffStoreKey) { s.pinned.Delete(key) }
+
+func (s *DiffStore) isPinned(key DiffStoreKey) bool {
+	_, ok := s.pinned.Load(key)
+
+	return ok
+}
+
 func (s *DiffStore) scheduleDelete(ctx context.Context, key DiffStoreKey, dSize int64) {
 	s.pdMu.Lock()
 	defer s.pdMu.Unlock()
@@ -294,6 +382,18 @@ func (s *DiffStore) scheduleDelete(ctx context.Context, key DiffStoreKey, dSize 
 		case <-ctx.Done():
 		case <-cancelCh:
 		case <-time.After(s.pdDelay):
+			// The entry may have been pinned after this delete was scheduled: a
+			// Pin can race the eviction scan (its isPinned check in
+			// deleteOldestFromCache runs just before scheduleDelete). Re-check at
+			// fire time — the last point before eviction — since deleting a
+			// pinned diff would tear down state an in-flight provisional resume
+			// still needs. Clear the pending-delete record so the entry becomes
+			// eligible for eviction again once it is unpinned.
+			if s.isPinned(key) {
+				s.resetDelete(key)
+
+				return
+			}
 			s.cache.Delete(key)
 		}
 	})()

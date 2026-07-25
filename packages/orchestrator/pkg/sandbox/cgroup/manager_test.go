@@ -1,7 +1,8 @@
+//go:build linux
+
 package cgroup
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,32 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func requireWritableCgroup(t *testing.T) {
+	t.Helper()
+
+	if os.Geteuid() != 0 {
+		t.Skip("test requires root privileges")
+	}
+
+	probePath := filepath.Join(cgroupV2MountPoint, fmt.Sprintf("e2b-probe-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	if err := os.Mkdir(probePath, 0o755); err != nil {
+		t.Skipf("test requires writable cgroup v2 filesystem: %v", err)
+	}
+
+	subtreeControlPath := filepath.Join(probePath, "cgroup.subtree_control")
+	if _, err := os.Stat(subtreeControlPath); err != nil {
+		_ = os.Remove(probePath)
+		t.Skipf("test requires usable cgroup v2 control files: %v", err)
+	}
+	if err := os.WriteFile(subtreeControlPath, []byte("+cpu +memory"), 0); err != nil {
+		_ = os.Remove(probePath)
+		t.Skipf("test requires writable cgroup v2 subtree control: %v", err)
+	}
+	if err := os.Remove(probePath); err != nil {
+		t.Skipf("test requires removable cgroup v2 filesystem: %v", err)
+	}
+}
 
 func TestNewManager(t *testing.T) {
 	t.Parallel()
@@ -30,11 +57,9 @@ func TestNewManager(t *testing.T) {
 func TestManagerInitialize(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	mgr := &managerImpl{}
 
@@ -57,11 +82,9 @@ func TestManagerInitialize(t *testing.T) {
 func TestCgroupHandleLifecycle(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, err := NewManager()
 	require.NoError(t, err)
 
@@ -95,11 +118,9 @@ func TestCgroupHandleLifecycle(t *testing.T) {
 func TestCgroupHandleWithProcessCreation(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, err := NewManager()
 	require.NoError(t, err)
 
@@ -150,11 +171,9 @@ func TestCgroupHandleWithProcessCreation(t *testing.T) {
 func TestCgroupHandleNoRaceOnQuickExit(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, err := NewManager()
 	require.NoError(t, err)
 
@@ -187,11 +206,9 @@ func TestCgroupHandleNoRaceOnQuickExit(t *testing.T) {
 func TestCgroupHandleGetStats(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, err := NewManager()
 	require.NoError(t, err)
 
@@ -236,11 +253,9 @@ func TestCgroupHandleGetStats(t *testing.T) {
 func TestCgroupHandleGetStatsNonExistent(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, err := NewManager()
 	require.NoError(t, err)
 
@@ -261,14 +276,101 @@ func TestCgroupHandleGetStatsNonExistent(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to read cpu.stat")
 }
 
+func TestCgroupHandleKillNoProcesses(t *testing.T) {
+	t.Parallel()
+
+	cgroupPath := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(cgroupPath, "cgroup.events"), []byte("populated 0\n"), 0o644))
+
+	handle := &CgroupHandle{
+		cgroupName: "test-empty-kill",
+		path:       cgroupPath,
+	}
+
+	require.NoError(t, handle.Kill(t.Context()))
+}
+
+func TestCgroupHandlePopulated(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		write   bool
+		want    bool
+	}{
+		{
+			name:    "populated",
+			content: "populated 1\n",
+			write:   true,
+			want:    true,
+		},
+		{
+			name:    "empty",
+			content: "populated 0\n",
+			write:   true,
+		},
+		{
+			name: "missing file",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cgroupPath := t.TempDir()
+			if tc.write {
+				require.NoError(t, os.WriteFile(filepath.Join(cgroupPath, "cgroup.events"), []byte(tc.content), 0o644))
+			}
+
+			handle := &CgroupHandle{path: cgroupPath}
+
+			got, err := handle.populated()
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestCgroupHandleKillTerminatesProcesses(t *testing.T) {
+	t.Parallel()
+
+	requireWritableCgroup(t)
+
+	ctx := t.Context()
+	mgr, err := NewManager()
+	require.NoError(t, err)
+
+	err = mgr.Initialize(ctx)
+	require.NoError(t, err)
+
+	handle, err := mgr.Create(ctx, "test-cgroup-kill")
+	require.NoError(t, err)
+	defer handle.Remove(ctx)
+	defer handle.ReleaseCgroupFD()
+
+	cmd := exec.CommandContext(ctx, "sleep", "60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		UseCgroupFD: true,
+		CgroupFD:    handle.GetFD(),
+	}
+
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	require.NoError(t, handle.ReleaseCgroupFD())
+	require.NoError(t, handle.Kill(ctx))
+	require.Error(t, cmd.Wait())
+}
+
 func TestCgroupHandleRemoveNonExistent(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, err := NewManager()
 	require.NoError(t, err)
 
@@ -310,7 +412,7 @@ burst_usec 0`
 	err = os.WriteFile(filepath.Join(cgroupPath, "memory.current"), []byte("536870912"), 0o644)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr := &managerImpl{}
 
 	// nil memoryPeakFile: regular files don't support the per-FD reset of cgroup pseudo-files
@@ -325,28 +427,26 @@ burst_usec 0`
 	assert.Equal(t, uint64(0), stats.MemoryPeakBytes, "MemoryPeakBytes should be 0 without peak FD")
 }
 
-func TestCgroupHandleLifetimePeak(t *testing.T) {
+func TestCgroupHandlePeakReset(t *testing.T) {
 	t.Parallel()
 
-	if os.Geteuid() != 0 {
-		t.Skip("test requires root privileges")
-	}
+	requireWritableCgroup(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, err := NewManager()
 	require.NoError(t, err)
 
 	err = mgr.Initialize(ctx)
 	require.NoError(t, err)
 
-	testSandboxID := "test-lifetime-peak"
+	testSandboxID := "test-peak-reset"
 
 	handle, err := mgr.Create(ctx, testSandboxID)
 	require.NoError(t, err)
 	defer handle.Remove(ctx)
 	defer handle.ReleaseCgroupFD()
 
-	// Allocate memory gradually to observe lifetime peak behavior
+	// Allocate memory gradually so we can sample the peak reset behavior
 	cmd := exec.CommandContext(ctx, "bash", "-c",
 		"x=''; for i in {1..10}; do x=$x$(head -c 5M /dev/zero | tr '\\0' 'x'); sleep 0.5; done; sleep 5")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -365,33 +465,30 @@ func TestCgroupHandleLifetimePeak(t *testing.T) {
 	require.NoError(t, err)
 	peak1 := stats1.MemoryPeakBytes
 	require.Positive(t, peak1, "First peak should be non-zero")
-	assert.GreaterOrEqual(t, peak1, stats1.MemoryUsageBytes,
-		"Peak should be >= current memory")
 	t.Logf("First sample - peak: %d bytes, current: %d bytes", peak1, stats1.MemoryUsageBytes)
 
+	// Peak should represent interval peak (since last GetStats), not lifetime
 	time.Sleep(2 * time.Second)
 	stats2, err := handle.GetStats(ctx)
 	require.NoError(t, err)
 	peak2 := stats2.MemoryPeakBytes
 	require.Positive(t, peak2, "Second peak should be non-zero")
-	assert.GreaterOrEqual(t, peak2, peak1,
-		"Lifetime peak should be monotonically non-decreasing")
-	assert.GreaterOrEqual(t, peak2, stats2.MemoryUsageBytes,
-		"Peak should be >= current memory")
 	t.Logf("Second sample - peak: %d bytes, current: %d bytes", peak2, stats2.MemoryUsageBytes)
+
+	assert.GreaterOrEqual(t, peak2, stats2.MemoryUsageBytes,
+		"Peak memory should be >= current memory within the interval")
 
 	time.Sleep(2 * time.Second)
 	stats3, err := handle.GetStats(ctx)
 	require.NoError(t, err)
 	peak3 := stats3.MemoryPeakBytes
 	require.Positive(t, peak3, "Third peak should be non-zero")
-	assert.GreaterOrEqual(t, peak3, peak2,
-		"Lifetime peak should be monotonically non-decreasing")
-	assert.GreaterOrEqual(t, peak3, stats3.MemoryUsageBytes,
-		"Peak should be >= current memory")
 	t.Logf("Third sample - peak: %d bytes, current: %d bytes", peak3, stats3.MemoryUsageBytes)
 
-	t.Logf("Lifetime peak test complete - peaks: %d, %d, %d bytes",
+	assert.GreaterOrEqual(t, peak3, stats3.MemoryUsageBytes,
+		"Peak memory should be >= current memory within the interval")
+
+	t.Logf("Reset test complete - peaks tracked per interval: %d, %d, %d bytes",
 		peak1, peak2, peak3)
 
 	cmd.Process.Kill()

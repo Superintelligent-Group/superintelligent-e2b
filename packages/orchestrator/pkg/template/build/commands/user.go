@@ -1,7 +1,10 @@
+//go:build linux
+
 package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"go.uber.org/zap/zapcore"
@@ -30,7 +33,7 @@ func (u *User) Execute(
 	args := step.GetArgs()
 	// args: [username, optional_add_to_sudo]
 	if len(args) < 1 {
-		return metadata.Context{}, fmt.Errorf("USER requires a username argument")
+		return metadata.Context{}, errors.New("USER requires a username argument")
 	}
 
 	userArg := args[0]

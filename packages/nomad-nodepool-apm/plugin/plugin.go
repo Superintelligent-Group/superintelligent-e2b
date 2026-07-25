@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -111,7 +112,7 @@ func (p *NodePoolPlugin) Query(query string, _ sdk.TimeRange) (sdk.TimestampedMe
 	nodePool := query
 
 	if nodePool == "" {
-		return nil, fmt.Errorf("node pool name is required as query parameter")
+		return nil, errors.New("node pool name is required as query parameter")
 	}
 
 	p.logger.Debug("querying node count for node pool", "node_pool", nodePool)
@@ -126,18 +127,12 @@ func (p *NodePoolPlugin) Query(query string, _ sdk.TimeRange) (sdk.TimestampedMe
 		return nil, fmt.Errorf("failed to list nodes in pool %q: %w", nodePool, err)
 	}
 
-	// Count only nodes that are ready and eligible for scheduling
-	readyCount := 0
-	for _, node := range nodes {
-		if node.Status == api.NodeStatusReady && node.SchedulingEligibility == api.NodeSchedulingEligible {
-			readyCount++
-		}
-	}
+	readyCount := countReadyNodes(nodes)
 
 	p.logger.Info("node count query completed",
 		"node_pool", nodePool,
 		"total_nodes", len(nodes),
-		"ready_eligible_nodes", readyCount,
+		"ready_nodes", readyCount,
 	)
 
 	return sdk.TimestampedMetrics{
@@ -146,6 +141,19 @@ func (p *NodePoolPlugin) Query(query string, _ sdk.TimeRange) (sdk.TimestampedMe
 			Value:     float64(readyCount),
 		},
 	}, nil
+}
+
+// countReadyNodes keeps nodes that are temporarily ineligible in the desired
+// allocation count until they have actually left the pool.
+func countReadyNodes(nodes []*api.NodeListStub) int {
+	count := 0
+	for _, node := range nodes {
+		if node.Status == api.NodeStatusReady {
+			count++
+		}
+	}
+
+	return count
 }
 
 // QueryMultiple satisfies the QueryMultiple function on the apm.APM interface.

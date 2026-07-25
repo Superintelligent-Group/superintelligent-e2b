@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
 	"net/http"
 
@@ -12,6 +10,8 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
+	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -21,6 +21,12 @@ func (a *APIStore) PostAccessTokens(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	userID := auth.MustGetUserID(c)
+
+	if a.featureFlags.BoolFlag(ctx, featureflags.DisableE2BAccessTokenProvisioningFlag, featureflags.UserContext(userID.String())) {
+		a.sendAPIStoreError(c, http.StatusGone, "Creating new access tokens is disabled. E2B_ACCESS_TOKEN is deprecated; use an API key (E2B_API_KEY) instead. See https://e2b.dev/docs/migration/access-token-deprecation")
+
+		return
+	}
 
 	body, err := ginutils.ParseBody[api.NewAccessToken](ctx, c)
 	if err != nil {
@@ -40,7 +46,7 @@ func (a *APIStore) PostAccessTokens(c *gin.Context) {
 		return
 	}
 
-	accessTokenDB, err := a.authDB.Write.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
+	accessTokenDB, err := a.authDB.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
 		ID:                    uuid.New(),
 		UserID:                userID,
 		AccessTokenHash:       accessToken.HashedValue,
@@ -86,11 +92,11 @@ func (a *APIStore) DeleteAccessTokensAccessTokenID(c *gin.Context, accessTokenID
 		return
 	}
 
-	_, err = a.authDB.Write.DeleteAccessToken(ctx, authqueries.DeleteAccessTokenParams{
+	_, err = a.authDB.DeleteAccessToken(ctx, authqueries.DeleteAccessTokenParams{
 		ID:     accessTokenIDParsed,
 		UserID: userID,
 	})
-	if errors.Is(err, sql.ErrNoRows) {
+	if dberrors.IsNotFoundError(err) {
 		c.String(http.StatusNotFound, "id not found")
 
 		return

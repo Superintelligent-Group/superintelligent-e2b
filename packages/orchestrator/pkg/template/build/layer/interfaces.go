@@ -1,3 +1,5 @@
+//go:build linux
+
 package layer
 
 import (
@@ -7,6 +9,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	sbxtemplate "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
 const (
@@ -40,4 +43,7 @@ type LayerBuildCommand struct {
 	UpdateEnvd     bool
 	SandboxCreator SandboxCreator
 	ActionExecutor ActionExecutor
+	// BuildOrigin is the object-metadata origin for the uploaded layer:
+	// template_build for the final layer, template_build_cache for intermediates.
+	BuildOrigin storage.ObjectOrigin
 }

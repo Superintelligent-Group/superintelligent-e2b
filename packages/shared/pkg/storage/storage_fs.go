@@ -6,13 +6,19 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
 type fsStorage struct {
@@ -24,30 +30,21 @@ type fsStorage struct {
 var _ StorageProvider = (*fsStorage)(nil)
 
 type fsObject struct {
-	path string
+	path    string
+	objType SeekableObjectType
 }
 
 var (
-	_ Seekable        = (*fsObject)(nil)
-	_ Blob            = (*fsObject)(nil)
-	_ StreamingReader = (*fsObject)(nil)
+	_ Seekable    = (*fsObject)(nil)
+	_ Blob        = (*fsObject)(nil)
+	_ RangeOpener = (*fsObject)(nil)
 )
 
-type fsRangeReadCloser struct {
-	io.Reader
-
-	file *os.File
-}
-
-func (r *fsRangeReadCloser) Close() error {
-	return r.file.Close()
-}
-
-func newFileSystemStorage(cfg StorageConfig) *fsStorage {
+func newFileSystemStorage(basePath, uploadBaseURL string, hmacKey []byte) *fsStorage {
 	return &fsStorage{
-		basePath:  cfg.GetLocalBasePath(),
-		uploadURL: cfg.uploadBaseURL,
-		hmacKey:   cfg.hmacKey,
+		basePath:  basePath,
+		uploadURL: uploadBaseURL,
+		hmacKey:   hmacKey,
 	}
 }
 
@@ -63,30 +60,33 @@ func (s *fsStorage) GetDetails() string {
 
 func (s *fsStorage) UploadSignedURL(_ context.Context, path string, ttl time.Duration) (string, error) {
 	if s.uploadURL == "" || s.hmacKey == nil {
-		return "", fmt.Errorf("file system storage does not support signed URLs (no local upload endpoint configured)")
+		return "", errors.New("file system storage does not support signed URLs (no local upload endpoint configured)")
 	}
 
-	expires := time.Now().Add(ttl).Unix()
-	token := ComputeUploadHMAC(s.hmacKey, path, expires)
+	expiresSec := time.Now().Add(ttl).Unix()
+	token := ComputeUploadHMAC(s.hmacKey, path, expiresSec)
 
 	u := fmt.Sprintf("%s/upload?path=%s&expires=%d&token=%s",
-		s.uploadURL, url.QueryEscape(path), expires, url.QueryEscape(token))
+		s.uploadURL, url.QueryEscape(path), expiresSec, url.QueryEscape(token))
 
 	return u, nil
 }
 
-func (s *fsStorage) OpenSeekable(_ context.Context, path string, _ SeekableObjectType) (Seekable, error) {
+func (s *fsStorage) OpenSeekable(_ context.Context, path string) (Seekable, error) {
 	dir := filepath.Dir(s.getPath(path))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
+	objType, _ := seekableObjectType(path)
+
 	return &fsObject{
-		path: s.getPath(path),
+		path:    s.getPath(path),
+		objType: objType,
 	}, nil
 }
 
-func (s *fsStorage) OpenBlob(_ context.Context, path string, _ ObjectType) (Blob, error) {
+func (s *fsStorage) OpenBlob(_ context.Context, path string) (Blob, error) {
 	dir := filepath.Dir(s.getPath(path))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -101,7 +101,10 @@ func (s *fsStorage) getPath(path string) string {
 	return filepath.Join(s.basePath, path)
 }
 
-func (o *fsObject) WriteTo(_ context.Context, dst io.Writer) (int64, error) {
+func (o *fsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err error) {
+	start := time.Now()
+	defer func() { RecordReadBlob(ctx, time.Since(start), n, o.path, SourceFS, err) }()
+
 	handle, err := o.getHandle(true)
 	if err != nil {
 		return 0, err
@@ -109,10 +112,12 @@ func (o *fsObject) WriteTo(_ context.Context, dst io.Writer) (int64, error) {
 
 	defer handle.Close()
 
-	return io.Copy(dst, handle)
+	n, err = io.Copy(dst, handle)
+
+	return n, err
 }
 
-func (o *fsObject) Put(_ context.Context, data []byte) error {
+func (o *fsObject) Put(_ context.Context, data []byte, _ ...PutOption) error {
 	handle, err := o.getHandle(false)
 	if err != nil {
 		return err
@@ -124,47 +129,89 @@ func (o *fsObject) Put(_ context.Context, data []byte) error {
 	return err
 }
 
-func (o *fsObject) StoreFile(_ context.Context, path string) error {
+func (o *fsObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (*FullFrameTable, [32]byte, error) {
+	putOpts := ApplyPutOptions(opts)
+	cfg := CompressConfigFromOpts(putOpts)
+	if cfg.IsCompressionEnabled() {
+		ft, checksum, err := o.storeFileCompressed(ctx, path, cfg, putOpts.FrameSink)
+		if err == nil {
+			t := ft.Table()
+			logger.L().Debug(ctx, "Stored file to filesystem",
+				zap.String("object", o.path),
+				zap.String("source", path),
+				zap.Int64("size_uncompressed", t.UncompressedSize()),
+				zap.Int64("size_compressed", t.CompressedSize()),
+				zap.String("compression", cfg.CompressionType().String()),
+				zap.Int("frames", t.NumFrames()),
+			)
+		}
+
+		return ft, checksum, err
+	}
+
 	r, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("failed to open file %s: %w", path, err)
+		return nil, [32]byte{}, fmt.Errorf("failed to open file %s: %w", path, err)
 	}
 	defer r.Close()
 
 	handle, err := o.getHandle(false)
 	if err != nil {
-		return err
+		return nil, [32]byte{}, err
 	}
 	defer handle.Close()
 
-	_, err = io.Copy(handle, r)
-	if err != nil {
-		return err
+	n, err := io.Copy(handle, r)
+	if err == nil {
+		logger.L().Debug(ctx, "Stored file to filesystem",
+			zap.String("object", o.path),
+			zap.String("source", path),
+			zap.Int64("size_uncompressed", n),
+			zap.String("compression", "none"),
+		)
 	}
 
-	return nil
+	return nil, [32]byte{}, err
 }
 
-func (o *fsObject) OpenRangeReader(_ context.Context, off, length int64) (io.ReadCloser, error) {
+func (o *fsObject) storeFileCompressed(ctx context.Context, localPath string, cfg CompressConfig, sink FrameSink) (*FullFrameTable, [32]byte, error) {
+	file, err := os.Open(localPath)
+	if err != nil {
+		return nil, [32]byte{}, fmt.Errorf("failed to open local file %s: %w", localPath, err)
+	}
+	defer file.Close()
+
+	fi, err := file.Stat()
+	if err != nil {
+		return nil, [32]byte{}, fmt.Errorf("failed to stat local file %s: %w", localPath, err)
+	}
+
+	uploader := &fsPartUploader{fullPath: o.path}
+
+	const noConcurrencyForMemUploader = 1
+	ft, checksum, err := compressStream(ctx, file, cfg, uploader, noConcurrencyForMemUploader, sink)
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
+
+	// Sidecar is written only after compressStream succeeds so a failure (cancel,
+	// partial read, compress error) doesn't leave Size() reporting the new size
+	// against the unchanged data file.
+	sidecarPath := SizeSidecar(o.path)
+	if writeErr := os.WriteFile(sidecarPath, []byte(strconv.FormatInt(fi.Size(), 10)), 0o644); writeErr != nil {
+		return nil, [32]byte{}, fmt.Errorf("failed to write uncompressed-size sidecar for %s: %w", o.path, writeErr)
+	}
+
+	return ft, checksum, nil
+}
+
+func (o *fsObject) openRangeReader(_ context.Context, off, length int64) (RangeReader, error) {
 	f, err := o.getHandle(true)
 	if err != nil {
 		return nil, err
 	}
 
-	return &fsRangeReadCloser{
-		Reader: io.NewSectionReader(f, off, length),
-		file:   f,
-	}, nil
-}
-
-func (o *fsObject) ReadAt(_ context.Context, buff []byte, off int64) (n int, err error) {
-	handle, err := o.getHandle(true)
-	if err != nil {
-		return 0, err
-	}
-	defer handle.Close()
-
-	return handle.ReadAt(buff, off)
+	return newSectionReader(f, off, length), nil
 }
 
 func (o *fsObject) Exists(_ context.Context) (bool, error) {
@@ -176,7 +223,10 @@ func (o *fsObject) Exists(_ context.Context) (bool, error) {
 	return err == nil, err
 }
 
-func (o *fsObject) Size(_ context.Context) (int64, error) {
+func (o *fsObject) Size(ctx context.Context) (_ int64, err error) {
+	start := time.Now()
+	defer func() { RecordReadSize(ctx, time.Since(start), o.objType, SourceFS, err) }()
+
 	handle, err := o.getHandle(true)
 	if err != nil {
 		return 0, err
@@ -186,6 +236,14 @@ func (o *fsObject) Size(_ context.Context) (int64, error) {
 	fileInfo, err := handle.Stat()
 	if err != nil {
 		return 0, err
+	}
+
+	// Check for .uncompressed-size sidecar file
+	sidecarPath := SizeSidecar(o.path)
+	if sidecarData, sidecarErr := os.ReadFile(sidecarPath); sidecarErr == nil {
+		if parsed, parseErr := strconv.ParseInt(strings.TrimSpace(string(sidecarData)), 10, 64); parseErr == nil {
+			return parsed, nil
+		}
 	}
 
 	return fileInfo.Size(), nil
@@ -238,4 +296,54 @@ func (o *fsObject) getHandle(checkExistence bool) (*os.File, error) {
 	}
 
 	return handle, nil
+}
+
+// fsPartUploader implements partUploader for local filesystem.
+// Embeds memPartUploader for concurrent-safe part collection,
+// then writes atomically on Complete.
+type fsPartUploader struct {
+	memPartUploader
+
+	fullPath string
+}
+
+func (u *fsPartUploader) Complete(_ context.Context) error {
+	if err := os.MkdirAll(filepath.Dir(u.fullPath), 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	return os.WriteFile(u.fullPath, u.Assemble(), 0o644)
+}
+
+func (o *fsObject) OpenRangeReader(ctx context.Context, offsetU int64, length int64, frameTable *FrameTable) (_ RangeReader, _ Source, err error) {
+	start := time.Now()
+	defer func() { RecordReadOpen(ctx, time.Since(start), o.objType, SourceFS, frameTable.CompressionType(), err) }()
+
+	if frameTable.IsCompressed() {
+		r, err := frameTable.LocateCompressed(offsetU)
+		if err != nil {
+			return nil, SourceFS, fmt.Errorf("get frame for offset %d, FS:%s: %w", offsetU, o.path, err)
+		}
+
+		raw, err := o.openRangeReader(ctx, r.Offset, int64(r.Length))
+		if err != nil {
+			return nil, SourceFS, err
+		}
+
+		dec, err := NewDecompressReader(raw, frameTable.CompressionType(), SourceFS, o.objType)
+		if err != nil {
+			raw.Close(ctx)
+
+			return nil, SourceFS, err
+		}
+
+		return dec, SourceFS, nil
+	}
+
+	raw, err := o.openRangeReader(ctx, offsetU, length)
+	if err != nil {
+		return nil, SourceFS, err
+	}
+
+	return raw, SourceFS, nil
 }

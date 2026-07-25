@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/metric"
@@ -15,6 +16,7 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
@@ -39,7 +41,7 @@ type Node struct {
 	SandboxDomain *string
 
 	client *clusters.GRPCClient
-	status api.NodeStatus
+	status StatusInfo
 
 	metrics   Metrics
 	metricsMu sync.RWMutex
@@ -50,6 +52,9 @@ type Node struct {
 
 	PlacementMetrics PlacementMetrics
 
+	// featureflags is the feature flags client for feature flag checks
+	featureflags *featureflags.Client
+
 	mutex sync.RWMutex
 }
 
@@ -58,11 +63,13 @@ func New(
 	tracerProvider trace.TracerProvider,
 	meterProvider metric.MeterProvider,
 	discoveredNode NomadServiceDiscovery,
+	ff *featureflags.Client,
 ) (*Node, error) {
 	client, err := NewClient(tracerProvider, meterProvider, discoveredNode.OrchestratorAddress)
 	if err != nil {
 		return nil, err
 	}
+	client.Init(ctx)
 
 	nodeInfo, err := client.Info.ServiceInfo(ctx, &emptypb.Empty{})
 	if err != nil {
@@ -75,6 +82,11 @@ func New(
 	if !ok {
 		logger.L().Error(ctx, "Unknown service info status", zap.String("status", nodeInfo.GetServiceStatus().String()), logger.WithNodeID(nodeInfo.GetNodeId()))
 		nodeStatus = api.NodeStatusUnhealthy
+	}
+
+	var nodeStatusChangedAt time.Time
+	if ts := nodeInfo.GetServiceStatusChangedAt(); ts.IsValid() {
+		nodeStatusChangedAt = ts.AsTime()
 	}
 
 	nodeMetadata := NodeMetadata{
@@ -91,7 +103,7 @@ func New(
 		SandboxDomain:    nil,
 
 		client: client,
-		status: nodeStatus,
+		status: StatusInfo{Status: nodeStatus, ChangedAt: nodeStatusChangedAt},
 		meta:   nodeMetadata,
 
 		PlacementMetrics: PlacementMetrics{
@@ -99,6 +111,8 @@ func New(
 			createSuccess:       atomic.Uint64{},
 			createFails:         atomic.Uint64{},
 		},
+
+		featureflags: ff,
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
@@ -108,7 +122,7 @@ func New(
 	return n, nil
 }
 
-func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID uuid.UUID, sandboxDomain *string, i *clusters.Instance) (*Node, error) {
+func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID uuid.UUID, sandboxDomain *string, i *clusters.Instance, ff *featureflags.Client) (*Node, error) {
 	info := i.GetInfo()
 	status, ok := OrchestratorToApiNodeStateMapper[info.Status]
 	if !ok {
@@ -126,8 +140,9 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 		NomadNodeShortID: UnknownNomadNodeShortID,
 		ClusterID:        clusterID,
 		ID:               i.NodeID,
-		// We can't connect directly to the node in the cluster
-		IPAddress:     "",
+		// API control-plane calls still use the cluster gRPC proxy, but edge/client
+		// proxies need the node IP address for data-plane sandbox traffic.
+		IPAddress:     i.LocalIPAddress,
 		SandboxDomain: sandboxDomain,
 		PlacementMetrics: PlacementMetrics{
 			sandboxesInProgress: smap.New[SandboxResources](),
@@ -135,9 +150,10 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 			createFails:         atomic.Uint64{},
 		},
 
-		client: client,
-		status: status,
-		meta:   nodeMetadata,
+		client:       client,
+		status:       StatusInfo{Status: status, ChangedAt: info.StatusChangedAt},
+		meta:         nodeMetadata,
+		featureflags: ff,
 	}
 
 	nodeClient, ctx := n.GetClient(ctx)
@@ -176,4 +192,43 @@ func (n *Node) GetClient(ctx context.Context) (*clusters.GRPCClient, context.Con
 
 func (n *Node) IsNomadManaged() bool {
 	return n.NomadNodeShortID != UnknownNomadNodeShortID
+}
+
+func (n *Node) IsClusterNode() bool {
+	return n.ClusterID != consts.LocalClusterID
+}
+
+func (n *Node) OptimisticAdd(ctx context.Context, res SandboxResources) {
+	if n.featureflags != nil && !n.featureflags.BoolFlag(ctx, featureflags.OptimisticResourceAccountingFlag) {
+		return
+	}
+
+	n.metricsMu.Lock()
+	defer n.metricsMu.Unlock()
+
+	// Directly accumulate to the current metrics view
+	n.metrics.CpuAllocated += uint32(res.CPUs)
+	n.metrics.MemoryAllocatedBytes += uint64(res.MiBMemory) * 1024 * 1024 // Note: CpuPercent is difficult to estimate, usually just updating Allocated is sufficient for the scheduling algorithm
+}
+
+func (n *Node) OptimisticRemove(ctx context.Context, res SandboxResources) {
+	if n.featureflags != nil && !n.featureflags.BoolFlag(ctx, featureflags.OptimisticResourceAccountingFlag) {
+		return
+	}
+
+	n.metricsMu.Lock()
+	defer n.metricsMu.Unlock()
+
+	cpu := uint32(res.CPUs)
+	memory := uint64(res.MiBMemory) * 1024 * 1024
+
+	// Prevent underflow due to race condition (the sandbox was most likely already removed by the node sync)
+	if cpu > n.metrics.CpuAllocated || memory > n.metrics.MemoryAllocatedBytes {
+		logger.L().Warn(ctx, "OptimisticRemove would cause underflow, skipping", logger.WithNodeID(n.ID), zap.Uint32("cpuAllocated", n.metrics.CpuAllocated), zap.Uint64("memoryAllocatedBytes", n.metrics.MemoryAllocatedBytes), zap.Uint32("cpuToRemove", cpu), zap.Uint64("memoryToRemove", memory))
+
+		return
+	}
+
+	n.metrics.CpuAllocated -= cpu
+	n.metrics.MemoryAllocatedBytes -= memory
 }

@@ -1,3 +1,5 @@
+//go:build linux
+
 package nbd
 
 import (
@@ -15,7 +17,10 @@ import (
 
 	"github.com/Merovius/nbd/nbdnl"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
@@ -24,7 +29,15 @@ import (
 )
 
 const (
-	connectTimeout = 30 * time.Second
+	// ioTimeout is the per-request timeout for the kernel NBD driver.
+	// Must be greater than the backend fetch timeout (60s in streaming_chunk.go)
+	// so the dispatch handler has time to respond before the kernel declares
+	// the connection dead and returns EIO to the guest.
+	ioTimeout = 90 * time.Second
+
+	// deadconnTimeout is how long the kernel waits after an I/O timeout
+	// before declaring the NBD connection dead.
+	deadconnTimeout = 30 * time.Second
 
 	// disconnectTimeout should not be necessary if the disconnect is reliable
 	disconnectTimeout = 30 * time.Second
@@ -37,9 +50,11 @@ type DirectPathMount struct {
 	devicePool   *DevicePool
 	featureFlags *featureflags.Client
 
-	Backend     block.Device
-	deviceIndex uint32
-	blockSize   uint64
+	Backend         block.Device
+	deviceIndex     uint32
+	blockSize       uint64
+	ioTimeout       time.Duration
+	deadconnTimeout time.Duration
 
 	dispatchers []*Dispatch
 	socksClient []*os.File
@@ -48,24 +63,55 @@ type DirectPathMount struct {
 	handlersWg sync.WaitGroup
 }
 
-func NewDirectPathMount(b block.Device, devicePool *DevicePool, featureFlags *featureflags.Client) *DirectPathMount {
-	return &DirectPathMount{
-		Backend:      b,
-		blockSize:    4096,
-		devicePool:   devicePool,
-		featureFlags: featureFlags,
-		socksClient:  make([]*os.File, 0),
-		socksServer:  make([]io.Closer, 0),
-		deviceIndex:  math.MaxUint32,
+// MountOption configures a DirectPathMount.
+type MountOption func(*DirectPathMount)
+
+// WithIOTimeout overrides the kernel NBD I/O timeout (default 90s).
+func WithIOTimeout(d time.Duration) MountOption {
+	return func(m *DirectPathMount) { m.ioTimeout = d }
+}
+
+// WithDeadconnTimeout overrides the kernel NBD dead-connection timeout (default 30s).
+func WithDeadconnTimeout(d time.Duration) MountOption {
+	return func(m *DirectPathMount) { m.deadconnTimeout = d }
+}
+
+func NewDirectPathMount(b block.Device, devicePool *DevicePool, featureFlags *featureflags.Client, opts ...MountOption) *DirectPathMount {
+	m := &DirectPathMount{
+		Backend:         b,
+		blockSize:       4096,
+		devicePool:      devicePool,
+		featureFlags:    featureFlags,
+		socksClient:     make([]*os.File, 0),
+		socksServer:     make([]io.Closer, 0),
+		deviceIndex:     math.MaxUint32,
+		ioTimeout:       ioTimeout,
+		deadconnTimeout: deadconnTimeout,
 	}
+
+	for _, o := range opts {
+		o(m)
+	}
+
+	return m
 }
 
 func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err error) {
+	// The connect + wait-for-connected poll loop (and device-pool contention) are
+	// otherwise invisible; both add up when this is opened once per measure/resize.
+	ctx, span := tracer.Start(ctx, "direct-path-mount-open")
+
 	ctx, d.cancelfn = context.WithCancel(ctx)
 
 	defer func() {
 		// Set the device index to the one returned, correctly capture error values
 		d.deviceIndex = retDeviceIndex
+		span.SetAttributes(attribute.Int64("nbd.device_index", int64(retDeviceIndex)))
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
 		logger.L().Debug(ctx, "opening direct path mount", zap.Uint32("device_index", d.deviceIndex), zap.Error(err))
 	}()
 
@@ -78,7 +124,7 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 
 	telemetry.ReportEvent(ctx, "got backend size")
 
-	deviceIndex := uint32(math.MaxUint32)
+	var deviceIndex uint32
 
 	for {
 		deviceIndex, err = d.devicePool.GetDevice(ctx)
@@ -93,6 +139,7 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 		d.dispatchers = make([]*Dispatch, 0)
 
 		connections := d.featureFlags.IntFlag(ctx, featureflags.NBDConnectionsPerDevice)
+		asyncWriteZeroes := d.featureFlags.BoolFlag(ctx, featureflags.NBDAsyncWriteZeroesFlag)
 
 		for i := range connections {
 			// Create the socket pairs
@@ -118,14 +165,18 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 			}
 			server.Close()
 
-			dispatch := NewDispatch(serverc, d.Backend)
+			dispatch := NewDispatch(serverc, d.Backend, asyncWriteZeroes)
+			// Capture deviceIndex for the goroutine closure — it's reassigned on
+			// each retry iteration of the outer for-loop (not a range loop, so
+			// Go 1.22+ loop variable fix doesn't apply).
+			devIdx := deviceIndex
 			// Start reading commands on the socket and dispatching them to our provider
 			d.handlersWg.Go(func() {
 				handleErr := dispatch.Handle(ctx)
 				// The error is expected to happen if the nbd (socket connection) is closed
 				logger.L().Info(ctx, "closing handler for NBD commands",
 					zap.Error(handleErr),
-					zap.Uint32("device_index", deviceIndex),
+					zap.Uint32("device_index", devIdx),
 					zap.Int("socket_index", i),
 				)
 			})
@@ -137,10 +188,12 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 
 		var opts []nbdnl.ConnectOption
 		opts = append(opts, nbdnl.WithBlockSize(d.blockSize))
-		opts = append(opts, nbdnl.WithTimeout(connectTimeout))
-		opts = append(opts, nbdnl.WithDeadconnTimeout(connectTimeout))
+		opts = append(opts, nbdnl.WithTimeout(d.ioTimeout))
+		opts = append(opts, nbdnl.WithDeadconnTimeout(d.deadconnTimeout))
 
-		serverFlags := nbdnl.FlagHasFlags | nbdnl.FlagCanMulticonn
+		const flagSendWriteZeroes nbdnl.ServerFlags = 1 << 6 // NBD_FLAG_SEND_WRITE_ZEROES, not in nbdnl
+		serverFlags := nbdnl.FlagHasFlags | nbdnl.FlagCanMulticonn |
+			nbdnl.FlagSendTrim | flagSendWriteZeroes
 
 		idx, connectErr := nbdnl.Connect(deviceIndex, d.socksClient, uint64(size), 0, serverFlags, opts...)
 		if connectErr == nil {
@@ -192,12 +245,39 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 			break
 		}
 
-		time.Sleep(100 * time.Nanosecond)
+		time.Sleep(100 * time.Microsecond)
 	}
 
 	telemetry.ReportEvent(ctx, "connected to NBD")
 
 	return deviceIndex, nil
+}
+
+// Flush writes all pending data through the NBD connection and then clears the
+// kernel's block-device buffers. Call this before reading or exporting the
+// backend directly so it cannot observe writes that are still cached by Linux.
+func (d *DirectPathMount) Flush(ctx context.Context) error {
+	ctx, span := tracer.Start(ctx, "direct-path-mount-flush")
+	defer span.End()
+
+	path := GetDevicePath(d.deviceIndex)
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open NBD device for flush: %w", err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			logger.L().Warn(ctx, "failed to close NBD device after flush", zap.Error(err), zap.String("path", path))
+		}
+	}()
+
+	// BLKFLSBUF completes all dirty pages as NBD writes to the in-process
+	// backend and invalidates the cache; fsync would only add the unsupported NBD_CMD_FLUSH.
+	if err := unix.IoctlSetInt(int(file.Fd()), unix.BLKFLSBUF, 0); err != nil {
+		return fmt.Errorf("flush NBD device buffers: %w", err)
+	}
+
+	return nil
 }
 
 func (d *DirectPathMount) Close(ctx context.Context) error {
@@ -285,10 +365,14 @@ func disconnectNBDWithTimeout(ctx context.Context, deviceIndex uint32, timeout t
 		if err == nil && !s.Connected {
 			break
 		}
-		time.Sleep(100 * time.Nanosecond)
+		time.Sleep(100 * time.Microsecond)
 	}
 
 	return nil
+}
+
+func DisconnectDevice(ctx context.Context, deviceIndex DeviceSlot) error {
+	return disconnectNBDWithTimeout(ctx, deviceIndex, disconnectTimeout)
 }
 
 func closeSocketPairs(socksClient []*os.File, socksServer []io.Closer) error {

@@ -1,3 +1,5 @@
+//go:build linux
+
 package testutils
 
 import (
@@ -18,19 +20,19 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
-func TemplateRootfs(ctx context.Context, buildID string) (*BuildDevice, *Cleaner, error) {
+func TemplateRootfs(ctx context.Context, spec storage.Spec, buildID string) (*BuildDevice, *Cleaner, error) {
 	var cleaner Cleaner
 
-	files := storage.TemplateFiles{
+	paths := storage.Paths{
 		BuildID: buildID,
 	}
 
-	s, err := storage.GetStorageProvider(ctx, storage.TemplateStorageConfig)
+	s, err := storage.NewProvider(ctx, spec)
 	if err != nil {
 		return nil, &cleaner, fmt.Errorf("failed to get storage provider: %w", err)
 	}
 
-	obj, err := s.OpenBlob(ctx, files.StorageRootfsHeaderPath(), storage.RootFSHeaderObjectType)
+	obj, err := s.OpenBlob(ctx, paths.RootfsHeader())
 	if err != nil {
 		return nil, &cleaner, fmt.Errorf("failed to open object: %w", err)
 	}
@@ -42,7 +44,7 @@ func TemplateRootfs(ctx context.Context, buildID string) (*BuildDevice, *Cleaner
 			return nil, &cleaner, fmt.Errorf("failed to parse build id: %w", err)
 		}
 
-		r, err := s.OpenSeekable(ctx, files.StorageRootfsPath(), storage.RootFSObjectType)
+		r, err := s.OpenSeekable(ctx, paths.Rootfs())
 		if err != nil {
 			return nil, &cleaner, fmt.Errorf("failed to open object: %w", err)
 		}

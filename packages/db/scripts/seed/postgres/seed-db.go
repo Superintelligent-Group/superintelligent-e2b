@@ -71,14 +71,59 @@ func main() {
 	}
 	defer db.Close()
 
-	authDb, err := authdb.NewClient(ctx, connectionString, connectionString)
+	authDb, err := authdb.NewClient(ctx, connectionString)
 	if err != nil {
 		panic(err)
 	}
 	defer authDb.Close()
 
-	// Open .e2b/config.json
-	// Delete existing user and recreate (simpler for seeding)
+	// Clean up existing data for idempotent re-seeding.
+	// Delete child rows that have ON DELETE NO ACTION constraints
+	// before deleting the team and user rows.
+	err = authDb.TestsRawSQL(ctx, `
+DELETE FROM envs WHERE team_id IN (SELECT id FROM teams WHERE email = $1)
+`, email)
+	if err != nil {
+		panic(err)
+	}
+
+	err = authDb.TestsRawSQL(ctx, `
+DELETE FROM snapshots WHERE team_id IN (SELECT id FROM teams WHERE email = $1)
+`, email)
+	if err != nil {
+		panic(err)
+	}
+
+	err = authDb.TestsRawSQL(ctx, `
+DELETE FROM volumes WHERE team_id IN (SELECT id FROM teams WHERE email = $1)
+`, email)
+	if err != nil {
+		panic(err)
+	}
+
+	err = authDb.TestsRawSQL(ctx, `
+DELETE FROM addons WHERE added_by IN (SELECT id FROM auth.users WHERE email = $1)
+`, email)
+	if err != nil {
+		panic(err)
+	}
+
+	// Now safe to delete team (team_api_keys cascade automatically).
+	err = authDb.TestsRawSQL(ctx, `
+DELETE FROM teams WHERE email = $1
+`, email)
+	if err != nil {
+		panic(err)
+	}
+
+	err = authDb.TestsRawSQL(ctx, `
+DELETE FROM public.users WHERE id IN (SELECT id FROM auth.users WHERE email = $1)
+`, email)
+	if err != nil {
+		panic(err)
+	}
+
+	// Delete the auth user separately.
 	err = authDb.TestsRawSQL(ctx, `
 DELETE FROM auth.users WHERE email = $1
 `, email)
@@ -86,7 +131,6 @@ DELETE FROM auth.users WHERE email = $1
 		panic(err)
 	}
 
-	// Create the user
 	userID := uuid.New()
 	err = authDb.TestsRawSQL(ctx, `
 INSERT INTO auth.users (id, email)
@@ -96,10 +140,7 @@ VALUES ($1, $2)
 		panic(err)
 	}
 
-	// Delete team
-	err = authDb.TestsRawSQL(ctx, `
-DELETE FROM teams WHERE email = $1
-`, email)
+	err = authDb.UpsertPublicUser(ctx, userID)
 	if err != nil {
 		panic(err)
 	}
@@ -133,7 +174,7 @@ VALUES ($1, $2, $3)
 	if err != nil {
 		panic(err)
 	}
-	_, err = authDb.Write.CreateAccessToken(
+	_, err = authDb.CreateAccessToken(
 		ctx, authqueries.CreateAccessTokenParams{
 			ID:                    uuid.New(),
 			UserID:                userID,
@@ -159,7 +200,7 @@ VALUES ($1, $2, $3)
 	if err != nil {
 		panic(err)
 	}
-	_, err = authDb.Write.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
+	_, err = authDb.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
 		TeamID:           teamUUID,
 		CreatedBy:        &userID,
 		ApiKeyHash:       apiKeyHash,

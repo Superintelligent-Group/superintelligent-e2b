@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
-	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 	"github.com/e2b-dev/infra/tests/integration/internal/envd"
 	"github.com/e2b-dev/infra/tests/integration/internal/setup"
 	"github.com/e2b-dev/infra/tests/integration/internal/utils"
@@ -34,7 +33,7 @@ func TestDownloadFileWhenAuthIsDisabled(t *testing.T) {
 		ctx,
 		&envd.PostFilesParams{
 			Path:     &filePath,
-			Username: sharedUtils.ToPtr("user"),
+			Username: new("user"),
 		},
 		contentType,
 		textFile,
@@ -46,7 +45,7 @@ func TestDownloadFileWhenAuthIsDisabled(t *testing.T) {
 
 	getRes, err := envdClient.HTTPClient.GetFilesWithResponse(
 		ctx,
-		&envd.GetFilesParams{Path: &filePath, Username: sharedUtils.ToPtr("user")},
+		&envd.GetFilesParams{Path: &filePath, Username: new("user")},
 		setup.WithSandbox(t, sbx.JSON201.SandboxID),
 	)
 
@@ -60,8 +59,8 @@ func TestDownloadFileWithoutSigningWhenAuthIsEnabled(t *testing.T) {
 	defer cancel()
 
 	sbx := createSandbox(t, true, setup.WithAPIKey())
-	assert.NotNil(t, sbx.JSON201)
-	assert.NotNil(t, sbx.JSON201.EnvdAccessToken)
+	require.NotNil(t, sbx.JSON201)
+	require.NotNil(t, sbx.JSON201.EnvdAccessToken)
 
 	envdClient := setup.GetEnvdClient(t, ctx)
 	envdToken := sbx.JSON201.EnvdAccessToken
@@ -75,7 +74,7 @@ func TestDownloadFileWithoutSigningWhenAuthIsEnabled(t *testing.T) {
 		ctx,
 		&envd.PostFilesParams{
 			Path:      &filePath,
-			Username:  sharedUtils.ToPtr("user"),
+			Username:  new("user"),
 			Signature: &writeFileSigning,
 		},
 		contentType,
@@ -89,7 +88,7 @@ func TestDownloadFileWithoutSigningWhenAuthIsEnabled(t *testing.T) {
 
 	readRes, readErr := envdClient.HTTPClient.GetFiles(
 		ctx,
-		&envd.GetFilesParams{Path: &filePath, Username: sharedUtils.ToPtr("user")},
+		&envd.GetFilesParams{Path: &filePath, Username: new("user")},
 		setup.WithSandbox(t, sbx.JSON201.SandboxID),
 	)
 	require.NoError(t, readErr)
@@ -103,8 +102,8 @@ func TestDownloadFileWithSigningWhenAuthIsEnabled(t *testing.T) {
 	defer cancel()
 
 	sbx := createSandbox(t, true, setup.WithAPIKey())
-	assert.NotNil(t, sbx.JSON201)
-	assert.NotNil(t, sbx.JSON201.EnvdAccessToken)
+	require.NotNil(t, sbx.JSON201)
+	require.NotNil(t, sbx.JSON201.EnvdAccessToken)
 
 	envdClient := setup.GetEnvdClient(t, ctx)
 	envdToken := sbx.JSON201.EnvdAccessToken
@@ -119,7 +118,7 @@ func TestDownloadFileWithSigningWhenAuthIsEnabled(t *testing.T) {
 		ctx,
 		&envd.PostFilesParams{
 			Path:      &filePath,
-			Username:  sharedUtils.ToPtr("user"),
+			Username:  new("user"),
 			Signature: &writeFileSigning,
 		},
 		contentType,
@@ -132,7 +131,7 @@ func TestDownloadFileWithSigningWhenAuthIsEnabled(t *testing.T) {
 
 	readRes, readErr := envdClient.HTTPClient.GetFilesWithResponse(
 		ctx,
-		&envd.GetFilesParams{Path: &filePath, Username: sharedUtils.ToPtr("user"), Signature: &readFileSigning},
+		&envd.GetFilesParams{Path: &filePath, Username: new("user"), Signature: &readFileSigning},
 		setup.WithSandbox(t, sbx.JSON201.SandboxID),
 	)
 
@@ -147,23 +146,23 @@ func TestDownloadWithAlreadyExpiredToken(t *testing.T) {
 	defer cancel()
 
 	sbx := createSandbox(t, true, setup.WithAPIKey())
-	assert.NotNil(t, sbx.JSON201)
-	assert.NotNil(t, sbx.JSON201.EnvdAccessToken)
+	require.NotNil(t, sbx.JSON201)
+	require.NotNil(t, sbx.JSON201.EnvdAccessToken)
 
 	envdClient := setup.GetEnvdClient(t, ctx)
 	envdToken := sbx.JSON201.EnvdAccessToken
 
 	// create test file
 	filePath := "demo/test.txt"
-	signatureExpiration := time.Now().Add(-3 * time.Hour).Unix()
-	signatureForRead := generateSignature(filePath, "user", "read", &signatureExpiration, *envdToken)
+	signatureExpirationSec := time.Now().Add(-3 * time.Hour).Unix()
+	signatureForRead := generateSignature(filePath, "user", "read", &signatureExpirationSec, *envdToken)
 
-	readExpiration := int(signatureExpiration)
+	readExpiration := int(signatureExpirationSec)
 	readRes, readErr := envdClient.HTTPClient.GetFilesWithResponse(
 		ctx,
 		&envd.GetFilesParams{
 			Path:                &filePath,
-			Username:            sharedUtils.ToPtr("user"),
+			Username:            new("user"),
 			Signature:           &signatureForRead,
 			SignatureExpiration: &readExpiration,
 		},
@@ -181,23 +180,23 @@ func TestDownloadWithHealthyToken(t *testing.T) {
 	defer cancel()
 
 	sbx := createSandbox(t, true, setup.WithAPIKey())
-	assert.NotNil(t, sbx.JSON201)
-	assert.NotNil(t, sbx.JSON201.EnvdAccessToken)
+	require.NotNil(t, sbx.JSON201)
+	require.NotNil(t, sbx.JSON201.EnvdAccessToken)
 
 	envdClient := setup.GetEnvdClient(t, ctx)
 	envdToken := sbx.JSON201.EnvdAccessToken
 
 	// create test file
 	filePath := "demo/test.txt"
-	signatureExpiration := time.Now().Add(1 * time.Minute).Unix()
-	signatureForRead := generateSignature(filePath, "user", "read", &signatureExpiration, *envdToken)
+	signatureExpirationSec := time.Now().Add(1 * time.Minute).Unix()
+	signatureForRead := generateSignature(filePath, "user", "read", &signatureExpirationSec, *envdToken)
 
-	readExpiration := int(signatureExpiration)
+	readExpiration := int(signatureExpirationSec)
 	readRes, readErr := envdClient.HTTPClient.GetFilesWithResponse(
 		ctx,
 		&envd.GetFilesParams{
 			Path:                &filePath,
-			Username:            sharedUtils.ToPtr("user"),
+			Username:            new("user"),
 			Signature:           &signatureForRead,
 			SignatureExpiration: &readExpiration,
 		},
@@ -215,23 +214,23 @@ func TestAccessWithNotCorrespondingSignatureAndSignatureExpiration(t *testing.T)
 	defer cancel()
 
 	sbx := createSandbox(t, true, setup.WithAPIKey())
-	assert.NotNil(t, sbx.JSON201)
-	assert.NotNil(t, sbx.JSON201.EnvdAccessToken)
+	require.NotNil(t, sbx.JSON201)
+	require.NotNil(t, sbx.JSON201.EnvdAccessToken)
 
 	envdClient := setup.GetEnvdClient(t, ctx)
 	envdToken := sbx.JSON201.EnvdAccessToken
 
 	// create test file
 	filePath := "demo/test.txt"
-	signatureExpiration := time.Now().Add(-1 * time.Minute).Unix()
+	signatureExpirationSec := time.Now().Add(-1 * time.Minute).Unix()
 	signatureForRead := generateSignature(filePath, "user", "read", nil, *envdToken)
 
-	readExpiration := int(signatureExpiration)
+	readExpiration := int(signatureExpirationSec)
 	readRes, readErr := envdClient.HTTPClient.GetFilesWithResponse(
 		ctx,
 		&envd.GetFilesParams{
 			Path:                &filePath,
-			Username:            sharedUtils.ToPtr("user"),
+			Username:            new("user"),
 			Signature:           &signatureForRead,
 			SignatureExpiration: &readExpiration,
 		},
@@ -243,14 +242,14 @@ func TestAccessWithNotCorrespondingSignatureAndSignatureExpiration(t *testing.T)
 	assert.JSONEq(t, "{\"code\":401,\"message\":\"invalid signature\"}\n", string(readRes.Body))
 }
 
-func generateSignature(path, username, operation string, signatureExpiration *int64, accessToken string) string { //nolint:unparam // "username" will likely change soon
+func generateSignature(path, username, operation string, signatureExpirationSec *int64, accessToken string) string { //nolint:unparam // "username" will likely change soon
 	var signature string
 	hasher := keys.NewSHA256Hashing()
 
-	if signatureExpiration == nil {
+	if signatureExpirationSec == nil {
 		signature = fmt.Sprintf("%s:%s:%s:%s", path, operation, username, accessToken)
 	} else {
-		signature = fmt.Sprintf("%s:%s:%s:%s:%s", path, operation, username, accessToken, strconv.FormatInt(*signatureExpiration, 10))
+		signature = fmt.Sprintf("%s:%s:%s:%s:%s", path, operation, username, accessToken, strconv.FormatInt(*signatureExpirationSec, 10))
 	}
 
 	return fmt.Sprintf("v1_%s", hasher.HashWithoutPrefix([]byte(signature)))

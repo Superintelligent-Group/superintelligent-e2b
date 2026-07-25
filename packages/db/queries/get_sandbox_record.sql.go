@@ -15,7 +15,7 @@ import (
 const getSandboxRecordByTeamAndSandboxID = `-- name: GetSandboxRecordByTeamAndSandboxID :one
 SELECT
     sl.sandbox_id,
-    sl.env_id AS template_id,
+    COALESCE(s.base_env_id, sl.env_id) AS template_id,
     sl.vcpu,
     sl.ram_mb,
     sl.total_disk_size_mb,
@@ -26,24 +26,25 @@ SELECT
 FROM billing.sandbox_logs sl
 LEFT JOIN public.teams t ON t.id = sl.team_id
 LEFT JOIN public.clusters c ON c.id = t.cluster_id
+LEFT JOIN public.snapshots s
+    ON s.sandbox_id = sl.sandbox_id
+   AND s.team_id = sl.team_id
 LEFT JOIN LATERAL (
     SELECT ea.alias
     FROM public.env_aliases ea
-    WHERE ea.env_id = sl.env_id
+    WHERE ea.env_id = COALESCE(s.base_env_id, sl.env_id)
     ORDER BY ea.alias
     LIMIT 1
 ) template_alias ON TRUE
 WHERE sl.team_id = $1::uuid
   AND sl.sandbox_id = $2::text
-  AND sl.created_at >= $3::timestamptz
 ORDER BY sl.created_at DESC
 LIMIT 1
 `
 
 type GetSandboxRecordByTeamAndSandboxIDParams struct {
-	TeamID       uuid.UUID
-	SandboxID    string
-	CreatedAfter time.Time
+	TeamID    uuid.UUID
+	SandboxID string
 }
 
 type GetSandboxRecordByTeamAndSandboxIDRow struct {
@@ -59,7 +60,7 @@ type GetSandboxRecordByTeamAndSandboxIDRow struct {
 }
 
 func (q *Queries) GetSandboxRecordByTeamAndSandboxID(ctx context.Context, arg GetSandboxRecordByTeamAndSandboxIDParams) (GetSandboxRecordByTeamAndSandboxIDRow, error) {
-	row := q.db.QueryRow(ctx, getSandboxRecordByTeamAndSandboxID, arg.TeamID, arg.SandboxID, arg.CreatedAfter)
+	row := q.db.QueryRow(ctx, getSandboxRecordByTeamAndSandboxID, arg.TeamID, arg.SandboxID)
 	var i GetSandboxRecordByTeamAndSandboxIDRow
 	err := row.Scan(
 		&i.SandboxID,

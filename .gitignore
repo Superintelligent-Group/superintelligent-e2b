@@ -4,6 +4,7 @@
 .env*
 !.env.aws.template
 !.env.gcp.template
+!/.envrc
 .last_used_env
 .tfplan.*
 *.tfvars
@@ -34,3 +35,4 @@ pnpm-lock.yaml
 iac/provider-aws/.terraform-*/
 *.tfplan
 *.sig-backup
+**/bin/

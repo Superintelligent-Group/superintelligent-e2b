@@ -87,7 +87,7 @@ func requestTemplateBuild(ctx context.Context, c *gin.Context, a *APIStore, body
 	tags, err := id.ValidateAndDeduplicateTags(allTags)
 	if err != nil {
 		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid tag: %s", err))
-		telemetry.ReportError(ctx, "invalid tag", err)
+		telemetry.ReportErrorByCode(ctx, http.StatusBadRequest, "invalid tag", err)
 
 		return nil
 	}
@@ -115,7 +115,11 @@ func requestTemplateBuild(ctx context.Context, c *gin.Context, a *APIStore, body
 	}
 	span.End()
 
+	// TODO(ENG-3852): Stop sending the firecracker/kernel versions from the API.
+	// The orchestrator resolves them itself via the BuildFirecrackerVersion /
+	// BuildKernelVersion feature flags (see packages/orchestrator/pkg/template/server/create_template.go).
 	firecrackerVersion := a.featureFlags.StringFlag(ctx, featureflags.BuildFirecrackerVersion)
+	kernelVersion := a.featureFlags.StringFlag(ctx, featureflags.BuildKernelVersion)
 	buildReq := template.RegisterBuildData{
 		ClusterID:          clusters.WithClusterFallback(team.ClusterID),
 		TemplateID:         templateID,
@@ -126,14 +130,14 @@ func requestTemplateBuild(ctx context.Context, c *gin.Context, a *APIStore, body
 		CpuCount:           body.CpuCount,
 		MemoryMB:           body.MemoryMB,
 		Version:            templates.TemplateV2LatestVersion,
-		KernelVersion:      a.config.DefaultKernelVersion,
+		KernelVersion:      kernelVersion,
 		FirecrackerVersion: firecrackerVersion,
 	}
 
 	template, apiError := template.RegisterBuild(ctx, a.templateCache, a.sqlcDB, buildReq)
 	if apiError != nil {
 		a.sendAPIStoreError(c, apiError.Code, apiError.ClientMsg)
-		telemetry.ReportCriticalError(ctx, "build template register failed", apiError.Err)
+		telemetry.ReportErrorByCode(ctx, apiError.Code, "error when requesting template build", apiError.Err, telemetry.WithTemplateID(templateID))
 
 		return nil
 	}

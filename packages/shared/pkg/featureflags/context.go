@@ -3,6 +3,7 @@ package featureflags
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 )
 
@@ -81,11 +82,13 @@ func mergeSameKind(first ldcontext.Context, second ldcontext.Context) ldcontext.
 	return builder.Build()
 }
 
-func removeUndefined(contexts []ldcontext.Context) []ldcontext.Context {
+// removeInvalid drops undefined or invalid (e.g. empty key) contexts that
+// would otherwise poison the resulting multi-context.
+func removeInvalid(contexts []ldcontext.Context) []ldcontext.Context {
 	var result []ldcontext.Context
 
 	for _, item := range contexts {
-		if !item.IsDefined() {
+		if !item.IsDefined() || item.Err() != nil {
 			continue
 		}
 
@@ -103,7 +106,7 @@ func mergeContexts(ctx context.Context, contexts []ldcontext.Context) ldcontext.
 
 	contexts = flattenContexts(contexts)
 
-	contexts = removeUndefined(contexts)
+	contexts = removeInvalid(contexts)
 
 	if len(contexts) == 0 {
 		return ldcontext.NewWithKind("none", "none")
@@ -116,8 +119,8 @@ func mergeContexts(ctx context.Context, contexts []ldcontext.Context) ldcontext.
 	return ldcontext.NewMulti(contexts...)
 }
 
-func ClusterContext(clusterID string) ldcontext.Context {
-	return ldcontext.NewWithKind(ClusterKind, clusterID)
+func ClusterContext(clusterID uuid.UUID) ldcontext.Context {
+	return ldcontext.NewWithKind(ClusterKind, clusterID.String())
 }
 
 func deploymentContext(deploymentName string) ldcontext.Context {
@@ -164,9 +167,10 @@ func VolumeContext(volumeName string) ldcontext.Context {
 	return ldcontext.NewWithKind(VolumeKind, volumeName)
 }
 
-func VersionContext(orchestratorID, commit string) ldcontext.Context {
-	return ldcontext.NewBuilder(orchestratorID).
-		Kind(OrchestratorKind).
-		SetString(OrchestratorCommitAttribute, commit).
-		Build()
+func CompressFileTypeContext(fileType string) ldcontext.Context {
+	return ldcontext.NewWithKind(CompressFileTypeKind, fileType)
+}
+
+func CompressUseCaseContext(useCase string) ldcontext.Context {
+	return ldcontext.NewWithKind(CompressUseCaseKind, useCase)
 }

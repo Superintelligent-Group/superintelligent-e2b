@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 E2B Infrastructure is the backend infrastructure powering E2B (e2b.dev), an open-source cloud platform for AI code interpreting. It provides sandboxed execution environments using Firecracker microVMs, deployed on GCP using Terraform and Nomad.
 
+**Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — it explains what each service does, how services interact (with diagrams of the core flows: sandbox creation, traffic routing, pause/resume, template builds), and the deployment topology. Reading it first is the fastest way to understand this repository.
+
+**Keep docs/ARCHITECTURE.md updated**: if your change alters anything it describes (service responsibilities, ports, protocols, data stores, flows, deployment topology), update the document in the same change.
+
 ## Common Development Commands
 
 ### Setup & Environment
@@ -111,25 +115,27 @@ Client → Client-Proxy → API (REST) ⟷ PostgreSQL
 **API (`packages/api/`)** - REST API using Gin framework
 - Entry point: `main.go`
 - Core logic: `internal/handlers/store.go` (APIStore)
-- Authentication: JWT via Supabase in `internal/auth/`
+- Authentication: API keys, access tokens, and OIDC auth provider JWTs
 - OpenAPI code generation: `internal/api/*.gen.go`
 - Port: 80
 
 **Orchestrator (`packages/orchestrator/`)** - Firecracker microVM orchestration
 - Entry point: `main.go`
-- VM management: `internal/sandbox/`
-- Firecracker integration: `internal/sandbox/fc/`
-- Networking: `internal/sandbox/network/`
-- Storage: `internal/sandbox/nbd/` (Network Block Device)
-- Template caching: `internal/sandbox/template/`
-- gRPC server: `internal/server/`
-- Utilities: `cmd/clean-nfs-cache/`, `cmd/build-template/`
+- VM management: `pkg/sandbox/`
+- Firecracker integration: `pkg/sandbox/fc/`
+- Networking: `pkg/sandbox/network/`
+- Storage: `pkg/sandbox/nbd/` (Network Block Device)
+- Template caching: `pkg/sandbox/template/`
+- Template building: `pkg/template/`
+- gRPC server: `pkg/server/`
+- Utilities: `cmd/clean-nfs-cache/`, `cmd/inspect-build/`, `cmd/dummy-orchestrator/`
 
 **Envd (`packages/envd/`)** - In-VM daemon using Connect RPC
 - Runs inside each Firecracker VM
-- Process management API: `/spec/process/process.proto`
-- Filesystem API: `/spec/filesystem/filesystem.proto`
+- Process management API: `packages/envd/spec/process/process.proto`
+- Filesystem API: `packages/envd/spec/filesystem/filesystem.proto`
 - Port: 49983
+- **Version in `pkg/version.go` must be bumped on every behavioral change** (not comments/docs-only changes)
 
 **Client Proxy (`packages/client-proxy/`)** - Edge routing layer
 - Service discovery via Consul
@@ -148,11 +154,11 @@ Client → Client-Proxy → API (REST) ⟷ PostgreSQL
 **Database (`packages/db/`)** - PostgreSQL layer
 - Migrations: `migrations/*.sql` (goose)
 - Queries: `queries/*.sql` (sqlc)
-- Generated code: `internal/db/`
+- Generated code: `queries/` (plus `pkg/auth/queries/`, `pkg/dashboard/queries/`)
 
 ### Key Technologies
 
-- **Go 1.25.4** with workspaces (`go.work`)
+- **go 1.26.5** with workspaces (`go.work`)
 - **Firecracker** for microVM virtualization
 - **PostgreSQL** for primary data (sqlc for queries)
 - **ClickHouse** for analytics
@@ -204,13 +210,13 @@ go test -race -v -run TestCreateSandbox ./internal/handlers
 ## Important Development Notes
 
 ### Working with Proto/gRPC
-- Proto files: `spec/process/`, `spec/filesystem/`, internal proto in orchestrator
+- Proto files: `packages/envd/spec/process/`, `packages/envd/spec/filesystem/`, orchestrator protos at `packages/orchestrator/*.proto`
 - Shared protos: `packages/shared/pkg/grpc/`
 - After editing proto files, run `make generate/orchestrator` and `make generate/shared`
 
 ### Database Migrations
 - Migrations: `packages/db/migrations/`
-- Create: Add new `XXXXXX_name.sql` file
+- Create: `cd packages/db && make create-migration NAME=your-migration-name` — this generates the file with a correct `YYYYMMDDHHMMSS` timestamp. Do NOT hand-create migration files; placeholder timestamps like `120000`/`000000` cause same-day version collisions and are rejected by the out-of-order-migrations CI check.
 - Apply: `make migrate` (requires POSTGRES_CONNECTION_STRING)
 - Code generation: `make generate/db` (regenerates sqlc code)
 

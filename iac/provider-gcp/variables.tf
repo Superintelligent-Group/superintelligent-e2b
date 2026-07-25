@@ -132,14 +132,16 @@ variable "ingress_count" {
 }
 
 variable "additional_api_paths_handled_by_ingress" {
-  type        = list(string)
-  description = "Additional paths to forward to nomad's ingress"
+  type        = any
+  description = <<-EOT
+    Additional path rules to forward to nomad's ingress. Each entry creates a separate path_rule.
+    Accepts two formats for backward compatibility:
+    - Legacy: list(string) - e.g. ["/path1/*", "/path2/*"]
+    - New: list(object({paths = list(string), timeout_sec = optional(number)}))
+      e.g. [{paths = ["/path1/*", "/path2/*"], timeout_sec = 120}]
+    Per-route timeout_sec overrides the ingress backend default.
+  EOT
   default     = []
-}
-
-variable "additional_traefik_arguments" {
-  type    = list(string)
-  default = []
 }
 
 variable "client_proxy_resources_memory_mb" {
@@ -210,6 +212,44 @@ variable "api_port" {
   }
 }
 
+variable "api_internal_grpc_port" {
+  type    = number
+  default = 5009
+}
+
+variable "client_proxy_oidc_issuer_url" {
+  type    = string
+  default = ""
+}
+
+variable "auth_provider_config" {
+  type = object({
+    jwt = optional(list(object({
+      issuer = object({
+        url                 = string
+        discoveryURL        = optional(string)
+        audiences           = list(string)
+        audienceMatchPolicy = optional(string)
+      })
+      cacheDuration = optional(string)
+    })))
+  })
+  sensitive = true
+  default   = null
+}
+
+variable "ory_sdk_url" {
+  type        = string
+  default     = ""
+  description = "Ory Network admin SDK URL (e.g. https://<slug>.projects.oryapis.com)."
+}
+
+variable "ory_issuer_url" {
+  type        = string
+  default     = ""
+  description = "Ory OIDC issuer URL used to namespace public.user_identities. Must match one of auth_provider_config.jwt[*].issuer.url; defaults to the single configured JWT issuer if unset."
+}
+
 variable "ingress_port" {
   type = object({
     name        = string
@@ -223,11 +263,23 @@ variable "ingress_port" {
   }
 }
 
+variable "ingress_internal_port" {
+  type = object({
+    name        = string
+    port        = number
+    health_path = string
+  })
+  default = {
+    name        = "internal"
+    port        = 9435
+    health_path = "/"
+  }
+}
+
 variable "dashboard_api_count" {
   type    = number
   default = 0
 }
-
 variable "docker_reverse_proxy_port" {
   type = object({
     name        = string
@@ -257,9 +309,10 @@ variable "nomad_port" {
   default = 4646
 }
 
-variable "allow_sandbox_internet" {
-  type    = bool
-  default = true
+variable "allow_sandbox_internal_cidrs" {
+  type        = string
+  description = "Comma-separated CIDRs to allow through the sandbox firewall deny list (e.g. 10.0.0.1/32,10.0.0.2/32)"
+  default     = ""
 }
 
 variable "orchestrator_node_pool" {
@@ -302,6 +355,42 @@ variable "otel_collector_resources_cpu_count" {
   default = 0.5
 }
 
+variable "enable_otel_router_logs" {
+  type        = bool
+  default     = false
+  description = "Enable teeing non-internal customer logs from Vector to otel-router."
+}
+
+variable "otel_router_http_port" {
+  type        = number
+  default     = 4321
+  description = "Local otel-router Vector-compatible logs port used by Vector when otel-router log teeing is enabled."
+}
+
+variable "enable_otel_router_metrics" {
+  type        = bool
+  default     = false
+  description = "Enable teeing external customer metrics from otel-collector to otel-router."
+}
+
+variable "otel_router_grpc_port" {
+  type        = number
+  default     = 4320
+  description = "Local otel-router OTLP gRPC port used by otel-collector when otel-router metric teeing is enabled."
+}
+
+variable "enable_gcp_telemetry_metrics" {
+  type        = bool
+  default     = false
+  description = "Enable exporting selected otel-collector metrics to Google Cloud Monitoring using the googlecloud exporter."
+}
+
+variable "enable_gcp_telemetry_external_metrics" {
+  type        = bool
+  default     = false
+  description = "Enable exporting external e2b.* metrics to Google Cloud Monitoring. Requires enable_gcp_telemetry_metrics."
+}
+
 variable "clickhouse_resources_memory_mb" {
   type    = number
   default = 8192
@@ -315,37 +404,6 @@ variable "clickhouse_resources_cpu_count" {
 variable "domain_name" {
   type        = string
   description = "The domain name where e2b will run"
-}
-
-variable "additional_api_services_json" {
-  type        = string
-  description = <<EOT
-Deprecated. Use `additional_api_services` instead.
-
-Additional path rules to add to the API path matcher.
-Format: json string of an array of objects with 'path' and 'service' keys.
-Example:
-[
-  {
-    "paths": ["/api/v1"],
-    "service_id": "projects/e2b/global/backendServices/example",
-    "api_node_group_port_name": "example-port",
-    "api_node_group_port": 8080
-  }
-]
-EOT
-  default     = ""
-}
-
-variable "additional_api_services" {
-  type = list(object({
-    paths                    = list(string)
-    service_id               = string
-    api_node_group_port_name = string
-    api_node_group_port      = number
-  }))
-  description = "Additional path rules to add to the API path matcher."
-  default     = []
 }
 
 variable "prefix" {
@@ -409,6 +467,18 @@ variable "redis_shard_count" {
   default = 1
 }
 
+variable "gcp_redis_node_type" {
+  type        = string
+  description = "The node type for managed GCP Redis/Valkey. Can be set via TF_VAR_gcp_redis_node_type or GCP_REDIS_NODE_TYPE env var."
+  default     = "STANDARD_SMALL"
+}
+
+variable "gcp_redis_engine_version" {
+  type        = string
+  description = "The engine version for managed GCP Redis/Valkey. Can be set via TF_VAR_gcp_redis_engine_version or GCP_REDIS_ENGINE_VERSION env var."
+  default     = "VALKEY_8_0"
+}
+
 variable "filestore_cache_enabled" {
   type        = bool
   description = "Set to true to enable Filestore cache. Can be set via TF_VAR_use_filestore_cache or USE_FILESTORE_CACHE env var."
@@ -444,16 +514,6 @@ variable "filestore_cache_cleanup_dry_run" {
   default = false
 }
 
-variable "filestore_cache_cleanup_files_per_loop" {
-  type    = number
-  default = 10000
-}
-
-variable "filestore_cache_cleanup_deletions_per_loop" {
-  type    = number
-  default = 900
-}
-
 variable "filestore_cache_cleanup_max_concurrent_stat" {
   type        = number
   description = "Number of concurrent stat goroutines"
@@ -470,12 +530,6 @@ variable "filestore_cache_cleanup_max_concurrent_delete" {
   type        = number
   description = "Number of concurrent deleter goroutines"
   default     = 4
-}
-
-variable "filestore_cache_cleanup_max_retries" {
-  type        = number
-  description = "Maximum number of continuous error or miss retries before giving up"
-  default     = 10000
 }
 
 variable "remote_repository_enabled" {
@@ -629,16 +683,22 @@ variable "clickhouse_boot_disk_type" {
   default     = "pd-ssd"
 }
 
-variable "loki_boot_disk_type" {
-  description = "The GCE boot disk type for the Loki machines."
+variable "clickhouse_stateful_disk_type" {
+  description = "The GCE disk type for the ClickHouse stateful data disk (e.g. pd-ssd, hyperdisk-balanced). Must be compatible with clickhouse_machine_type (C4 requires hyperdisk-*)."
   type        = string
   default     = "pd-ssd"
 }
 
-variable "sandbox_storage_backend" {
-  description = "The sandbox storage backend to use. Valid values: 'memory', 'redis'."
+variable "clickhouse_stateful_disk_size_gb" {
+  description = "The GCE disk size (in GB) for the ClickHouse stateful data disk."
+  type        = number
+  default     = 100
+}
+
+variable "loki_boot_disk_type" {
+  description = "The GCE boot disk type for the Loki machines."
   type        = string
-  default     = ""
+  default     = "pd-ssd"
 }
 
 variable "db_max_open_connections" {
@@ -731,7 +791,79 @@ variable "gcs_grpc_connection_pool_size" {
   }
 }
 
+variable "anywhere_cache_enabled" {
+  type        = bool
+  description = "Enable GCS Anywhere Cache on the template bucket for all zones in the deploy region."
+  default     = false
+}
+
+variable "anywhere_cache_admission_policy" {
+  type        = string
+  description = "Configure anywhere cache policy. One of: admit-on-first-miss, admit-on-second-miss"
+  default     = null
+}
+
+variable "anywhere_cache_ttl" {
+  type    = string
+  default = null
+}
+
 variable "orchestrator_env_vars" {
-  type    = map(string)
-  default = {}
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "api_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "api_db_migrator_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "client_proxy_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "dashboard_api_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "template_manager_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "docker_reverse_proxy_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "filestore_cleanup_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "orchestrator_enabled" {
+  type        = bool
+  default     = true
+  description = "Whether the orchestrator Nomad job should be deployed. Set to false to skip deployment without removing the module."
+}
+
+variable "traefik_config_files" {
+  type        = map(string)
+  description = "Map of filename => content for additional Traefik dynamic configuration files"
+  default     = {}
 }

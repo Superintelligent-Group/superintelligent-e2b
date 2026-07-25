@@ -1,8 +1,12 @@
+//go:build linux
+
 package proxy
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,7 +18,6 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/connlimit"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
-	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	reverseproxy "github.com/e2b-dev/infra/packages/shared/pkg/proxy"
@@ -39,7 +42,7 @@ type SandboxProxy struct {
 }
 
 func NewSandboxProxy(meterProvider metric.MeterProvider, port uint16, sandboxes *sandbox.Map, featureFlags *featureflags.Client) (*SandboxProxy, error) {
-	getTargetFromRequest := reverseproxy.GetTargetFromRequest(env.IsLocal())
+	getTargetFromRequest := reverseproxy.GetTargetFromRequest()
 	limiter := connlimit.NewConnectionLimiter()
 	metrics := NewMetrics(meterProvider)
 
@@ -82,7 +85,7 @@ func NewSandboxProxy(meterProvider metric.MeterProvider, port uint16, sandboxes 
 				accessTokenRaw := r.Header.Get(trafficAccessTokenHeader)
 				if accessTokenRaw == "" {
 					return nil, reverseproxy.NewErrMissingTrafficAccessToken(sandboxId, trafficAccessTokenHeader)
-				} else if accessTokenRaw != accessToken {
+				} else if subtle.ConstantTimeCompare([]byte(accessTokenRaw), []byte(accessToken)) != 1 {
 					return nil, reverseproxy.NewErrInvalidTrafficAccessToken(sandboxId, trafficAccessTokenHeader)
 				}
 			}
@@ -96,7 +99,7 @@ func NewSandboxProxy(meterProvider metric.MeterProvider, port uint16, sandboxes 
 
 			url := &url.URL{
 				Scheme: "http",
-				Host:   fmt.Sprintf("%s:%d", sbx.Slot.HostIPString(), port),
+				Host:   net.JoinHostPort(sbx.Slot.HostIPString(), strconv.FormatUint(port, 10)),
 			}
 
 			logger := logger.L().With(
@@ -195,8 +198,8 @@ func (p *SandboxProxy) GetAddr() string {
 // OnInsert is called when a sandbox is inserted into the map.
 func (p *SandboxProxy) OnInsert(_ context.Context, _ *sandbox.Sandbox) {}
 
-// OnRemove is called when a sandbox is removed from the map.
-// It cleans up the connection limiter entry for the sandbox.
-func (p *SandboxProxy) OnRemove(_ context.Context, sbx *sandbox.Sandbox) {
-	p.limiter.Remove(sbx.Runtime.SandboxID)
+// OnNetworkRelease is called when a sandbox's network slot is released.
+// Keyed by LifecycleID so the removal is scoped to this sandbox lifecycle.
+func (p *SandboxProxy) OnNetworkRelease(_ context.Context, sbx *sandbox.Sandbox) {
+	p.limiter.Remove(sbx.LifecycleID)
 }

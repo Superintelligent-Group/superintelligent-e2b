@@ -1,3 +1,5 @@
+//go:build linux
+
 package cgroups
 
 import (
@@ -10,7 +12,8 @@ import (
 )
 
 type Cgroup2Manager struct {
-	cgroupFDs map[ProcessType]int
+	cgroupFDs   map[ProcessType]int
+	cgroupPaths map[ProcessType]string
 }
 
 var _ Manager = (*Cgroup2Manager)(nil)
@@ -51,18 +54,31 @@ func NewCgroup2Manager(opts ...Cgroup2ManagerOption) (*Cgroup2Manager, error) {
 		opt(&config)
 	}
 
-	cgroupFDs, err := createCgroups(config)
+	// Verify cgroup v2 is available by checking the filesystem type.
+	// On cgroup v1, /sys/fs/cgroup is a tmpfs and directories/files can be
+	// created freely, causing Cgroup2Manager to "succeed" with invalid fds
+	// that the kernel rejects with EBADF on clone3(CLONE_INTO_CGROUP).
+	var st unix.Statfs_t
+	if err := unix.Statfs(config.rootPath, &st); err != nil {
+		return nil, fmt.Errorf("failed to statfs cgroup root %s: %w", config.rootPath, err)
+	}
+	if st.Type != unix.CGROUP2_SUPER_MAGIC {
+		return nil, fmt.Errorf("cgroup root %s is not a cgroup2 filesystem (type=0x%x)", config.rootPath, st.Type)
+	}
+
+	cgroupFDs, cgroupPaths, err := createCgroups(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cgroups: %w", err)
 	}
 
-	return &Cgroup2Manager{cgroupFDs: cgroupFDs}, nil
+	return &Cgroup2Manager{cgroupFDs: cgroupFDs, cgroupPaths: cgroupPaths}, nil
 }
 
-func createCgroups(configs cgroup2Config) (map[ProcessType]int, error) {
+func createCgroups(configs cgroup2Config) (map[ProcessType]int, map[ProcessType]string, error) {
 	var (
-		results = make(map[ProcessType]int)
-		errs    []error
+		fdResults   = make(map[ProcessType]int)
+		pathResults = make(map[ProcessType]string)
+		errs        []error
 	)
 
 	for procType, config := range configs.processTypes {
@@ -73,21 +89,35 @@ func createCgroups(configs cgroup2Config) (map[ProcessType]int, error) {
 
 			continue
 		}
-		results[procType] = fd
+		fdResults[procType] = fd
+		pathResults[procType] = fullPath
 	}
 
 	if len(errs) > 0 {
-		for procType, fd := range results {
+		for procType, fd := range fdResults {
 			err := unix.Close(fd)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("failed to close cgroup fd for %s: %w", procType, err))
 			}
 		}
 
-		return nil, errors.Join(errs...)
+		return nil, nil, errors.Join(errs...)
 	}
 
-	return results, nil
+	return fdResults, pathResults, nil
+}
+
+// writeCgroupProp writes a cgroupfs property without O_CREATE so missing
+// properties error out rather than being silently created on a tmpfs fallback.
+func writeCgroupProp(path, value string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(value)
+
+	return err
 }
 
 func createCgroup(fullPath string, properties map[string]string) (int, error) {
@@ -97,8 +127,14 @@ func createCgroup(fullPath string, properties map[string]string) (int, error) {
 
 	var errs []error
 	for name, value := range properties {
-		if err := os.WriteFile(filepath.Join(fullPath, name), []byte(value), 0o644); err != nil {
-			errs = append(errs, fmt.Errorf("failed to write cgroup property: %w", err))
+		if err := writeCgroupProp(filepath.Join(fullPath, name), value); err != nil {
+			// Skip properties whose controller isn't enabled in subtree_control.
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+				fmt.Fprintf(os.Stderr, "cgroup property %q unavailable at %q, skipping\n", name, fullPath)
+
+				continue
+			}
+			errs = append(errs, fmt.Errorf("failed to write cgroup property %q: %w", name, err))
 		}
 	}
 	if len(errs) > 0 {
@@ -112,6 +148,23 @@ func (c Cgroup2Manager) GetFileDescriptor(procType ProcessType) (int, bool) {
 	fd, ok := c.cgroupFDs[procType]
 
 	return fd, ok
+}
+
+func (c Cgroup2Manager) Freeze(procType ProcessType) error {
+	return c.setFreezeState(procType, "1")
+}
+
+func (c Cgroup2Manager) Unfreeze(procType ProcessType) error {
+	return c.setFreezeState(procType, "0")
+}
+
+func (c Cgroup2Manager) setFreezeState(procType ProcessType, value string) error {
+	path, ok := c.cgroupPaths[procType]
+	if !ok {
+		return fmt.Errorf("unknown process type: %s", procType)
+	}
+
+	return writeCgroupProp(filepath.Join(path, "cgroup.freeze"), value)
 }
 
 func (c Cgroup2Manager) Close() error {

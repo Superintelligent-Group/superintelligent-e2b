@@ -89,50 +89,24 @@ job "template-manager" {
 
       resources {
         memory     = 1024
-        cpu        = 256
+        # COST-00: upstream uses memory_max = -1 (unlimited oversubscription),
+        # which requires Nomad 1.7+. Our Packer AMI ships Nomad 1.6.2 and rejects
+        # it ("MemoryMaxMB (-1) should be larger than MemoryMB"). Bounded value
+        # until the AMI is rebuilt on a current Nomad; revert to -1 after that.
+        memory_max = 4096
       }
 
       env {
         NODE_ID     = "$${node.unique.name}"
         NODE_LABELS = "$${meta.node_labels}"
 
-        CONSUL_TOKEN                  = "${consul_acl_token}"
-%{ if provider == "gcp" }
-        GOOGLE_SERVICE_ACCOUNT_BASE64 = "${provider_gcp_config.service_account_key}"
-        GCP_PROJECT_ID                = "${provider_gcp_config.project_id}"
-        GCP_REGION                    = "${provider_gcp_config.region}"
-        GCP_DOCKER_REPOSITORY_NAME    = "${provider_gcp_config.docker_registry}"
-
-        %{ if provider_gcp_config.gcs_grpc_connection_pool_size != 0 }
-        GCS_GRPC_CONNECTION_POOL_SIZE = "${provider_gcp_config.gcs_grpc_connection_pool_size}"
-        %{ endif }
-%{ endif }
-%{ if provider == "aws" }
-        ARTIFACTS_REGISTRY_PROVIDER   = "AWS_ECR"
-        STORAGE_PROVIDER              = "AWSBucket"
-        AWS_REGION                    = "${provider_aws_config.region}"
-        AWS_DOCKER_REPOSITORY_NAME    = "${provider_aws_config.docker_repository_name}"
-%{ endif }
-        API_SECRET                    = "${api_secret}"
-        ENVIRONMENT                   = "${environment}"
-        DOMAIN_NAME                   = "${domain_name}"
-        TEMPLATE_BUCKET_NAME          = "${template_bucket_name}"
-        BUILD_CACHE_BUCKET_NAME       = "${build_cache_bucket_name}"
-        OTEL_COLLECTOR_GRPC_ENDPOINT     = "${otel_collector_grpc_endpoint}"
-        LOGS_COLLECTOR_ADDRESS           = "${logs_collector_address}"
-        ORCHESTRATOR_SERVICES            = "${orchestrator_services}"
-        REDIS_POOL_SIZE                  = "${redis_pool_size}"
-        SHARED_CHUNK_CACHE_PATH       = "${shared_chunk_cache_path}"
-        CLICKHOUSE_CONNECTION_STRING  = "${clickhouse_connection_string}"
-        DOCKERHUB_REMOTE_REPOSITORY_URL  = "${dockerhub_remote_repository_url}"
         GRPC_PORT                     = "${port}"
-        GIN_MODE                      = "release"
 %{ if !update_stanza }
         FORCE_STOP                    = "true"
 %{ endif }
-%{ if launch_darkly_api_key != "" }
-        LAUNCH_DARKLY_API_KEY         = "${launch_darkly_api_key}"
-%{ endif }
+%{ for key, value in job_env_vars ~}
+        ${key} = "${value}"
+%{ endfor ~}
       }
 
       config {
@@ -142,11 +116,8 @@ job "template-manager" {
 
       artifact {
         source      = "${artifact_source}"
-%{ if template_manager_checksum != "" }
-        options {
-            checksum    = "md5:${template_manager_checksum}"
-        }
-%{ endif }
+        destination = "local/template-manager"
+        mode        = "file"
       }
     }
   }

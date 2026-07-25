@@ -51,7 +51,7 @@ func (a *APIStore) PostTemplates(c *gin.Context) {
 
 	template, apiErr := a.buildTemplate(ctx, userID, team, templateID, body)
 	if apiErr != nil {
-		telemetry.ReportCriticalError(ctx, "error when requesting template build", apiErr.Err, telemetry.WithTemplateID(templateID))
+		telemetry.ReportErrorByCode(ctx, apiErr.Code, "error when requesting template build", apiErr.Err, telemetry.WithTemplateID(templateID))
 		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
 		return
@@ -107,7 +107,7 @@ func (a *APIStore) PostTemplatesTemplateID(c *gin.Context, rawTemplateID api.Tem
 		return
 	}
 
-	templateDB, err := a.sqlcDB.GetTemplateByID(ctx, templateID)
+	templateDB, err := a.sqlcDB.GetTemplateById(ctx, templateID)
 	switch {
 	case err == nil:
 		if templateDB.TeamID != team.ID {
@@ -130,7 +130,7 @@ func (a *APIStore) PostTemplatesTemplateID(c *gin.Context, rawTemplateID api.Tem
 
 	template, apiErr := a.buildTemplate(ctx, userID, team, templateID, body)
 	if apiErr != nil {
-		telemetry.ReportCriticalError(ctx, "error when requesting template build", apiErr.Err, telemetry.WithTemplateID(templateID))
+		telemetry.ReportErrorByCode(ctx, apiErr.Code, "error when requesting template build", apiErr.Err, telemetry.WithTemplateID(templateID))
 		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
 		return
@@ -160,7 +160,11 @@ func (a *APIStore) buildTemplate(
 	templateID api.TemplateID,
 	body api.TemplateBuildRequest,
 ) (*template.RegisterBuildResponse, *api.APIError) {
+	// TODO(ENG-3852): Stop sending the firecracker/kernel versions from the API.
+	// The orchestrator resolves them itself via the BuildFirecrackerVersion /
+	// BuildKernelVersion feature flags (see packages/orchestrator/pkg/template/server/create_template.go).
 	firecrackerVersion := a.featureFlags.StringFlag(ctx, featureflags.BuildFirecrackerVersion)
+	kernelVersion := a.featureFlags.StringFlag(ctx, featureflags.BuildKernelVersion)
 
 	var alias *string
 	var tags []string
@@ -203,7 +207,7 @@ func (a *APIStore) buildTemplate(
 		CpuCount:           body.CpuCount,
 		MemoryMB:           body.MemoryMB,
 		Version:            templates.TemplateV1Version,
-		KernelVersion:      a.config.DefaultKernelVersion,
+		KernelVersion:      kernelVersion,
 		FirecrackerVersion: firecrackerVersion,
 	}
 
