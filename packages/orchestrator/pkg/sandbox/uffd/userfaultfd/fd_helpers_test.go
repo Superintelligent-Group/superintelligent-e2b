@@ -1,3 +1,5 @@
+//go:build linux
+
 package userfaultfd
 
 import (
@@ -8,8 +10,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
-// Used for testing.
-// flags: syscall.O_CLOEXEC|syscall.O_NONBLOCK
+// Used for testing (flags: syscall.O_CLOEXEC|syscall.O_NONBLOCK).
 func newFd(flags uintptr) (Fd, error) {
 	uffd, _, errno := syscall.Syscall(NR_userfaultfd, flags, 0, 0)
 	if errno != 0 {
@@ -19,18 +20,20 @@ func newFd(flags uintptr) (Fd, error) {
 	return Fd(uffd), nil
 }
 
-// Used for testing
-// features: UFFD_FEATURE_MISSING_HUGETLBFS
-// This is already called by the FC
-func configureApi(f Fd, pagesize uint64) error {
+// configureApi is used for testing. The caller (FC in production) sets
+// UFFD_FEATURE_MISSING_HUGETLBFS only when hugepages are in use.
+func configureApi(f Fd, pagesize uint64, removeEnabled bool) error {
 	var features CULong
 
-	// Only set the hugepage feature if we're using hugepages
+	// Only set the hugepage feature if we're using hugepages.
 	if pagesize == header.HugepageSize {
 		features |= UFFD_FEATURE_MISSING_HUGETLBFS
 	}
 
 	features |= UFFD_FEATURE_WP_ASYNC
+	if removeEnabled {
+		features |= UFFD_FEATURE_EVENT_REMOVE
+	}
 
 	api := newUffdioAPI(UFFD_API, features)
 	ret, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f), UFFDIO_API, uintptr(unsafe.Pointer(&api)))
@@ -41,9 +44,23 @@ func configureApi(f Fd, pagesize uint64) error {
 	return nil
 }
 
-// mode: UFFDIO_REGISTER_MODE_WP|UFFDIO_REGISTER_MODE_MISSING
-// This is already called by the FC, but only with the UFFDIO_REGISTER_MODE_MISSING
-// We need to call it with UFFDIO_REGISTER_MODE_WP when we use both missing and wp
+// unregister tears down the UFFD registration over [addr, addr+size).
+// Used in test cleanup so in-flight REMOVE events queued by the kernel
+// (configureApi enables UFFD_FEATURE_EVENT_REMOVE when removeEnabled)
+// don't keep munmap blocked on un-acked events.
+func unregister(f Fd, addr uintptr, size uint64) error {
+	r := newUffdioRange(CULong(addr), CULong(size))
+
+	ret, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f), UFFDIO_UNREGISTER, uintptr(unsafe.Pointer(&r)))
+	if errno != 0 {
+		return fmt.Errorf("UFFDIO_UNREGISTER ioctl failed: %w (ret=%d)", errno, ret)
+	}
+
+	return nil
+}
+
+// register is used for testing. FC uses UFFDIO_REGISTER_MODE_MISSING; we add
+// UFFDIO_REGISTER_MODE_WP when both missing and write-protection are needed.
 func register(f Fd, addr uintptr, size uint64, mode CULong) error {
 	register := newUffdioRegister(CULong(addr), CULong(size), mode)
 

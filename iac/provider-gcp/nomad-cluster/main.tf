@@ -121,8 +121,9 @@ module "network" {
   client_proxy_port        = var.client_proxy_port
   client_proxy_health_port = var.client_proxy_health_port
 
-  api_instance_group    = google_compute_instance_group_manager.api_pool.instance_group
-  server_instance_group = google_compute_region_instance_group_manager.server_pool.instance_group
+  api_instance_group        = google_compute_instance_group_manager.api_pool.instance_group
+  extra_api_instance_groups = var.extra_api_instance_groups
+  server_instance_group     = google_compute_region_instance_group_manager.server_pool.instance_group
 
   nomad_port = var.nomad_port
 
@@ -130,15 +131,6 @@ module "network" {
 
   labels = var.labels
   prefix = var.prefix
-
-  additional_api_path_rules = [
-    for service in var.additional_api_services : {
-      paths      = service.paths
-      service_id = service.service_id
-    }
-  ]
-
-  additional_ports = [for service in var.additional_api_services : service.api_node_group_port]
 }
 
 module "filestore" {
@@ -191,13 +183,14 @@ module "build_cluster" {
   fc_env_pipeline_bucket_name = var.fc_env_pipeline_bucket_name
   fc_kernels_bucket_name      = var.fc_kernels_bucket_name
   fc_versions_bucket_name     = var.fc_versions_bucket_name
+  fc_busybox_bucket_name      = var.fc_busybox_bucket_name
 
   filestore_cache_enabled = var.filestore_cache_enabled
   nfs_ip_addresses        = var.filestore_cache_enabled ? module.filestore[0].nfs_ip_addresses : []
   nfs_mount_path          = local.nfs_mount_path
   nfs_mount_subdir        = local.nfs_mount_subdir
   nfs_mount_opts          = local.nfs_mount_opts
-  persistent_volume_types = var.persistent_volume_types
+  persistent_volume_types = {} // don't need to access persistent volumes when building templates
 
   environment = var.environment
   labels      = var.labels
@@ -249,6 +242,7 @@ module "client_cluster" {
   fc_env_pipeline_bucket_name = var.fc_env_pipeline_bucket_name
   fc_kernels_bucket_name      = var.fc_kernels_bucket_name
   fc_versions_bucket_name     = var.fc_versions_bucket_name
+  fc_busybox_bucket_name      = var.fc_busybox_bucket_name
 
   filestore_cache_enabled = var.filestore_cache_enabled
   nfs_ip_addresses        = var.filestore_cache_enabled ? module.filestore[0].nfs_ip_addresses : []

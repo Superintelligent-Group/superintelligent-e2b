@@ -1,3 +1,5 @@
+//go:build linux
+
 package peerserver
 
 import (
@@ -30,12 +32,35 @@ func (f *headerSource) Stream(ctx context.Context, sender Sender) error {
 		return fmt.Errorf("get device: %w", err)
 	}
 
+	// Serve the durable (deduped) header, not the live one. While a provisional
+	// header is being served locally, device.Header() maps dirty pages to a
+	// synthetic build id backed only by this node's memfd, which a peer can't
+	// resolve (it's absent from the peer registry and object storage).
+	// DurableHeader waits for the deduped header if a swap is still pending;
+	// devices without one return their current header immediately.
 	h := device.Header()
+	if dh, ok := device.(interface {
+		DurableHeader(ctx context.Context) (*header.Header, error)
+	}); ok {
+		h, err = dh.DurableHeader(ctx)
+		if err != nil {
+			span.RecordError(err)
+
+			return fmt.Errorf("resolve durable header: %w", err)
+		}
+	}
 	if h == nil {
 		return ErrNotAvailable
 	}
 
-	data, err := header.Serialize(h.Metadata, h.Mapping)
+	// Rely on the V5 format on the wire.
+	wire := *h
+	meta := *h.Metadata
+	meta.Version = header.MetadataVersionV5
+	wire.Metadata = &meta
+	wire.IncompletePendingUpload = true
+
+	data, err := header.SerializeHeader(&wire)
 	if err != nil {
 		span.RecordError(err)
 

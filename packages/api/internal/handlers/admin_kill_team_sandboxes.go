@@ -19,6 +19,13 @@ func (a *APIStore) PostAdminTeamsTeamIDSandboxesKill(c *gin.Context, teamID uuid
 	ctx, span := tracer.Start(ctx, "admin-kill-team-sandboxes")
 	defer span.End()
 
+	err := a.authService.InvalidateTeamCache(ctx, teamID)
+	if err != nil {
+		logger.L().Error(ctx, "Failed to invalidate auth cache for team",
+			logger.WithTeamID(teamID.String()),
+			zap.Error(err))
+	}
+
 	logger.L().Info(ctx, "Admin killing all sandboxes for team", logger.WithTeamID(teamID.String()))
 
 	// Get all running sandboxes for the team
@@ -43,17 +50,22 @@ func (a *APIStore) PostAdminTeamsTeamIDSandboxesKill(c *gin.Context, teamID uuid
 	// Kill each sandbox
 	for _, sbx := range sandboxes {
 		wg.Go(func() error {
-			err := a.orchestrator.RemoveSandbox(ctx, sbx.TeamID, sbx.SandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionKill})
+			err := a.orchestrator.RemoveSandbox(ctx, sbx.TeamID, sbx.SandboxID, sandbox.RemoveOpts{
+				Action: sandbox.StateActionKill,
+				Reason: sandbox.KillReasonAdmin,
+			})
 			if err != nil {
 				logger.L().Error(ctx, "Failed to kill sandbox",
 					logger.WithSandboxID(sbx.SandboxID),
 					logger.WithTeamID(teamID.String()),
+					zap.String("kill_reason", sandbox.KillReasonAdmin.String()),
 					zap.Error(err))
 				failedCount.Add(1)
 			} else {
 				logger.L().Debug(ctx, "Successfully killed sandbox",
 					logger.WithSandboxID(sbx.SandboxID),
-					logger.WithTeamID(teamID.String()))
+					logger.WithTeamID(teamID.String()),
+					zap.String("kill_reason", sandbox.KillReasonAdmin.String()))
 				killedCount.Add(1)
 			}
 
@@ -66,6 +78,13 @@ func (a *APIStore) PostAdminTeamsTeamIDSandboxesKill(c *gin.Context, teamID uuid
 		a.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to kill sandboxes")
 
 		return
+	}
+
+	// Invalidate auth cache for this team so subsequent requests re-check against DB
+	if err := a.authService.InvalidateTeamCache(ctx, teamID); err != nil {
+		logger.L().Error(ctx, "Failed to invalidate auth cache for team",
+			logger.WithTeamID(teamID.String()),
+			zap.Error(err))
 	}
 
 	logger.L().Info(ctx, "Completed killing team sandboxes",

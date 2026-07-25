@@ -6,8 +6,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/e2b-dev/infra/packages/db/pkg/auth"
-	"github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
+	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
+	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
+	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
@@ -18,7 +19,7 @@ type CreateAPIKeyResponse struct {
 	RawAPIKey string
 }
 
-func CreateAPIKey(ctx context.Context, authDB *authdb.Client, teamID uuid.UUID, userID uuid.UUID, name string) (CreateAPIKeyResponse, error) {
+func CreateAPIKey(ctx context.Context, authDB *authdb.Client, teamID uuid.UUID, createdBy *uuid.UUID, name string) (CreateAPIKeyResponse, error) {
 	teamApiKey, err := keys.GenerateKey(keys.ApiKeyPrefix)
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error when generating team API key", err)
@@ -26,9 +27,9 @@ func CreateAPIKey(ctx context.Context, authDB *authdb.Client, teamID uuid.UUID, 
 		return CreateAPIKeyResponse{}, fmt.Errorf("error when generating team API key: %w", err)
 	}
 
-	apiKey, err := authDB.Write.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
+	apiKey, err := authDB.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
 		TeamID:           teamID,
-		CreatedBy:        &userID,
+		CreatedBy:        createdBy,
 		ApiKeyHash:       teamApiKey.HashedValue,
 		ApiKeyPrefix:     teamApiKey.Masked.Prefix,
 		ApiKeyLength:     int32(teamApiKey.Masked.ValueLength),
@@ -46,4 +47,24 @@ func CreateAPIKey(ctx context.Context, authDB *authdb.Client, teamID uuid.UUID, 
 		TeamApiKey: &apiKey,
 		RawAPIKey:  teamApiKey.PrefixedRawValue,
 	}, nil
+}
+
+func DeleteAPIKey(ctx context.Context, authDB *authdb.Client, authService sharedauth.Service, teamID uuid.UUID, apiKeyID uuid.UUID) (bool, error) {
+	hashes, err := authDB.DeleteTeamAPIKey(ctx, authqueries.DeleteTeamAPIKeyParams{
+		ID:     apiKeyID,
+		TeamID: teamID,
+	})
+	if err != nil {
+		telemetry.ReportCriticalError(ctx, "error when deleting API key", err)
+
+		return false, fmt.Errorf("error when deleting API key: %w", err)
+	}
+
+	// Invalidate the auth cache so the deleted key stops authenticating
+	// immediately instead of after the cache TTL expires.
+	for _, hash := range hashes {
+		authService.InvalidateAPIKeyCache(ctx, hash)
+	}
+
+	return len(hashes) > 0, nil
 }

@@ -3,10 +3,17 @@ package featureflags
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 	"github.com/launchdarkly/go-sdk-common/v3/ldvalue"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 )
@@ -17,18 +24,20 @@ const (
 	SandboxTemplateAttribute           string         = "template-id"
 	SandboxKernelVersionAttribute      string         = "kernel-version"
 	SandboxFirecrackerVersionAttribute string         = "firecracker-version"
+	SandboxEnvdVersionAttribute        string         = "envd-version"
+	// SandboxTypeAttribute distinguishes "sandbox" from "build" runs.
+	SandboxTypeAttribute string = "sandbox-type"
 
-	TeamKind       ldcontext.Kind = "team"
-	UserKind       ldcontext.Kind = "user"
-	ClusterKind    ldcontext.Kind = "cluster"
-	deploymentKind ldcontext.Kind = "deployment"
-	TierKind       ldcontext.Kind = "tier"
-	ServiceKind    ldcontext.Kind = "service"
-	TemplateKind   ldcontext.Kind = "template"
-	VolumeKind     ldcontext.Kind = "volume"
-
-	OrchestratorKind            ldcontext.Kind = "orchestrator"
-	OrchestratorCommitAttribute string         = "commit"
+	TeamKind             ldcontext.Kind = "team"
+	UserKind             ldcontext.Kind = "user"
+	ClusterKind          ldcontext.Kind = "cluster"
+	deploymentKind       ldcontext.Kind = "deployment"
+	TierKind             ldcontext.Kind = "tier"
+	ServiceKind          ldcontext.Kind = "service"
+	TemplateKind         ldcontext.Kind = "template"
+	VolumeKind           ldcontext.Kind = "volume"
+	CompressFileTypeKind ldcontext.Kind = "compress-file-type"
+	CompressUseCaseKind  ldcontext.Kind = "compress-use-case"
 )
 
 // All flags must be defined here: https://app.launchdarkly.com/projects/default/flags/
@@ -50,7 +59,7 @@ func (f JSONFlag) Fallback() ldvalue.Value {
 	return f.fallback
 }
 
-func newJSONFlag(name string, fallback ldvalue.Value) JSONFlag {
+func NewJSONFlag(name string, fallback ldvalue.Value) JSONFlag {
 	flag := JSONFlag{name: name, fallback: fallback}
 	builder := launchDarklyOfflineStore.Flag(flag.name).ValueForAll(fallback)
 	launchDarklyOfflineStore.Update(builder)
@@ -58,7 +67,7 @@ func newJSONFlag(name string, fallback ldvalue.Value) JSONFlag {
 	return flag
 }
 
-var CleanNFSCache = newJSONFlag("clean-nfs-cache", ldvalue.Null())
+var CleanNFSCache = NewJSONFlag("clean-nfs-cache", ldvalue.Null())
 
 // RateLimitConfigFlag provides per-team rate limit overrides.
 // JSON format:
@@ -69,7 +78,7 @@ var CleanNFSCache = newJSONFlag("clean-nfs-cache", ldvalue.Null())
 //	}
 //
 // When non-null, values override the code defaults. Target specific teams in LaunchDarkly.
-var RateLimitConfigFlag = newJSONFlag("rate-limit-config", ldvalue.Null())
+var RateLimitConfigFlag = NewJSONFlag("rate-limit-config", ldvalue.Null())
 
 type BoolFlag struct {
 	name     string
@@ -88,7 +97,7 @@ func (f BoolFlag) Fallback() bool {
 	return f.fallback
 }
 
-func newBoolFlag(name string, fallback bool) BoolFlag {
+func NewBoolFlag(name string, fallback bool) BoolFlag {
 	flag := BoolFlag{name: name, fallback: fallback}
 	builder := launchDarklyOfflineStore.Flag(flag.name).VariationForAll(fallback)
 	launchDarklyOfflineStore.Update(builder)
@@ -96,30 +105,171 @@ func newBoolFlag(name string, fallback bool) BoolFlag {
 	return flag
 }
 
+// OverrideBoolFlag forces a bool flag to a specific value in the offline store.
+// Only takes effect when LAUNCH_DARKLY_API_KEY is not set (i.e. dev/CLI tools).
+func OverrideBoolFlag(flag BoolFlag, value bool) {
+	builder := launchDarklyOfflineStore.Flag(flag.name).VariationForAll(value)
+	launchDarklyOfflineStore.Update(builder)
+}
+
+// OverrideJSONFlag forces a JSON flag to a specific value in the offline store.
+// Only takes effect when LAUNCH_DARKLY_API_KEY is not set (i.e. dev/CLI tools).
+func OverrideJSONFlag(flag JSONFlag, value ldvalue.Value) {
+	builder := launchDarklyOfflineStore.Flag(flag.name).ValueForAll(value)
+	launchDarklyOfflineStore.Update(builder)
+}
+
 var (
-	MetricsWriteFlag                    = newBoolFlag("sandbox-metrics-write", true)
-	MetricsReadFlag                     = newBoolFlag("sandbox-metrics-read", true)
-	SnapshotFeatureFlag                 = newBoolFlag("use-nfs-for-snapshots", env.IsDevelopment())
-	TemplateFeatureFlag                 = newBoolFlag("use-nfs-for-templates", env.IsDevelopment())
-	EnableWriteThroughCacheFlag         = newBoolFlag("write-to-cache-on-writes", false)
-	UseNFSCacheForBuildingTemplatesFlag = newBoolFlag("use-nfs-for-building-templates", env.IsDevelopment())
-	BestOfKCanFitFlag                   = newBoolFlag("best-of-k-can-fit", true)
-	BestOfKTooManyStartingFlag          = newBoolFlag("best-of-k-too-many-starting", false)
-	EdgeProvidedSandboxMetricsFlag      = newBoolFlag("edge-provided-sandbox-metrics", false)
-	CreateStorageCacheSpansFlag         = newBoolFlag("create-storage-cache-spans", env.IsDevelopment())
-	SandboxAutoResumeFlag               = newBoolFlag("sandbox-auto-resume", env.IsDevelopment())
-	SandboxCatalogLocalCacheFlag        = newBoolFlag("sandbox-catalog-local-cache", true)
+	SnapshotFeatureFlag                 = NewBoolFlag("use-nfs-for-snapshots", env.IsDevelopment())
+	TemplateFeatureFlag                 = NewBoolFlag("use-nfs-for-templates", env.IsDevelopment())
+	EnableWriteThroughCacheFlag         = NewBoolFlag("write-to-cache-on-writes", false)
+	UseNFSCacheForBuildingTemplatesFlag = NewBoolFlag("use-nfs-for-building-templates", env.IsDevelopment())
+	CreateStorageCacheSpansFlag         = NewBoolFlag("create-storage-cache-spans", env.IsDevelopment())
+	OrchAcceptsCombinedHostFlag         = NewBoolFlag("orch-accepts-combined-host", false)
+
+	// StorageSoftDeleteCheckFlag enables reading the storage-index soft-delete
+	// tombstone on header load (one extra GCS Attrs on cold load). Off = no overhead.
+	StorageSoftDeleteCheckFlag = NewBoolFlag("storage-soft-delete-check", false)
+	// StorageSoftDeleteEnforceFlag makes a soft-deleted object fail the read
+	// (fail closed) instead of only emitting a metric + log. Requires the check flag.
+	StorageSoftDeleteEnforceFlag = NewBoolFlag("storage-soft-delete-enforce", false)
+
+	// UseMemFdFlag asks Firecracker to back guest memory with a memfd and
+	// pass the fd over the UFFD socket; the orchestrator then mmaps it
+	// directly instead of using process_vm_readv on pause.
+	UseMemFdFlag = NewBoolFlag("use-memfd", true)
+
+	// MemfdBackgroundCopyFlag streams the memfd into the snapshot cache on
+	// a goroutine so Pause returns as soon as the diff metadata is written.
+	// Only takes effect when UseMemFdFlag is also on.
+	MemfdBackgroundCopyFlag = NewBoolFlag("memfd-background-copy", true)
+
+	// MemfileDiffDedupFlag enables 4 KiB-page dedup of the memfile diff
+	// against the base memfile. bestEffort skips uncached blocks; directIO
+	// opens the dedup output with O_DIRECT. The remaining keys budget fetch
+	// defragmentation of the deduped diff — fetchRunWindowPages is the
+	// uncompressed frame/window size served per backing fetch — see
+	// orchestrator block.DedupBudget for semantics (0 = disabled/default).
+	MemfileDiffDedupFlag = NewJSONFlag("memfile-diff-dedup", ldvalue.FromJSONMarshal(map[string]any{
+		"enabled":                        false,
+		"bestEffort":                     false,
+		"directIO":                       false,
+		"maxFetchWindowsPerBlock":        0,
+		"maxPromotedParentPagesPerBlock": 0,
+		"maxPagesPerPromotedFrame":       0,
+		"blockFaultPct":                  0,
+		"fetchRunWindowPages":            0,
+	}))
+
+	// MemfdDedupInflightServeFlag lets a resume that overlaps an in-flight
+	// memfile dedup serve dirty pages straight from the still-mapped memfd
+	// instead of blocking until dedup finishes. It gates both windows: serving
+	// via a provisional local header while dedup is still computing the deduped
+	// header, and serving during the dedup drain before the compacted diff is
+	// ready. Only affects the memfd-dedup path; off restores the prior
+	// wait-for-dedup behavior.
+	MemfdDedupInflightServeFlag = NewBoolFlag("memfd-dedup-inflight-serve", false)
 
 	// PeerToPeerChunkTransferFlag enables peer-to-peer chunk routing.
-	PeerToPeerChunkTransferFlag = newBoolFlag("peer-to-peer-chunk-transfer", false)
+	PeerToPeerChunkTransferFlag = NewBoolFlag("peer-to-peer-chunk-transfer", false)
 	// PeerToPeerAsyncCheckpointFlag makes Checkpoint upload fire-and-forget instead
 	// of synchronous. Only safe to enable after PeerToPeerChunkTransferFlag is ON.
-	PeerToPeerAsyncCheckpointFlag = newBoolFlag("peer-to-peer-async-checkpoint", false)
+	PeerToPeerAsyncCheckpointFlag = NewBoolFlag("peer-to-peer-async-checkpoint", false)
 
-	PersistentVolumesFlag           = newBoolFlag("can-use-persistent-volumes", env.IsDevelopment())
-	ExecutionMetricsOnWebhooksFlag  = newBoolFlag("execution-metrics-on-webhooks", false) // TODO: Remove NLT 20250315
-	SandboxLabelBasedSchedulingFlag = newBoolFlag("sandbox-label-based-scheduling", false)
+	PersistentVolumesFlag            = NewBoolFlag("can-use-persistent-volumes", env.IsDevelopment())
+	SandboxLabelBasedSchedulingFlag  = NewBoolFlag("sandbox-label-based-scheduling", false)
+	OptimisticResourceAccountingFlag = NewBoolFlag("sandbox-placement-optimistic-resource-accounting", false)
+	FreePageReportingFlag            = NewBoolFlag("free-page-reporting", false)
+	FreezeUserCgroupFlag             = NewBoolFlag("freeze-user-cgroup", env.IsDevelopment())
+	// CollapseEnvdHeapFlag makes the orchestrator ask envd to collapse its own
+	// anonymous heap into 2 MiB hugepages just before pause, reducing the number
+	// of distinct frames envd faults on resume. Off by default; rolled out via LD.
+	CollapseEnvdHeapFlag = NewBoolFlag("collapse-envd-heap", false)
+
+	// CollapseEnvdHeapTimeoutMsFlag bounds the pre-pause POST /collapse call, in
+	// milliseconds. Collapsing migrates envd's scattered heap pages into
+	// hugepages, which is heavier than the freeze sysfs write, so it gets a
+	// larger, independent budget. Collapse is best-effort: a cut-short run still
+	// helps, so this can be tuned per rollout without redeploying. The fallback
+	// (returned when LD is unavailable or the flag is unset) is the default.
+	CollapseEnvdHeapTimeoutMsFlag = NewIntFlag("collapse-envd-heap-timeout-ms", 10000) // 10s in milliseconds
+
+	// VolumeFallbackToUnmatchedNodesFlag allows volume operations to fall back to
+	// orchestrator nodes that don't advertise the volume's type label when every
+	// labeled node fails with a retryable error. This is a transitional flag for
+	// the volume-label migration: once every node is labeled, unlabeled nodes will
+	// fail 100% of the time, so this should be turned off and removed afterwards.
+	VolumeFallbackToUnmatchedNodesFlag = NewBoolFlag("volume-fallback-to-unmatched-nodes", true)
+
+	// SandboxVolumeLabelBasedSchedulingFlag enables filtering orchestrator nodes
+	// based on the volume types required by the sandbox. When enabled, labels
+	// like "persistent-volume-type=nfs" are added to the required node labels
+	// for sandbox placement.
+	SandboxVolumeLabelBasedSchedulingFlag = NewBoolFlag("sandbox-volume-label-based-scheduling", false)
+
+	NetworkTransformRulesFlag = NewBoolFlag("network-transform-rules", env.IsDevelopment())
+
+	BYOPProxyEnabledFlag = NewBoolFlag("byop-proxy-enabled", env.IsDevelopment())
+
+	// SandboxIamTokensFlag gates the sandbox IAM workload token configuration
+	// (iam.tokens) per team during beta.
+	SandboxIamTokensFlag = NewBoolFlag("enable-sandbox-iam-tokens", env.IsDevelopment())
+
+	// V4HeaderForUncompressedFlag forces the V4 header layout on uncompressed
+	// uploads. Independent of compress-config: it changes the header format,
+	// not whether data is compressed.
+	V4HeaderForUncompressedFlag = NewBoolFlag("v4-header-for-uncompressed", false)
+
+	// HeaderV5WriteFlag makes Pause emit V5 headers. When enabled it also
+	// supersedes V4HeaderForUncompressedFlag for uncompressed uploads.
+	HeaderV5WriteFlag = NewBoolFlag("header-v5-write", false)
+
+	// ResumeOriginNodeRemapFlag enables repointing a snapshot's origin_node_id to
+	// the fallback node a resume timed out on. The node's local cache is warming
+	// from the in-progress snapshot pull, so pinning the retry to it avoids
+	// re-pulling the snapshot onto yet another node.
+	ResumeOriginNodeRemapFlag = NewBoolFlag("resume-origin-node-remap", false)
+
+	// ExpirationIndexHealerFlag enables the API's Redis expiration index healer
+	// loop, which re-adds sandboxes missing from the global expiration ZSET
+	// (a missing member is never seen by the evictor and would live forever).
+	// Checked on every heal tick, so it can be toggled without a redeploy.
+	// On by default; acts as a kill switch if a heal pass misbehaves.
+	ExpirationIndexHealerFlag = NewBoolFlag("expiration-index-healer", true)
+
+	// DisableE2BAccessTokenProvisioningFlag stops POST /access-tokens from issuing
+	// new E2B access tokens (sk_e2b_) once enabled. E2B_ACCESS_TOKEN is deprecated
+	// in favor of E2B_API_KEY; the CLI now authenticates via Hydra JWTs. Off by
+	// default so issuance keeps working until the deprecation cutover.
+	DisableE2BAccessTokenProvisioningFlag = NewBoolFlag("disable-e2b-access-token-provisioning", false)
+
+	// DisableE2BAccessTokenAuthFlag stops the API and docker-reverse-proxy
+	// (V1 build docker login) from accepting E2B access tokens (sk_e2b_) for
+	// authentication once enabled. E2B_ACCESS_TOKEN is deprecated in favor of
+	// E2B_API_KEY; existing tokens stop working on the deprecation cutover
+	// (Aug 1, 2026). Off by default. Evaluated per-user so rejection can be
+	// rolled out gradually via LD targeting.
+	DisableE2BAccessTokenAuthFlag = NewBoolFlag("disable-e2b-access-token-auth", false)
+
+	// BuildEnsureFreeDiskSpace grows the rootfs after build steps and before finalize.
+	BuildEnsureFreeDiskSpace = NewBoolFlag("build-ensure-free-disk-space", false)
 )
+
+// envdTimeoutFallbackMs reads ENVD_TIMEOUT (Go duration string, e.g. "10s")
+// and returns milliseconds. Falls back to 10 000 ms when unset or unparseable.
+func envdTimeoutFallbackMs() int {
+	raw := os.Getenv("ENVD_TIMEOUT")
+	if raw == "" {
+		return 10_000
+	}
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 10_000
+	}
+
+	return int(d.Milliseconds())
+}
 
 type IntFlag struct {
 	name     string
@@ -138,7 +288,7 @@ func (f IntFlag) Fallback() int {
 	return f.fallback
 }
 
-func newIntFlag(name string, fallback int) IntFlag {
+func NewIntFlag(name string, fallback int) IntFlag {
 	flag := IntFlag{name: name, fallback: fallback}
 	builder := launchDarklyOfflineStore.Flag(flag.name).ValueForAll(ldvalue.Int(fallback))
 	launchDarklyOfflineStore.Update(builder)
@@ -147,60 +297,170 @@ func newIntFlag(name string, fallback int) IntFlag {
 }
 
 var (
-	MaxSandboxesPerNode           = newIntFlag("max-sandboxes-per-node", 200)
-	GcloudConcurrentUploadLimit   = newIntFlag("gcloud-concurrent-upload-limit", 8)
-	GcloudMaxTasks                = newIntFlag("gcloud-max-tasks", 16)
-	ClickhouseBatcherMaxBatchSize = newIntFlag("clickhouse-batcher-max-batch-size", 100)
-	ClickhouseBatcherMaxDelay     = newIntFlag("clickhouse-batcher-max-delay", 1000) // 1s in milliseconds
-	ClickhouseBatcherQueueSize    = newIntFlag("clickhouse-batcher-queue-size", 1000)
-	BestOfKSampleSize             = newIntFlag("best-of-k-sample-size", 3)                   // Default K=3
-	BestOfKMaxOvercommit          = newIntFlag("best-of-k-max-overcommit", 400)              // Default R=4 (stored as percentage, max over-commit ratio)
-	BestOfKAlpha                  = newIntFlag("best-of-k-alpha", 50)                        // Default Alpha=0.5 (stored as percentage for int flag, current usage weight)
-	EnvdInitTimeoutMilliseconds   = newIntFlag("envd-init-request-timeout-milliseconds", 50) // Timeout for envd init request in milliseconds
-	HostStatsSamplingInterval     = newIntFlag("host-stats-sampling-interval", 5000)         // Host stats sampling interval in milliseconds (default 5s)
-	MaxCacheWriterConcurrencyFlag = newIntFlag("max-cache-writer-concurrency", 10)
+	MaxSandboxesPerNode = NewIntFlag("max-sandboxes-per-node", 200)
+	// The LD keys keep the legacy "gcloud-" prefix, but the limits apply to uploads on all storage providers.
+	StorageConcurrentUploadLimit  = NewIntFlag("gcloud-concurrent-upload-limit", 8)
+	StorageMaxUploadTasks         = NewIntFlag("gcloud-max-tasks", 16)
+	ClickhouseBatcherMaxBatchSize = NewIntFlag("clickhouse-batcher-max-batch-size", 1000)
+	ClickhouseBatcherMaxDelay     = NewIntFlag("clickhouse-batcher-max-delay", 1000) // 1s in milliseconds
+	ClickhouseBatcherQueueSize    = NewIntFlag("clickhouse-batcher-queue-size", 1000)
+	BestOfKSampleSize             = NewIntFlag("best-of-k-sample-size", 3)                           // Default K=3
+	BestOfKMaxOvercommit          = NewIntFlag("best-of-k-max-overcommit", 400)                      // Default R=4 (stored as percentage, max over-commit ratio)
+	BestOfKAlpha                  = NewIntFlag("best-of-k-alpha", 50)                                // Default Alpha=0.5 (stored as percentage for int flag, current usage weight)
+	EnvdInitTimeoutMilliseconds   = NewIntFlag("envd-init-request-timeout-milliseconds", 50)         // Timeout for envd init request in milliseconds
+	EnvdTimeoutMilliseconds       = NewIntFlag("envd-timeout-milliseconds", envdTimeoutFallbackMs()) // Timeout for waiting for envd on resume; falls back to ENVD_TIMEOUT env var (default 10s)
+	// GuestSyncTimeoutMs overrides the mandatory pre-pause guest-sync deadline
+	// for filesystem-only snapshots, in milliseconds. 0 (default) derives the
+	// timeout from guest RAM; a positive value pins it.
+	GuestSyncTimeoutMs            = NewIntFlag("guest-sync-timeout-milliseconds", 0)
+	MaxCacheWriterConcurrencyFlag = NewIntFlag("max-cache-writer-concurrency", 10)
 
 	// BuildCacheMaxUsagePercentage the maximum percentage of the cache disk storage
 	// that can be used before the cache starts evicting items.
-	BuildCacheMaxUsagePercentage = newIntFlag("build-cache-max-usage-percentage", 85)
-	BuildProvisionVersion        = newIntFlag("build-provision-version", 0)
+	BuildCacheMaxUsagePercentage = NewIntFlag("build-cache-max-usage-percentage", 85)
+	BuildProvisionVersion        = NewIntFlag("build-provision-version", 0)
 
 	// NBDConnectionsPerDevice the number of NBD socket connections per device
-	NBDConnectionsPerDevice = newIntFlag("nbd-connections-per-device", 4)
+	NBDConnectionsPerDevice = NewIntFlag("nbd-connections-per-device", 1)
+
+	// NBDAsyncWriteZeroesFlag, when enabled, handles NBD WRITE_ZEROES/TRIM
+	// commands in a goroutine instead of inline on the dispatch read loop.
+	// Inline handling can stall the read loop via head-of-line blocking on the
+	// shared write lock (when a reply writer is blocked on a full socket send
+	// buffer), which makes the kernel time out the NBD connection and surfaces
+	// as guest I/O errors. Disabled by default.
+	NBDAsyncWriteZeroesFlag = NewBoolFlag("nbd-async-write-zeroes", false)
 
 	// MemoryPrefetchMaxFetchWorkers is the maximum number of parallel fetch workers per sandbox for memory prefetching.
 	// Fetching is I/O bound so we can have more parallelism.
-	MemoryPrefetchMaxFetchWorkers = newIntFlag("memory-prefetch-max-fetch-workers", 16)
+	MemoryPrefetchMaxFetchWorkers = NewIntFlag("memory-prefetch-max-fetch-workers", 16)
 
 	// MemoryPrefetchMaxCopyWorkers is the maximum number of parallel copy workers per sandbox for memory prefetching.
 	// Copy uses uffd syscalls, so we limit parallelism to avoid overwhelming the system.
-	MemoryPrefetchMaxCopyWorkers = newIntFlag("memory-prefetch-max-copy-workers", 8)
+	MemoryPrefetchMaxCopyWorkers = NewIntFlag("memory-prefetch-max-copy-workers", 8)
+
+	// PauseResumePrefetchHarvestFlag makes the orchestrator, after a pause
+	// snapshot is durable, run a throwaway warm resume of the just-written
+	// artifact (driven by envd /init, workload frozen, egress denied) to record
+	// the resume page-fault trace and turn it into a prefetch mapping. Off by
+	// default; the harvest is best-effort and never affects the pause result.
+	PauseResumePrefetchHarvestFlag = NewBoolFlag("pause-resume-prefetch-harvest", false)
+
+	// PauseResumePrefetchConsumeFlag controls whether a harvested mapping is
+	// persisted into the pause artifact metadata (and therefore replayed on the
+	// customer's next resume). When off, the harvest still runs and emits its
+	// trace-size metrics but does NOT write the mapping, so resumes are
+	// unaffected — letting us validate harvest behaviour with no customer-visible
+	// change before enabling prefetch on resume. Off by default.
+	PauseResumePrefetchConsumeFlag = NewBoolFlag("pause-resume-prefetch-consume", false)
+
+	// PauseResumePrefetchHarvestTimeoutMsFlag bounds the throwaway harvest resume
+	// (slot-hold cap), in milliseconds. The harvest is best-effort: a cut-short
+	// run is discarded (the build is simply re-harvested on its next pause), so
+	// erring short is cheap. A normal warm harvest completes in a few seconds; the
+	// default leaves headroom for a large warm resume to fully drain while keeping
+	// the worst-case slot hold modest. Tunable per rollout via LD; the fallback
+	// (returned when LD is unavailable or the flag is unset) is the default.
+	PauseResumePrefetchHarvestTimeoutMsFlag = NewIntFlag("pause-resume-prefetch-harvest-timeout-ms", 15000) // 15s
 
 	// TCPFirewallMaxConnectionsPerSandbox is the maximum number of concurrent TCP firewall
 	// connections allowed per sandbox. Negative means no limit.
-	TCPFirewallMaxConnectionsPerSandbox = newIntFlag("tcpfirewall-max-connections-per-sandbox", -1)
+	TCPFirewallMaxConnectionsPerSandbox = NewIntFlag("tcpfirewall-max-connections-per-sandbox", -1)
 
 	// SandboxMaxIncomingConnections is the maximum number of concurrent HTTP proxy
 	// connections allowed per sandbox. Negative means no limit.
-	SandboxMaxIncomingConnections = newIntFlag("sandbox-max-incoming-connections", -1)
+	SandboxMaxIncomingConnections = NewIntFlag("sandbox-max-incoming-connections", -1)
 
 	// BuildBaseRootfsSizeLimitMB is the maximum size of the base rootfs filesystem created from the OCI image, in MB.
-	BuildBaseRootfsSizeLimitMB = newIntFlag("build-base-rootfs-size-limit-mb", 25000)
+	BuildBaseRootfsSizeLimitMB = NewIntFlag("build-base-rootfs-size-limit-mb", 25000)
+
+	// MinAutoResumeTimeoutSeconds is the minimum auto-resume timeout in seconds.
+	// This prevents thrashing from very short timeouts.
+	MinAutoResumeTimeoutSeconds = NewIntFlag("minimum-autoresume-timeout", 300)
 
 	// BuildReservedDiskSpaceMB is the amount of disk space in MB reserved for root on the guest filesystem.
 	// Reserved blocks are only usable by root (uid 0), protecting the guest OS from disk-full conditions.
-	BuildReservedDiskSpaceMB = newIntFlag("build-reserved-disk-space-mb", 0)
+	BuildReservedDiskSpaceMB = NewIntFlag("build-reserved-disk-space-mb", 256)
+
+	// MaxStartingInstancesPerNode limits concurrent sandbox start/resume operations on a single orchestrator node.
+	// Must be > 0.
+	MaxStartingInstancesPerNode = NewIntFlag("max-starting-instances-per-node", 3)
+
+	// MaxConcurrentEvictions caps the number of sandbox evictions that can run
+	// in parallel per API instance. Excess items remain expired in the store
+	// and are picked up by the next eviction tick. Must be > 0; non-positive
+	// values are ignored at refresh time.
+	MaxConcurrentEvictions = NewIntFlag("max-concurrent-evictions", 256)
 
 	// MaxConcurrentSnapshotUpserts limits concurrent UpsertSnapshot calls (pause + snapshot template paths).
 	// 0 or negative disables throttling (unlimited concurrency).
-	MaxConcurrentSnapshotUpserts = newIntFlag("max-concurrent-snapshot-upserts", 0)
+	MaxConcurrentSnapshotUpserts = NewIntFlag("max-concurrent-snapshot-upserts", 0)
 	// MaxConcurrentSandboxListQueries limits concurrent GetSnapshotsWithCursor calls in the sandbox list path.
 	// 0 or negative disables throttling (unlimited concurrency).
-	MaxConcurrentSandboxListQueries = newIntFlag("max-concurrent-sandbox-list-queries", 0)
+	MaxConcurrentSandboxListQueries = NewIntFlag("max-concurrent-sandbox-list-queries", 0)
 	// MaxConcurrentSnapshotBuildQueries limits concurrent GetSnapshotBuilds calls (e.g. sandbox delete).
 	// 0 or negative disables throttling (unlimited concurrency).
-	MaxConcurrentSnapshotBuildQueries = newIntFlag("max-concurrent-snapshot-build-queries", 0)
+	MaxConcurrentSnapshotBuildQueries = NewIntFlag("max-concurrent-snapshot-build-queries", 0)
+
+	MinChunkerReadSizeKB = NewIntFlag("min-chunker-read-size-kb", 16)
+
+	// MaxParallelBuildReadSegments limits concurrent backing reads within one fragmented build read.
+	// 1 or lower keeps the existing serial path.
+	MaxParallelBuildReadSegments = NewIntFlag("max-parallel-build-read-segments", 1)
 )
+
+// ReclaimConfigFlag holds per-step caps in milliseconds for the pre-pause
+// reclaim chain. Missing/zero/negative values disable the step.
+// Example: {"sync":500,"drop_caches":200,"compact_memory":1000,"fstrim":500}
+var ReclaimConfigFlag = NewJSONFlag("guest-pause-reclaim", ldvalue.Null())
+
+// FreePageHintingConfig controls virtio-balloon free-page-hinting.
+// "enabled" configures FreePageHinting=true on the balloon at install time
+// (kernel-side eligibility is targeted separately via the LD context — the
+// race fixed in https://lore.kernel.org/lkml/20240429125100.7393-1-david@redhat.com/
+// is on the hinting flow, gated by the per-use-case timeouts below).
+// "pause"/"build" are pre-pause drain timeouts in ms keyed by SnapshotUseCase;
+// missing/zero/negative disables the drain for that use case.
+// Example: {"enabled": true, "pause": 500, "build": 0}
+var FreePageHintingConfig = NewJSONFlag("free-page-hinting-config", ldvalue.Null())
+
+// IsFreePageHintingEnabled reports whether FPH should be configured on the
+// balloon at install time.
+func IsFreePageHintingEnabled(ctx context.Context, ff *Client, contexts ...ldcontext.Context) bool {
+	return ff.JSONFlag(ctx, FreePageHintingConfig, contexts...).GetByKey("enabled").BoolValue()
+}
+
+// GetFreePageHintingTimeout returns the pre-pause FPH drain timeout for the
+// given SnapshotUseCase. Zero means disabled.
+func GetFreePageHintingTimeout(ctx context.Context, ff *Client, useCase string, contexts ...ldcontext.Context) time.Duration {
+	ms := ff.JSONFlag(ctx, FreePageHintingConfig, contexts...).GetByKey(useCase).IntValue()
+	if ms <= 0 {
+		return 0
+	}
+
+	return time.Duration(ms) * time.Millisecond
+}
+
+type ReclaimConfig struct {
+	Sync          time.Duration
+	DropCaches    time.Duration
+	CompactMemory time.Duration
+	Fstrim        time.Duration
+}
+
+func GetReclaimConfig(ctx context.Context, ff *Client, contexts ...ldcontext.Context) ReclaimConfig {
+	v := ff.JSONFlag(ctx, ReclaimConfigFlag, contexts...)
+	ms := func(key string) time.Duration {
+		return time.Duration(v.GetByKey(key).IntValue()) * time.Millisecond
+	}
+
+	return ReclaimConfig{
+		Sync:          ms("sync"),
+		DropCaches:    ms("drop_caches"),
+		CompactMemory: ms("compact_memory"),
+		Fstrim:        ms("fstrim"),
+	}
+}
 
 type StringFlag struct {
 	name     string
@@ -219,7 +479,7 @@ func (f StringFlag) Fallback() string {
 	return f.fallback
 }
 
-func newStringFlag(name string, fallback string) StringFlag {
+func NewStringFlag(name string, fallback string) StringFlag {
 	flag := StringFlag{name: name, fallback: fallback}
 	builder := launchDarklyOfflineStore.Flag(flag.name).ValueForAll(ldvalue.String(fallback))
 	launchDarklyOfflineStore.Update(builder)
@@ -227,7 +487,6 @@ func newStringFlag(name string, fallback string) StringFlag {
 	return flag
 }
 
-// This is currently not configurable via feature flags.
 const (
 	DefaultKernelVersion = "vmlinux-6.1.158"
 )
@@ -235,27 +494,316 @@ const (
 // The Firecracker version the last tag + the short SHA (so we can build our dev previews)
 // TODO: The short tag here has only 7 characters — the one from our build pipeline will likely have exactly 8 so this will break.
 const (
-	DefaultFirecackerV1_10Version = "v1.10.1_30cbb07"
-	DefaultFirecackerV1_12Version = "v1.12.1_a41d3fb"
-	DefaultFirecrackerVersion     = DefaultFirecackerV1_12Version
+	DefaultFirecrackerV1_10Version = "v1.10.1_30cbb07"
+	DefaultFirecrackerV1_12Version = "v1.12.1_210cbac"
+	DefaultFirecrackerV1_14Version = "v1.14.1_431f1fc"
+	DefaultFirecrackerVersion      = DefaultFirecrackerV1_14Version
 )
 
 var FirecrackerVersionMap = map[string]string{
-	"v1.10": DefaultFirecackerV1_10Version,
-	"v1.12": DefaultFirecackerV1_12Version,
+	"v1.10": DefaultFirecrackerV1_10Version,
+	"v1.12": DefaultFirecrackerV1_12Version,
+	"v1.14": DefaultFirecrackerV1_14Version,
 }
 
 // BuildIoEngine Sync is used by default as there seems to be a bad interaction between Async and a lot of io operations.
 var (
-	BuildFirecrackerVersion     = newStringFlag("build-firecracker-version", env.GetEnv("DEFAULT_FIRECRACKER_VERSION", DefaultFirecrackerVersion))
-	BuildIoEngine               = newStringFlag("build-io-engine", "Sync")
-	DefaultPersistentVolumeType = newStringFlag("default-persistent-volume-type", "")
-	BuildNodeInfo               = newJSONFlag("preferred-build-node", ldvalue.Null())
-	FirecrackerVersions         = newJSONFlag("firecracker-versions", ldvalue.FromJSONMarshal(FirecrackerVersionMap))
+	BuildFirecrackerVersion     = NewStringFlag("build-firecracker-version", env.GetEnv("DEFAULT_FIRECRACKER_VERSION", DefaultFirecrackerVersion))
+	BuildKernelVersion          = NewStringFlag("build-kernel-version", env.GetEnv("DEFAULT_KERNEL_VERSION", DefaultKernelVersion))
+	BuildIoEngine               = NewStringFlag("build-io-engine", "Sync")
+	DefaultPersistentVolumeType = NewStringFlag("default-persistent-volume-type", "")
+	BuildNodeInfo               = NewJSONFlag("preferred-build-node", ldvalue.Null())
+	FirecrackerVersions         = NewJSONFlag("firecracker-versions", ldvalue.FromJSONMarshal(FirecrackerVersionMap))
+
+	// ClickhouseReadEndpointFlag selects which ClickHouse DSN to use for reads.
+	// "" (empty) → singular CLICKHOUSE_CONNECTION_STRING (self-managed default).
+	// "0", "1", ... → index into CLICKHOUSE_CONNECTION_STRINGS
+	ClickhouseReadEndpointFlag = NewStringFlag("clickhouse-read-endpoint", "")
+
+	// ClickhouseWriteFanoutFlag: when false, drop writes to alternate
+	// ClickHouse endpoints (CLICKHOUSE_CONNECTION_STRINGS). Default DSN
+	// is unaffected.
+	ClickhouseWriteFanoutFlag = NewBoolFlag("clickhouse-write-fanout", false)
 )
 
+// LogsWriteConfigFlag controls where sandbox/external logs are written, so
+// operators can retarget log destinations from LaunchDarkly without a redeploy.
+//
+// Shape:
+//
+//	{
+//	  "mode": "primary_only" | "primary_and_shadow",
+//	  "primary_url": "http://localhost:30006",
+//	  "shadow_urls": ["http://localhost:4321/logs"],
+//	  "timeout_ms": 2000,
+//	  "max_inflight_shadow_writes": 1024
+//	}
+//
+// Semantics:
+//   - null/missing/invalid  -> fall back to the legacy collector address only.
+//   - "primary_only"        -> write to primary_url only.
+//   - "primary_and_shadow"  -> write to primary_url; fire-and-forget shadow_urls
+//     (shadow failures never affect the primary result).
+//   - Empty primary_url in a non-disabled mode is invalid -> legacy fallback.
+//   - shadow_urls must be an array of <= maxLogWriteShadowURLs safe string URLs.
+//   - timeout_ms <= 0 or too large is clamped to a safe range.
+//   - max_inflight_shadow_writes <= 0 defaults to defaultMaxInflightShadowWrites.
+//   - Only http URLs pointing at local/private hosts or allowed internal DNS
+//     suffixes are allowed; anything else is rejected and the whole config falls
+//     back to legacy.
+//
+// The fallback collector address is a runtime env value the flag cannot know,
+// so the default is Null() and the code substitutes the legacy address.
+var LogsWriteConfigFlag = NewJSONFlag("logs-write-config", ldvalue.Null())
+
+// LogsReadConfigFlag selects the backend used to read sandbox/build logs.
+// false (default) reads from Loki (unchanged behavior); true reads from the
+// ClickHouse sandbox_logs table.
+var LogsReadConfigFlag = NewBoolFlag("logs-read-config", false)
+
+// Log write routing modes for LogsWriteConfigFlag.
+const (
+	LogsWriteModePrimaryOnly      = "primary_only"
+	LogsWriteModePrimaryAndShadow = "primary_and_shadow"
+)
+
+const (
+	// defaultLogWriteTimeout is used when timeout_ms is missing/invalid.
+	defaultLogWriteTimeout = 2000 * time.Millisecond
+	// maxLogWriteTimeout caps operator-provided timeouts.
+	maxLogWriteTimeout = 10000 * time.Millisecond
+	// maxLogWriteShadowURLs caps fanout configured from LaunchDarkly.
+	maxLogWriteShadowURLs = 4
+	// defaultMaxInflightShadowWrites is used when max_inflight_shadow_writes is missing/invalid.
+	defaultMaxInflightShadowWrites = 1024
+)
+
+var (
+	logRoutingMeter                = otel.Meter("github.com/e2b-dev/infra/packages/shared/pkg/featureflags")
+	logWriteConfigResolutionMetric = mustLogRoutingCounter(
+		"log_write_config_resolution_count",
+		"Number of logs-write-config resolutions by outcome and fallback reason",
+	)
+)
+
+func mustLogRoutingCounter(name, description string) metric.Int64Counter {
+	counter, err := logRoutingMeter.Int64Counter(name, metric.WithDescription(description))
+	if err != nil {
+		return nil
+	}
+
+	return counter
+}
+
+// LogWriteConfig is the resolved, validated log write routing configuration.
+// The zero value (PrimaryURL set by the resolver) preserves legacy behavior.
+type LogWriteConfig struct {
+	// PrimaryURL is the synchronous, success-controlling destination.
+	PrimaryURL string
+	// ShadowURLs are best-effort, fire-and-forget destinations.
+	ShadowURLs []string
+	// Timeout bounds each individual log write request.
+	Timeout time.Duration
+	// MaxInflightShadowWrites bounds concurrent best-effort shadow writes.
+	MaxInflightShadowWrites int64
+}
+
+// ResolveLogWriteConfig reads LogsWriteConfigFlag and returns a validated
+// LogWriteConfig. On any missing/malformed/unsafe input it falls back to
+// writing only to fallbackURL (today's behavior).
+func ResolveLogWriteConfig(ctx context.Context, ff *Client, fallbackURL string, contexts ...ldcontext.Context) LogWriteConfig {
+	// The legacy fallback (flag null/invalid) preserves pre-flag behavior: it
+	// leaves Timeout at 0 so callers skip the per-request WithTimeout and rely
+	// solely on the HTTP client's own timeout, exactly as before this flag
+	// existed. defaultLogWriteTimeout only applies to explicitly-configured
+	// flags with a missing/invalid timeout_ms.
+	legacy := LogWriteConfig{
+		PrimaryURL:              strings.TrimSpace(fallbackURL),
+		Timeout:                 0,
+		MaxInflightShadowWrites: defaultMaxInflightShadowWrites,
+	}
+
+	if ff == nil {
+		recordLogWriteConfigResolution(ctx, "legacy", "nil_client", "")
+
+		return legacy
+	}
+
+	value := ff.JSONFlag(ctx, LogsWriteConfigFlag, contexts...)
+	if value.IsNull() {
+		recordLogWriteConfigResolution(ctx, "legacy", "null", "")
+
+		return legacy
+	}
+	if value.Type() != ldvalue.ObjectType {
+		recordLogWriteConfigResolution(ctx, "legacy", "non_object", "")
+
+		return legacy
+	}
+
+	modeValue := value.GetByKey("mode")
+	if modeValue.Type() != ldvalue.StringType {
+		recordLogWriteConfigResolution(ctx, "legacy", "mode_not_string", "")
+
+		return legacy
+	}
+	mode := strings.TrimSpace(modeValue.StringValue())
+	switch mode {
+	case LogsWriteModePrimaryOnly, LogsWriteModePrimaryAndShadow:
+		// handled below
+	default:
+		// unknown/missing mode -> legacy fallback
+		recordLogWriteConfigResolution(ctx, "legacy", "unknown_mode", mode)
+
+		return legacy
+	}
+
+	primaryValue := value.GetByKey("primary_url")
+	if primaryValue.Type() != ldvalue.StringType {
+		recordLogWriteConfigResolution(ctx, "legacy", "primary_not_string", mode)
+
+		return legacy
+	}
+	primary := strings.TrimSpace(primaryValue.StringValue())
+	if !isSafeLogURL(primary) {
+		recordLogWriteConfigResolution(ctx, "legacy", "unsafe_primary", mode)
+
+		return legacy
+	}
+
+	var shadows []string
+	if mode == LogsWriteModePrimaryAndShadow {
+		raw := value.GetByKey("shadow_urls")
+		if !raw.IsNull() {
+			if raw.Type() != ldvalue.ArrayType {
+				recordLogWriteConfigResolution(ctx, "legacy", "shadow_not_array", mode)
+
+				return legacy
+			}
+			if raw.Count() > maxLogWriteShadowURLs {
+				recordLogWriteConfigResolution(ctx, "legacy", "too_many_shadows", mode)
+
+				return legacy
+			}
+
+			seen := map[string]struct{}{primary: {}}
+			for i := range raw.Count() {
+				item := raw.GetByIndex(i)
+				if item.Type() != ldvalue.StringType {
+					recordLogWriteConfigResolution(ctx, "legacy", "shadow_not_string", mode)
+
+					return legacy
+				}
+				u := strings.TrimSpace(item.StringValue())
+				// An unsafe shadow URL invalidates the whole config: fail safe to
+				// legacy rather than silently exfiltrating to an external host.
+				if !isSafeLogURL(u) {
+					recordLogWriteConfigResolution(ctx, "legacy", "unsafe_shadow", mode)
+
+					return legacy
+				}
+				if _, ok := seen[u]; ok {
+					continue
+				}
+				seen[u] = struct{}{}
+				shadows = append(shadows, u)
+			}
+		}
+	}
+
+	recordLogWriteConfigResolution(ctx, "configured", "", mode)
+
+	return LogWriteConfig{
+		PrimaryURL:              primary,
+		ShadowURLs:              shadows,
+		Timeout:                 clampLogWriteTimeout(value),
+		MaxInflightShadowWrites: clampMaxInflightShadowWrites(value),
+	}
+}
+
+func recordLogWriteConfigResolution(ctx context.Context, outcome, reason, mode string) {
+	if logWriteConfigResolutionMetric == nil {
+		return
+	}
+
+	logWriteConfigResolutionMetric.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", outcome),
+		attribute.String("reason", reason),
+		attribute.String("mode", mode),
+	))
+}
+
+// clampLogWriteTimeout reads timeout_ms and clamps it to a safe range.
+func clampLogWriteTimeout(value ldvalue.Value) time.Duration {
+	ms := value.GetByKey("timeout_ms").IntValue()
+	if ms <= 0 {
+		return defaultLogWriteTimeout
+	}
+
+	d := time.Duration(ms) * time.Millisecond
+	if d > maxLogWriteTimeout {
+		return maxLogWriteTimeout
+	}
+
+	return d
+}
+
+func clampMaxInflightShadowWrites(value ldvalue.Value) int64 {
+	maxInflight := value.GetByKey("max_inflight_shadow_writes").IntValue()
+	if maxInflight <= 0 {
+		return defaultMaxInflightShadowWrites
+	}
+
+	return int64(maxInflight)
+}
+
+var allowedLogHostSuffixes = []string{
+	".service.consul",
+	".consul",
+	".svc.cluster.local",
+	".svc",
+	".local",
+	".internal",
+}
+
+// isSafeLogURL allows only http URLs pointing at loopback, link-local, private
+// IPs, or internal service-discovery DNS suffixes. This keeps log routing on
+// local/private infrastructure and prevents exfiltration to arbitrary external
+// endpoints via the flag.
+func isSafeLogURL(raw string) bool {
+	if raw == "" {
+		return false
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.Host == "" {
+		return false
+	}
+
+	host := u.Hostname()
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+
+	hostLower := strings.ToLower(host)
+	for _, suffix := range allowedLogHostSuffixes {
+		if strings.HasSuffix(hostLower, suffix) {
+			return true
+		}
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Non-IP host without an explicitly allowed internal suffix -> reject.
+		return false
+	}
+
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
 // ResolveFirecrackerVersion resolves the firecracker version using the FirecrackerVersions feature flag.
-// The buildVersion format is "v1.12.1_a41d3fb" — we extract "v1.12" as the lookup key.
+// The buildVersion format is "v1.12.1_210cbac" — we extract "v1.12" as the lookup key.
 func ResolveFirecrackerVersion(ctx context.Context, ff *Client, buildVersion string) string {
 	parts := strings.Split(buildVersion, "_")
 	if len(parts) < 2 {
@@ -291,7 +839,7 @@ var defaultTrackedTemplates = map[string]bool{
 // should be tracked in sandbox start time metrics. Templates not in this list
 // will be grouped under "other" to reduce metric cardinality.
 // JSON format: {"base": true, "code-interpreter-v1": true, ...}
-var TrackedTemplatesForMetrics = newJSONFlag("tracked-templates-for-metrics", ldvalue.FromJSONMarshal(defaultTrackedTemplates))
+var TrackedTemplatesForMetrics = NewJSONFlag("tracked-templates-for-metrics", ldvalue.FromJSONMarshal(defaultTrackedTemplates))
 
 // GetTrackedTemplatesSet fetches the TrackedTemplatesForMetrics flag and returns it as a set for efficient lookup.
 // Only keys with a truthy value are included; keys set to false are ignored.
@@ -309,17 +857,18 @@ func GetTrackedTemplatesSet(ctx context.Context, ff *Client) map[string]struct{}
 	return result
 }
 
-// ChunkerConfigFlag is a JSON flag controlling the chunker implementation and tuning.
-//
-// NOTE: Changing useStreaming has no effect on chunkers already created for
-// cached templates. A service restart (redeploy) is required for that change
-// to take effect. minReadBatchSizeKB is checked just-in-time on each fetch,
-// so it takes effect immediately.
-//
-// JSON format: {"useStreaming": false, "minReadBatchSizeKB": 16}
-var ChunkerConfigFlag = newJSONFlag("chunker-config", ldvalue.FromJSONMarshal(map[string]any{
-	"useStreaming":       false,
-	"minReadBatchSizeKB": 16,
+// CompressConfigFlag controls compression during template builds.
+// When compressBuilds is true, builds upload exclusively compressed data
+// (no uncompressed fallback). When false, exclusively uncompressed with V3
+// headers (unless V4HeaderForUncompressedFlag is set).
+var CompressConfigFlag = NewJSONFlag("compress-config", ldvalue.FromJSONMarshal(map[string]any{
+	"compressBuilds":     false,
+	"compressionType":    "",
+	"compressionLevel":   0,
+	"frameSizeKB":        0,
+	"minPartSizeMB":      0,
+	"frameEncodeWorkers": 0,
+	"encoderConcurrency": 0,
 }))
 
 // TCPFirewallEgressThrottleConfig controls per-sandbox egress throttling via Firecracker's
@@ -329,7 +878,7 @@ var ChunkerConfigFlag = newJSONFlag("chunker-config", ldvalue.FromJSONMarshal(ma
 //
 // Ops bucket (packets):    effective rate = ops.bucketSize * 1000 / ops.refillTimeMs ops/s.
 // Bandwidth bucket (bytes): effective rate = bandwidth.bucketSize * 1000 / bandwidth.refillTimeMs bytes/s.
-var TCPFirewallEgressThrottleConfig = newJSONFlag("tcpfirewall-egress-throttle-config", ldvalue.FromJSONMarshal(map[string]any{
+var TCPFirewallEgressThrottleConfig = NewJSONFlag("tcpfirewall-egress-throttle-config", ldvalue.FromJSONMarshal(map[string]any{
 	"ops":       map[string]any{"bucketSize": -1, "oneTimeBurst": 0, "refillTimeMs": 1000},
 	"bandwidth": map[string]any{"bucketSize": -1, "oneTimeBurst": 0, "refillTimeMs": 1000},
 }))
@@ -348,10 +897,8 @@ type TCPFirewallEgressThrottleConfigValue struct {
 	Bandwidth TokenBucketConfig
 }
 
-// GetTCPFirewallEgressThrottleConfig fetches and parses the TCPFirewallEgressThrottleConfig flag.
-func GetTCPFirewallEgressThrottleConfig(ctx context.Context, ff *Client) TCPFirewallEgressThrottleConfigValue {
-	value := ff.JSONFlag(ctx, TCPFirewallEgressThrottleConfig)
-
+// parseThrottleBuckets parses "ops" and "bandwidth" token bucket configs from a JSON flag value.
+func parseThrottleBuckets(value ldvalue.Value) (ops, bandwidth TokenBucketConfig) {
 	parseBucket := func(key string) TokenBucketConfig {
 		b := value.GetByKey(key)
 		if b.IsNull() {
@@ -371,8 +918,45 @@ func GetTCPFirewallEgressThrottleConfig(ctx context.Context, ff *Client) TCPFire
 		}
 	}
 
+	return parseBucket("ops"), parseBucket("bandwidth")
+}
+
+// GetTCPFirewallEgressThrottleConfig fetches and parses the TCPFirewallEgressThrottleConfig flag.
+func GetTCPFirewallEgressThrottleConfig(ctx context.Context, ff *Client) TCPFirewallEgressThrottleConfigValue {
+	value := ff.JSONFlag(ctx, TCPFirewallEgressThrottleConfig)
+	ops, bw := parseThrottleBuckets(value)
+
 	return TCPFirewallEgressThrottleConfigValue{
-		Ops:       parseBucket("ops"),
-		Bandwidth: parseBucket("bandwidth"),
+		Ops:       ops,
+		Bandwidth: bw,
+	}
+}
+
+// BlockDriveThrottleConfig controls per-sandbox block device (disk) throttling via Firecracker's
+// VMM-level token bucket rate limiters on the rootfs drive.
+// Structure mirrors the Firecracker RateLimiter API: two independent token buckets.
+// Set bucketSize to -1 to disable a bucket.
+//
+// Ops bucket (IOPS):       effective rate = ops.bucketSize * 1000 / ops.refillTimeMs ops/s.
+// Bandwidth bucket (bytes): effective rate = bandwidth.bucketSize * 1000 / bandwidth.refillTimeMs bytes/s.
+var BlockDriveThrottleConfig = NewJSONFlag("block-drive-throttle-config", ldvalue.FromJSONMarshal(map[string]any{
+	"ops":       map[string]any{"bucketSize": -1, "oneTimeBurst": 0, "refillTimeMs": 1000},
+	"bandwidth": map[string]any{"bucketSize": -1, "oneTimeBurst": 0, "refillTimeMs": 1000},
+}))
+
+// BlockDriveThrottleConfigValue holds the parsed values of BlockDriveThrottleConfig.
+type BlockDriveThrottleConfigValue struct {
+	Ops       TokenBucketConfig
+	Bandwidth TokenBucketConfig
+}
+
+// GetBlockDriveThrottleConfig fetches and parses the BlockDriveThrottleConfig flag.
+func GetBlockDriveThrottleConfig(ctx context.Context, ff *Client) BlockDriveThrottleConfigValue {
+	value := ff.JSONFlag(ctx, BlockDriveThrottleConfig)
+	ops, bw := parseThrottleBuckets(value)
+
+	return BlockDriveThrottleConfigValue{
+		Ops:       ops,
+		Bandwidth: bw,
 	}
 }

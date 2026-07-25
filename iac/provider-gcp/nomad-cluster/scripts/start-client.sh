@@ -127,6 +127,10 @@ net.ipv4.tcp_max_syn_backlog = 65535
 # Increase the maximum number of memory map areas
 vm.max_map_count=1048576
 
+# Allow larger host writeback bursts before dirty-page throttling.
+vm.dirty_background_ratio=20
+vm.dirty_ratio=40
+
 EOF
 sysctl -p
 
@@ -177,6 +181,11 @@ gcsfuse -o=allow_other,ro --file-mode 755 --config-file $fuse_config --implicit-
 fc_versions_dir="/fc-versions"
 mkdir -p $fc_versions_dir
 gcsfuse -o=allow_other,ro --file-mode 755 --config-file $fuse_config --implicit-dirs "${FC_VERSIONS_BUCKET_NAME}" $fc_versions_dir
+
+# Mount busybox
+busybox_dir="/fc-busybox"
+mkdir -p $busybox_dir
+gcsfuse -o=allow_other,ro --file-mode 755 --config-file $fuse_config --implicit-dirs "${FC_BUSYBOX_BUCKET_NAME}" $busybox_dir
 
 # These variables are passed in via Terraform template interpolation
 gsutil cp "gs://${SCRIPTS_BUCKET}/run-consul-${RUN_CONSUL_FILE_HASH}.sh" /opt/consul/bin/run-consul.sh

@@ -1,3 +1,5 @@
+//go:build linux
+
 package nbd
 
 import (
@@ -20,11 +22,10 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-// maxSlotsReady is the number of slots that are ready to be used.
 const (
-	maxSlotsReady                 = 64
 	waitOnNBDError                = 50 * time.Millisecond
 	devicePoolCloseReleaseTimeout = 10 * time.Minute
+	sysBlockDir                   = "/sys/block"
 )
 
 var (
@@ -82,7 +83,11 @@ type DevicePool struct {
 	slots chan DeviceSlot
 }
 
-func NewDevicePool() (*DevicePool, error) {
+func NewDevicePool(maxSlotsReady int) (*DevicePool, error) {
+	if maxSlotsReady <= 0 {
+		return nil, fmt.Errorf("maxSlotsReady must be > 0, got %d", maxSlotsReady)
+	}
+
 	maxDevices, err := getMaxDevices()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get max devices: %w", err)
@@ -95,7 +100,7 @@ func NewDevicePool() (*DevicePool, error) {
 	pool := &DevicePool{
 		done:      make(chan struct{}),
 		usedSlots: bitset.New(maxDevices),
-		slots:     make(chan DeviceSlot, int(math.Min(maxSlotsReady, float64(maxDevices)))),
+		slots:     make(chan DeviceSlot, int(math.Min(float64(maxSlotsReady), float64(maxDevices)))),
 	}
 
 	return pool, nil
@@ -120,6 +125,43 @@ func getMaxDevices() (uint, error) {
 	}
 
 	return uint(maxDevices), nil
+}
+
+func ConnectedDevices() ([]DeviceSlot, error) {
+	maxDevices, err := getMaxDevices()
+	if err != nil {
+		return nil, err
+	}
+
+	devices := make([]DeviceSlot, 0)
+	for slot := DeviceSlot(0); slot < DeviceSlot(maxDevices); slot++ {
+		connected, err := isDeviceConnectedIn(sysBlockDir, slot)
+		if err != nil {
+			return nil, err
+		}
+		if connected {
+			devices = append(devices, slot)
+		}
+	}
+
+	return devices, nil
+}
+
+func IsDeviceConnected(slot DeviceSlot) (bool, error) {
+	return isDeviceConnectedIn(sysBlockDir, slot)
+}
+
+func isDeviceConnectedIn(blockDir string, slot DeviceSlot) (bool, error) {
+	pidFile := fmt.Sprintf("%s/nbd%d/pid", blockDir, slot)
+	_, err := os.Stat(pidFile)
+	if err == nil {
+		return true, nil
+	}
+	if !os.IsNotExist(err) {
+		return false, fmt.Errorf("failed to stat pid file: %w", err)
+	}
+
+	return false, nil
 }
 
 func (d *DevicePool) Populate(ctx context.Context) {
@@ -174,18 +216,13 @@ func (d *DevicePool) Populate(ctx context.Context) {
 // https://superuser.com/questions/919895/how-to-get-a-list-of-connected-nbd-devices-on-ubuntu
 // https://github.com/NetworkBlockDevice/nbd/blob/17043b068f4323078637314258158aebbfff0a6c/nbd-client.c#L254
 func (d *DevicePool) isDeviceFree(slot DeviceSlot) (bool, error) {
-	// Continue only if the file doesn't exist.
-	pidFile := fmt.Sprintf("/sys/block/nbd%d/pid", slot)
-
-	_, err := os.Stat(pidFile)
-	if err == nil {
+	connected, err := isDeviceConnectedIn(sysBlockDir, slot)
+	if err != nil {
+		return false, err
+	}
+	if connected {
 		// File is present, therefore the device is in use.
 		return false, nil
-	}
-
-	if !os.IsNotExist(err) {
-		// Some other error occurred.
-		return false, fmt.Errorf("failed to stat pid file: %w", err)
 	}
 
 	sizeFile := fmt.Sprintf("/sys/block/nbd%d/size", slot)

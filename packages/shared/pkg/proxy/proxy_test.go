@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -22,7 +23,6 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/connlimit"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/pool"
-	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 // testBackend represents a test backend server
@@ -40,6 +40,8 @@ func (b *testBackend) RequestCount() uint64 {
 }
 
 const bodyWriteDelayHeader = "body-write-delay"
+
+var testHTTPClients sync.Map
 
 // newTestBackend creates a new test backend server
 func newTestBackend(listener net.Listener, id string) (*testBackend, error) {
@@ -276,6 +278,66 @@ func TestProxyResumePermissionDeniedErrorTemplate(t *testing.T) {
 	})
 }
 
+func TestProxySandboxStillTransitioningErrorTemplate(t *testing.T) {
+	t.Parallel()
+
+	getDestination := func(*http.Request) (*pool.Destination, error) {
+		return nil, NewErrSandboxStillTransitioning("test-sandbox")
+	}
+
+	proxy, port, err := newTestProxy(t, getDestination)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		proxy.Close()
+	})
+
+	t.Run("json for non-browser", func(t *testing.T) {
+		t.Parallel()
+		proxyURL := fmt.Sprintf("http://127.0.0.1:%d/hello", port)
+		resp, err := httpGet(t, proxyURL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = resp.Body.Close()
+		})
+
+		require.Equal(t, http.StatusConflict, resp.StatusCode)
+		require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+
+		var response struct {
+			SandboxID string `json:"sandboxId"`
+			Message   string `json:"message"`
+			Code      int    `json:"code"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&response)
+		require.NoError(t, err)
+		require.Equal(t, "test-sandbox", response.SandboxID)
+		require.Equal(t, "The sandbox is still transitioning. Try again in a moment.", response.Message)
+		require.Equal(t, http.StatusConflict, response.Code)
+	})
+
+	t.Run("html for browser", func(t *testing.T) {
+		t.Parallel()
+		proxyURL := fmt.Sprintf("http://127.0.0.1:%d/hello", port)
+		headers := http.Header{
+			"User-Agent": {"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+		}
+
+		resp, err := httpGetWithHeaders(t, proxyURL, headers)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = resp.Body.Close()
+		})
+
+		require.Equal(t, http.StatusConflict, resp.StatusCode)
+		require.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Contains(t, string(body), "Sandbox Still Transitioning")
+		assert.Contains(t, string(body), "test-sandbox")
+	})
+}
+
 func TestProxyTeamSandboxLimitError(t *testing.T) {
 	t.Parallel()
 
@@ -360,12 +422,29 @@ func httpGetWithHeaders(t *testing.T, proxyURL string, headers http.Header) (*ht
 		}
 	}
 
-	rsp, err := (&http.Client{}).Do(req)
+	rsp, err := testHTTPClient(t).Do(req)
 	if err != nil {
 		return nil, err
 	}
 
 	return rsp, nil
+}
+
+func testHTTPClient(t *testing.T) *http.Client {
+	t.Helper()
+
+	transport := &http.Transport{}
+	client := &http.Client{Transport: transport}
+
+	actual, loaded := testHTTPClients.LoadOrStore(t.Name(), client)
+	if !loaded {
+		t.Cleanup(func() {
+			transport.CloseIdleConnections()
+			testHTTPClients.Delete(t.Name())
+		})
+	}
+
+	return actual.(*http.Client)
 }
 
 type instrumentedConn struct {
@@ -602,7 +681,7 @@ func TestProxyReuseConnectionsWhenBackendChangesFails(t *testing.T) {
 
 		backendKey, ok := backendMapping[backendAddr]
 		if !ok {
-			return nil, fmt.Errorf("backend not found")
+			return nil, errors.New("backend not found")
 		}
 
 		return &pool.Destination{
@@ -675,7 +754,7 @@ func TestProxyDoesNotReuseConnectionsWhenBackendChanges(t *testing.T) {
 
 		backendKey, ok := backendMapping[backendAddr]
 		if !ok {
-			return nil, fmt.Errorf("backend not found")
+			return nil, errors.New("backend not found")
 		}
 
 		return &pool.Destination{
@@ -730,15 +809,61 @@ func TestProxyDoesNotReuseConnectionsWhenBackendChanges(t *testing.T) {
 	assert.Equal(t, uint64(2), proxy.TotalPoolConnections(), "proxy should not have reused the connection")
 }
 
+// reservedPort holds a TCP socket that is bound but not yet listening:
+// connections are refused while the port stays reserved for this test, and
+// listen turns the same socket into a live listener. This avoids the
+// close-and-rebind race where another process grabs the port in between.
+type reservedPort struct {
+	fd     int
+	addr   string
+	closed bool
+}
+
+func reserveTCPPort(t *testing.T) *reservedPort {
+	t.Helper()
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	require.NoError(t, err)
+	r := &reservedPort{fd: fd}
+	t.Cleanup(r.close)
+
+	require.NoError(t, syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}))
+	sa, err := syscall.Getsockname(fd)
+	require.NoError(t, err)
+	r.addr = fmt.Sprintf("127.0.0.1:%d", sa.(*syscall.SockaddrInet4).Port)
+
+	return r
+}
+
+// close releases the raw fd unless listen already handed it off.
+func (r *reservedPort) close() {
+	if r.closed {
+		return
+	}
+	r.closed = true
+	_ = syscall.Close(r.fd)
+}
+
+func (r *reservedPort) listen() (net.Listener, error) {
+	if err := syscall.Listen(r.fd, 128); err != nil {
+		return nil, fmt.Errorf("listen on reserved port: %w", err)
+	}
+	if err := syscall.SetNonblock(r.fd, true); err != nil {
+		return nil, fmt.Errorf("set nonblock: %w", err)
+	}
+	r.closed = true // fd ownership moves to the os.File below
+	f := os.NewFile(uintptr(r.fd), "reserved-port")
+	defer f.Close() // net.FileListener dups the fd
+
+	return net.FileListener(f)
+}
+
 // TestProxyRetriesOnDelayedBackendStartup simulates the scenario where a backend
 // server starts up after the initial connection attempt (like envd port forwarding delay).
 func TestProxyRetriesOnDelayedBackendStartup(t *testing.T) {
 	t.Parallel()
-	var lisCfg net.ListenConfig
-	tempListener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	backendAddr := tempListener.Addr().String()
-	tempListener.Close() // Close to simulate "connection refused" - small race is acceptable
+	reserved := reserveTCPPort(t)
+	backendAddr := reserved.addr
 
 	backendURL, err := url.Parse(fmt.Sprintf("http://%s", backendAddr))
 	require.NoError(t, err)
@@ -767,7 +892,7 @@ func TestProxyRetriesOnDelayedBackendStartup(t *testing.T) {
 		// Wait 300ms before starting the backend (should succeed on retry 2 or 3)
 		time.Sleep(300 * time.Millisecond)
 
-		listener, err := lisCfg.Listen(t.Context(), "tcp", backendAddr)
+		listener, err := reserved.listen()
 		if err != nil {
 			backendReady <- backendResult{nil, fmt.Errorf("failed to create delayed backend listener: %w", err)}
 
@@ -826,19 +951,33 @@ type data struct {
 // should return the "internal" server and not "masked" server.
 func TestChangeResponseHeader(t *testing.T) {
 	t.Parallel()
-	proxyPort := uint16(30092)
-	internalPort := uint64(30090)
-	maskedPort := uint16(30091)
+
+	var lisCfg net.ListenConfig
+
+	// Pre-listen on ephemeral ports so we know the servers are accepting
+	// connections before the test starts firing requests, and to avoid
+	// hardcoded-port collisions between parallel test runs.
+	internalListener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	internalAddr := internalListener.Addr().(*net.TCPAddr)
+	internalPort := uint64(internalAddr.Port) //nolint:gosec // test-only port number always fits
+	internalURL, err := url.Parse(fmt.Sprintf("http://%s", internalAddr.String()))
+	require.NoError(t, err)
+
+	maskedListener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	maskedAddr := maskedListener.Addr().(*net.TCPAddr)
+	maskedHost := maskedAddr.String()
+
+	proxyListener, err := lisCfg.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	proxyAddr := proxyListener.Addr().(*net.TCPAddr)
+	proxyPort := uint16(proxyAddr.Port) //nolint:gosec // test-only port number always fits
+	proxyURL, err := url.Parse(fmt.Sprintf("http://%s", proxyAddr.String()))
+	require.NoError(t, err)
 
 	client := &http.Client{}
 
-	proxyURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
-	require.NoError(t, err)
-	maskedHost := fmt.Sprintf("127.0.0.1:%d", maskedPort)
-	internalURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", internalPort))
-	require.NoError(t, err)
-
-	// start proxy
 	proxy := New(proxyPort, 1, time.Second, func(_ *http.Request) (*pool.Destination, error) {
 		return &pool.Destination{
 			Url:                                internalURL,
@@ -848,12 +987,12 @@ func TestChangeResponseHeader(t *testing.T) {
 			RequestLogger:                      logger.L(),
 			ConnectionKey:                      "connection-key",
 			IncludeSandboxIdInProxyErrorLogger: true,
-			MaskRequestHost:                    utils.ToPtr(maskedHost),
+			MaskRequestHost:                    new(maskedHost),
 		}, nil
 	}, nil, false)
 
 	go func() {
-		err = proxy.ListenAndServe(t.Context())
+		err := proxy.Serve(proxyListener)
 		assert.ErrorIs(t, err, http.ErrServerClosed)
 	}()
 
@@ -862,54 +1001,57 @@ func TestChangeResponseHeader(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	// start internal server
-	internalServer := http.Server{
-		Addr: fmt.Sprintf("127.0.0.1:%d", internalPort),
+	internalServer := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			err = json.NewEncoder(w).Encode(data{"internal", r.Host, r.Header})
-			assert.NoError(t, err)
+			encErr := json.NewEncoder(w).Encode(data{"internal", r.Host, r.Header})
+			assert.NoError(t, encErr)
 		}),
 	}
 	go func() {
-		err = internalServer.ListenAndServe()
-		assert.NoError(t, err)
+		serveErr := internalServer.Serve(internalListener)
+		assert.ErrorIs(t, serveErr, http.ErrServerClosed)
 	}()
+	t.Cleanup(func() {
+		assert.NoError(t, internalServer.Close())
+	})
 
-	// start fake server
-	maskedServer := http.Server{
-		Addr: fmt.Sprintf("127.0.0.1:%d", maskedPort),
+	maskedServer := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			err = json.NewEncoder(w).Encode(data{"masked", r.Host, r.Header})
-			assert.NoError(t, err)
+			encErr := json.NewEncoder(w).Encode(data{"masked", r.Host, r.Header})
+			assert.NoError(t, encErr)
 		}),
 	}
 	go func() {
-		err = maskedServer.ListenAndServe()
-		assert.NoError(t, err)
+		serveErr := maskedServer.Serve(maskedListener)
+		assert.ErrorIs(t, serveErr, http.ErrServerClosed)
 	}()
+	t.Cleanup(func() {
+		assert.NoError(t, maskedServer.Close())
+	})
 
-	// create request
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL.String(), nil)
-	req.Header.Set("Host", fmt.Sprintf("localhost:%d", proxyPort))
-	req.Header.Set("e2b-testing", "test123")
 	require.NoError(t, err)
+	req.Host = fmt.Sprintf("localhost:%d", proxyPort)
+	req.Header.Set("e2b-testing", "test123")
 
+	// Retry while the proxy goroutine is still binding to the port. Once the
+	// proxy is up, the internal server is guaranteed listening (we pre-bound
+	// its listener above), so we don't need to retry on bad status.
 	var rsp *http.Response
-	for range 10 {
+	for range 50 {
 		rsp, err = client.Do(req)
 		if err == nil {
 			t.Cleanup(func() {
-				err = rsp.Body.Close()
-				assert.NoError(t, err)
+				assert.NoError(t, rsp.Body.Close())
 			})
 
 			break
 		}
 
 		if errors.Is(err, syscall.ECONNREFUSED) {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 
 			continue
 		}
@@ -927,9 +1069,9 @@ func TestChangeResponseHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "internal", data.Tag)
-	assert.Equal(t, fmt.Sprintf("127.0.0.1:%d", maskedPort), data.Host)
+	assert.Equal(t, maskedHost, data.Host)
 	assert.Equal(t, "test123", data.Headers.Get("E2b-Testing"))
-	assert.Equal(t, fmt.Sprintf("127.0.0.1:%d", proxyPort), data.Headers.Get("X-Forwarded-Host"))
+	assert.Equal(t, fmt.Sprintf("localhost:%d", proxyPort), data.Headers.Get("X-Forwarded-Host"))
 }
 
 func TestConnectionLimitBlocksExcessConnections(t *testing.T) {

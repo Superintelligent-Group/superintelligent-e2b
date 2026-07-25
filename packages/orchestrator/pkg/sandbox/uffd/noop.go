@@ -1,12 +1,15 @@
+//go:build linux
+
 package uffd
 
 import (
 	"context"
 
-	"github.com/bits-and-blooms/bitset"
+	"github.com/RoaringBitmap/roaring/v2"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/userfaultfd"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -28,8 +31,8 @@ func NewNoopMemory(size, blockSize int64) *NoopMemory {
 	}
 }
 
-func (m *NoopMemory) Prefault(_ context.Context, _ int64, _ []byte) error {
-	return nil
+func (m *NoopMemory) Prefault(_ context.Context, _ int64, _ []byte) (bool, error) {
+	return false, nil
 }
 
 func (m *NoopMemory) DiffMetadata(ctx context.Context, f *fc.Process) (*header.DiffMetadata, error) {
@@ -38,17 +41,15 @@ func (m *NoopMemory) DiffMetadata(ctx context.Context, f *fc.Process) (*header.D
 		return nil, err
 	}
 
-	dirty := diffInfo.Dirty.Difference(diffInfo.Empty)
+	diffInfo.Dirty.AndNot(diffInfo.Empty)
 
 	numberOfPages := header.TotalBlocks(m.size, m.blockSize)
 
-	empty := bitset.New(uint(numberOfPages))
-	empty.FlipRange(0, uint(numberOfPages))
-
-	empty = empty.Difference(dirty)
+	empty := roaring.Flip(diffInfo.Dirty, 0, uint64(numberOfPages))
+	empty.RemoveRange(uint64(numberOfPages), uint64(1)<<32)
 
 	return &header.DiffMetadata{
-		Dirty:     dirty,
+		Dirty:     diffInfo.Dirty,
 		Empty:     empty,
 		BlockSize: m.blockSize,
 	}, nil
@@ -82,4 +83,14 @@ func (m *NoopMemory) Ready() chan struct{} {
 
 func (m *NoopMemory) Exit() *utils.ErrorOnce {
 	return m.exit
+}
+
+func (m *NoopMemory) Memfd(context.Context) *block.Memfd {
+	return nil
+}
+
+// ServeStats returns a zero snapshot: NoopMemory has no UFFD serve loop, so no
+// pages are demand-faulted through it.
+func (m *NoopMemory) ServeStats() userfaultfd.ServeSnapshot {
+	return userfaultfd.ServeSnapshot{}
 }

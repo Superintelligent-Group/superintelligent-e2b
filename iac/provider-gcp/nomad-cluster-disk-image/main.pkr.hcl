@@ -14,7 +14,7 @@ source "googlecompute" "orch" {
   # TODO: Overwrite the image instead of creating timestamped images every time we build its
   image_name    = "${var.prefix}orch-${formatdate("YYYY-MM-DD-hh-mm-ss", timestamp())}"
   project_id    = var.gcp_project_id
-  source_image  = "ubuntu-2204-jammy-v20251023"
+  source_image  = var.source_image
   ssh_username  = "ubuntu"
   zone          = var.gcp_zone
   disk_size     = 10
@@ -28,7 +28,7 @@ source "googlecompute" "orch" {
 
   # Enable IAP for SSH
   network    = var.network_name
-  subnetwork = "${var.network_name}-subnetwork"
+  subnetwork = var.subnet_name
   use_iap    = true
 }
 
@@ -69,11 +69,15 @@ build {
     ]
   }
 
+  # Install gcsfuse using signed-by keyring (required for Ubuntu 24.04+).
+  # See https://cloud.google.com/storage/docs/gcsfuse-install
   provisioner "shell" {
+    inline_shebang = "/bin/bash"
     inline = [
-      "export GCSFUSE_REPO=gcsfuse-`lsb_release -c -s`",
-      "echo \"deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main\" | sudo tee /etc/apt/sources.list.d/gcsfuse.list",
-      "curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -",
+      "set -eo pipefail",
+      "export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)",
+      "curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo tee /usr/share/keyrings/cloud.google.asc > /dev/null",
+      "echo \"deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $GCSFUSE_REPO main\" | sudo tee /etc/apt/sources.list.d/gcsfuse.list",
     ]
   }
 
@@ -88,12 +92,6 @@ build {
     inline = [
       "sudo apt-get -y update",
       "sudo apt-get install -y nfs-common",
-    ]
-  }
-
-  provisioner "shell" {
-    inline = [
-      "sudo snap install go --classic"
     ]
   }
 
@@ -122,9 +120,18 @@ build {
     execute_command = "chmod +x {{ .Path }}; {{ .Vars }} {{ .Path }} --version ${var.nomad_version}"
   }
 
+  # Install the ClickHouse client at the same version as the server so it's
+  # available on every node without being downloaded at boot time.
   provisioner "shell" {
-    script          = "${local.shared_setup_dir}/install-vault.sh"
-    execute_command = "chmod +x {{ .Path }}; {{ .Vars }} {{ .Path }} --version ${var.vault_version}"
+    script          = "${local.shared_setup_dir}/install-clickhouse-client.sh"
+    execute_command = "chmod +x {{ .Path }}; {{ .Vars }} {{ .Path }} --version ${var.clickhouse_client_version}"
+  }
+
+  # Install CNI plugins (needed by Nomad bridge-mode networking on the
+  # ClickHouse nodepool). Harmless on nodes that don't use them.
+  provisioner "shell" {
+    script          = "${local.shared_setup_dir}/install-cni-plugins.sh"
+    execute_command = "chmod +x {{ .Path }}; {{ .Vars }} {{ .Path }} --version ${var.cni_plugin_version}"
   }
 
   provisioner "shell" {

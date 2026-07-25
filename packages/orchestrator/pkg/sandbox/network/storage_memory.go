@@ -1,8 +1,10 @@
+//go:build linux
+
 package network
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strconv"
 	"sync"
 )
@@ -40,7 +42,7 @@ func (s *StorageMemory) Acquire(_ context.Context) (*Slot, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("failed to acquire IP slot: no empty slots found")
+	return nil, errors.New("failed to acquire IP slot: no empty slots found")
 }
 
 func (s *StorageMemory) Release(ips *Slot) error {

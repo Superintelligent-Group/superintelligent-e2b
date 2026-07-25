@@ -9,18 +9,18 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 )
 
-func (o *Orchestrator) AdminNodes() ([]*api.Node, error) {
+func (o *Orchestrator) AdminNodes(clusterID uuid.UUID) ([]*api.Node, error) {
 	var result []*api.Node
 
 	for _, n := range o.nodes.Items() {
-		// Skip all nodes that are not running in local (Nomad) cluster
-		if !n.IsNomadManaged() {
+		if n.ClusterID != clusterID {
 			continue
 		}
 
 		meta := n.Metadata()
 		metrics := n.GetAPIMetric()
 		machineInfo := n.MachineInfo()
+		statusInfo := n.StatusInfo()
 		result = append(result, &api.Node{
 			Id:                n.ID,
 			ServiceInstanceID: meta.ServiceInstanceID,
@@ -31,7 +31,8 @@ func (o *Orchestrator) AdminNodes() ([]*api.Node, error) {
 				CpuModel:        machineInfo.CPUModel,
 				CpuModelName:    machineInfo.CPUModelName,
 			},
-			Status:               n.Status(),
+			Status:               statusInfo.Status,
+			StatusChangedAt:      statusInfo.ChangedAt,
 			CreateSuccesses:      n.PlacementMetrics.SuccessCount(),
 			CreateFails:          n.PlacementMetrics.FailsCount(),
 			SandboxStartingCount: int(n.PlacementMetrics.InProgressCount()),
@@ -58,6 +59,7 @@ func (o *Orchestrator) AdminNodeDetail(clusterID uuid.UUID, nodeID string) (*api
 	meta := n.Metadata()
 	metrics := n.GetAPIMetric()
 	machineInfo := n.MachineInfo()
+	statusInfo := n.StatusInfo()
 
 	node := &api.NodeDetail{
 		Id:                n.ID,
@@ -69,7 +71,8 @@ func (o *Orchestrator) AdminNodeDetail(clusterID uuid.UUID, nodeID string) (*api
 			CpuModel:        machineInfo.CPUModel,
 			CpuModelName:    machineInfo.CPUModelName,
 		},
-		Status:          n.Status(),
+		Status:          statusInfo.Status,
+		StatusChangedAt: statusInfo.ChangedAt,
 		CreateSuccesses: n.PlacementMetrics.SuccessCount(),
 		CreateFails:     n.PlacementMetrics.FailsCount(),
 		SandboxCount:    n.Metrics().SandboxCount,

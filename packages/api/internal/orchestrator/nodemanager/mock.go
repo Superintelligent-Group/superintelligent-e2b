@@ -12,6 +12,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	infogrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
@@ -119,6 +120,20 @@ func WithSandboxCreateError(err error) TestOptions {
 	}
 }
 
+// WithFeatureFlags sets a custom feature flags client for the test node
+func WithFeatureFlags(ff *featureflags.Client) TestOptions {
+	return func(node *TestNode) {
+		node.featureflags = ff
+	}
+}
+
+// WithAllocatedMemoryBytes sets the initial allocated memory metric for the test node
+func WithAllocatedMemoryBytes(bytes uint64) TestOptions {
+	return func(node *TestNode) {
+		node.metrics.MemoryAllocatedBytes = bytes
+	}
+}
+
 // MockSandboxClientCustom allows custom error logic per call
 type MockSandboxClientCustom struct {
 	orchestrator.SandboxServiceClient
@@ -157,7 +172,7 @@ func NewTestNode(id string, status api.NodeStatus, cpuAllocated int64, cpuCount 
 		},
 
 		client: newMockGRPCClient(),
-		status: status,
+		status: StatusInfo{Status: status, ChangedAt: time.Now()},
 		metrics: Metrics{
 			CpuAllocated: uint32(cpuAllocated),
 			CpuCount:     cpuCount,

@@ -1,12 +1,14 @@
+//go:build linux
+
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"math"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,17 +17,21 @@ import (
 	"syscall"
 	"time"
 
-	"connectrpc.com/connect"
+	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/google/uuid"
 	"github.com/launchdarkly/go-sdk-common/v3/ldlog"
-	"go.opentelemetry.io/otel/metric/noop"
+	"github.com/launchdarkly/go-sdk-common/v3/ldvalue"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
+	"github.com/e2b-dev/infra/packages/clickhouse/pkg/hoststats"
 	"github.com/e2b-dev/infra/packages/orchestrator/cmd/internal/cmdutil"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	blockmetrics "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
@@ -34,14 +40,12 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/tcpfirewall"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
-	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
-	"github.com/e2b-dev/infra/packages/shared/pkg/grpc"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/envd/process"
-	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/envd/process/processconnect"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
@@ -49,10 +53,16 @@ func main() {
 	fromBuild := flag.String("from-build", "", "build ID (UUID) to resume from (required)")
 	toBuild := flag.String("to-build", "", "output build ID (UUID) for pause snapshot (auto-generated if not specified)")
 	storagePath := flag.String("storage", ".local-build", "storage: local path or gs://bucket")
+	sandboxDir := flag.String("sandbox-dir", "", "override SANDBOX_DIR (the rootfs path baked into the snapshot)")
 	iterations := flag.Int("iterations", 0, "run N iterations (0 = interactive)")
 	coldStart := flag.Bool("cold", false, "clear cache between iterations (cold start each time)")
 	noPrefetch := flag.Bool("no-prefetch", false, "disable memory prefetching")
+	noEgress := flag.Bool("no-egress", false, "block all guest internet egress")
+	disableMemfd := flag.Bool("disable-memfd", false, "disable memfd-backed guest memory")
+	memfileDiffDedup := flag.Bool("memfile-diff-dedup", false, "enable 4KiB-page deduplication of memfile diff against the base template")
 	verbose := flag.Bool("v", false, "verbose logging")
+	console := flag.Bool("console", false, "forward Firecracker's output and the guest kernel serial console (tty) to stdout (fresh boot / -reboot only)")
+	firecracker := flag.String("firecracker", "", "override the build's Firecracker version (e.g. when the baked version isn't on this node); safe for a cold boot/-reboot, risky for a memory resume")
 
 	// Command execution (no pause)
 	cmd := flag.String("cmd", "", "execute command in sandbox and exit (no snapshot)")
@@ -63,8 +73,56 @@ func main() {
 	cmdPause := flag.String("cmd-pause", "", "execute command in sandbox, then pause on success")
 	cmdSignalPause := flag.String("cmd-signal-pause", "", "execute command in sandbox, then wait for SIGUSR1 before pausing")
 	optimize := flag.Bool("optimize", false, "collect fresh prefetch mapping after pause (resumes snapshot to record page faults)")
+	fsOnly := flag.Bool("fs-only", false, "pause without a memory snapshot (filesystem-only; resume reboots the guest)")
+	reboot := flag.Bool("reboot", false, "cold-boot from the build's rootfs instead of resuming from memory")
+	forceReboot := flag.Bool("force-reboot", false, "cold-boot like -reboot, but bypass the filesystem-only safety gate for memory-snapshot builds (the disk is only crash-consistent)")
+	shell := flag.Bool("shell", false, "attach an interactive PTY shell via envd (no sshd required in the sandbox)")
+
+	fphTimeoutMs := flag.Int("fph-timeout-ms", 0, "override free-page-hinting-config pause timeout LD flag (0 = use LD default)")
+	reclaim := flag.Bool("reclaim", false, "enable pre-pause reclaim chain (fstrim 500ms, sync 500ms, drop_caches 200ms, compact 1s)")
+	collapseEnvdHeap := flag.Bool("collapse-envd-heap", false, "collapse envd's heap before pause (overrides the collapse-envd-heap flag)")
+
+	fphBench := flag.Bool("fph-bench", false, "compare pause memfile size with vs without FPH; requires -cmd-pause workload, uses -iterations (default 3), forces FPR on")
+	fphBenchDelay := flag.Duration("fph-bench-delay", 0, "wait this long between workload completion and pause (lets FPR settle)")
+
+	gdbDebug := flag.Bool("gdb", false, "resume under gdb: hold the guest at the kernel entry breakpoint with a gdb-enabled FC and hand over a ready gdb session for source-level guest-kernel debugging")
+	gdbFC := flag.String("gdb-fc", "", "path to a firecracker built --features gdb (default: fetch firecracker-debug by version; set E2B_GDB_ARTIFACTS_URL to override the source)")
+	gdbSymbols := flag.String("gdb-symbols", "", "path to the guest kernel's DWARF symbols, vmlinux.debug (default: fetch vmlinux.debug by version; set E2B_GDB_ARTIFACTS_URL to override the source)")
+	gdbSocket := flag.String("gdb-socket", "", "gdb unix socket path (default: a temp path)")
+	gdbExec := flag.String("gdb-exec", "", "scripted mode: run these gdb commands in batch (newline/';'-separated) instead of an interactive prompt")
+	gdbScript := flag.String("gdb-script", "", "scripted mode: run this gdb command file in batch")
 
 	flag.Parse()
+
+	if *fphTimeoutMs > 0 {
+		featureflags.NewJSONFlag("free-page-hinting-config", ldvalue.FromJSONMarshal(map[string]any{
+			"enabled": true,
+			"pause":   *fphTimeoutMs,
+		}))
+	}
+
+	if *reclaim {
+		featureflags.NewJSONFlag("guest-pause-reclaim", ldvalue.FromJSONMarshal(map[string]int{
+			"sync":           500,
+			"drop_caches":    200,
+			"compact_memory": 1000,
+			"fstrim":         500,
+		}))
+	}
+
+	if *disableMemfd {
+		featureflags.OverrideBoolFlag(featureflags.UseMemFdFlag, false)
+	}
+
+	if *collapseEnvdHeap {
+		featureflags.OverrideBoolFlag(featureflags.CollapseEnvdHeapFlag, true)
+	}
+
+	if *memfileDiffDedup {
+		featureflags.OverrideJSONFlag(featureflags.MemfileDiffDedupFlag, ldvalue.FromJSONMarshal(map[string]any{
+			"enabled": true,
+		}))
+	}
 
 	if *fromBuild == "" {
 		log.Fatal("-from-build required")
@@ -100,8 +158,8 @@ func main() {
 
 	isPauseMode := pauseCount > 0
 
-	// Interactive pause modes are incompatible with iterations.
-	if *iterations > 0 && (*signalPause != "" || *cmdPause != "" || *cmdSignalPause != "") {
+	// fph-bench reuses -cmd-pause and -iterations.
+	if !*fphBench && *iterations > 0 && (*signalPause != "" || *cmdPause != "" || *cmdSignalPause != "") {
 		log.Fatal("-signal-pause, -cmd-pause, and -cmd-signal-pause are incompatible with -iterations")
 	}
 
@@ -116,6 +174,20 @@ func main() {
 	if *optimize && *iterations > 0 {
 		log.Fatal("-optimize is incompatible with -iterations (benchmarking doesn't upload)")
 	}
+	if *fsOnly && !isPauseMode {
+		log.Fatal("-fs-only requires a pause flag (-pause, -signal-pause, -cmd-pause, or -cmd-signal-pause)")
+	}
+	if *fsOnly && (*optimize || *fphBench) {
+		log.Fatal("-fs-only is incompatible with -optimize and -fph-bench (no memory snapshot)")
+	}
+
+	if *shell && (isCmdMode || isPauseMode || *iterations > 0) {
+		log.Fatal("-shell can only be used in interactive mode (no -cmd, no pause flags, no -iterations)")
+	}
+
+	if *fphBench && (*cmdPause == "" || *fphTimeoutMs > 0) {
+		log.Fatal("-fph-bench requires -cmd-pause and is incompatible with -fph-timeout-ms")
+	}
 
 	// Generate new build ID if not specified and pause mode is enabled
 	outputBuildID := *toBuild
@@ -123,7 +195,14 @@ func main() {
 		outputBuildID = uuid.New().String()
 	}
 
-	if err := setupEnv(*storagePath); err != nil {
+	storageExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "storage" {
+			storageExplicit = true
+		}
+	})
+
+	if err := setupEnv(*storagePath, *sandboxDir, storageExplicit); err != nil {
 		log.Fatal(err)
 	}
 
@@ -144,14 +223,32 @@ func main() {
 		newBuildID:      outputBuildID,
 		iterations:      *iterations,
 		optimize:        *optimize,
+		fsOnly:          *fsOnly,
 	}
 
 	runOpts := runOptions{
-		cmd:        *cmd,
-		iterations: *iterations,
+		cmd:                *cmd,
+		iterations:         *iterations,
+		console:            *console,
+		firecrackerVersion: *firecracker,
 	}
 
-	err := run(ctx, *fromBuild, *iterations, *coldStart, *noPrefetch, *verbose, pauseOpts, runOpts)
+	benchIters := *iterations
+	if *fphBench && benchIters <= 0 {
+		benchIters = 3
+	}
+	fphBenchOpts := fphBenchOptions{enabled: *fphBench, workload: *cmdPause, iterations: benchIters, delay: *fphBenchDelay}
+
+	gdbOpts := gdbOptions{
+		enabled:  *gdbDebug,
+		fcBinary: *gdbFC,
+		symbols:  *gdbSymbols,
+		socket:   *gdbSocket,
+		execCmds: *gdbExec,
+		script:   *gdbScript,
+	}
+
+	err := run(ctx, *fromBuild, *iterations, *coldStart, *noPrefetch, *noEgress, *verbose, *shell, *reboot, *forceReboot, pauseOpts, runOpts, fphBenchOpts, gdbOpts)
 	cancel()
 
 	if err != nil {
@@ -173,6 +270,7 @@ type pauseOptions struct {
 	newBuildID      string
 	iterations      int // for benchmarking pause (only with immediate)
 	optimize        bool
+	fsOnly          bool
 }
 
 func (p pauseOptions) enabled() bool {
@@ -188,8 +286,10 @@ type pauseTimings struct {
 }
 
 type runOptions struct {
-	cmd        string // command to run and exit (no pause)
-	iterations int    // number of iterations (0 = single run)
+	cmd                string // command to run and exit (no pause)
+	iterations         int    // number of iterations (0 = single run)
+	console            bool   // forward the guest kernel console + FC output to stdout/stderr (fresh boot)
+	firecrackerVersion string // override the build's Firecracker version (empty = use the build's own)
 }
 
 func (r runOptions) enabled() bool {
@@ -204,8 +304,12 @@ type cmdTimings struct {
 	err     error
 }
 
-func setupEnv(from string) error {
+func setupEnv(from string, sandboxDir string, storageExplicit bool) error {
 	abs := func(s string) string { return utils.Must(filepath.Abs(s)) }
+
+	if sandboxDir != "" {
+		os.Setenv("SANDBOX_DIR", sandboxDir)
+	}
 
 	// Derive dataDir from 'from' when it's a local path
 	var dataDir string
@@ -233,17 +337,8 @@ func setupEnv(from string) error {
 		"HOST_ENVD_PATH":              abs(filepath.Join(dataDir, "envd", "envd")),
 		"HOST_KERNELS_DIR":            abs(filepath.Join(dataDir, "kernels")),
 		"ORCHESTRATOR_BASE_PATH":      abs(filepath.Join(dataDir, "orchestrator")),
-		"SANDBOX_DIR":                 abs(filepath.Join(dataDir, "sandbox")),
 		"SNAPSHOT_CACHE_DIR":          abs(filepath.Join(dataDir, "snapshot-cache")),
 		"USE_LOCAL_NAMESPACE_STORAGE": "true",
-	}
-
-	if strings.HasPrefix(from, "gs://") {
-		env["STORAGE_PROVIDER"] = "GCPBucket"
-		env["TEMPLATE_BUCKET_NAME"] = strings.TrimPrefix(from, "gs://")
-	} else {
-		env["STORAGE_PROVIDER"] = "Local"
-		env["LOCAL_TEMPLATE_STORAGE_BASE_PATH"] = abs(filepath.Join(dataDir, "templates"))
 	}
 
 	for k, v := range env {
@@ -252,19 +347,69 @@ func setupEnv(from string) error {
 		}
 	}
 
+	templateURL := from
+	if !strings.HasPrefix(from, "gs://") {
+		templateURL = "file://" + abs(filepath.Join(dataDir, "templates"))
+	}
+
+	// An explicit -storage flag overrides ambient storage config; the flag's
+	// default value only applies when nothing is configured.
+	if storageExplicit || (os.Getenv("TEMPLATE_STORAGE_URL") == "" && os.Getenv("STORAGE_PROVIDER") == "") {
+		os.Setenv("TEMPLATE_STORAGE_URL", templateURL)
+	}
+
 	return nil
 }
 
 type runner struct {
-	factory    *sandbox.Factory
-	tmpl       template.Template
-	sbxConfig  *sandbox.Config
-	buildID    string
-	cache      *template.Cache
-	coldStart  bool
-	noPrefetch bool
-	config     cfg.BuilderConfig
-	storage    storage.StorageProvider
+	factory     *sandbox.Factory
+	tmpl        template.Template
+	sbxConfig   *sandbox.Config
+	buildID     string
+	cache       *template.Cache
+	coldStart   bool
+	noPrefetch  bool
+	shell       bool
+	reboot      bool
+	forceReboot bool
+	console     bool
+	config      cfg.BuilderConfig
+	storage     storage.StorageProvider
+}
+
+// wrapTemplate applies the CLI's template masks: -no-prefetch drops the
+// prefetch mapping and -force-reboot masks the metadata as filesystem-only so
+// RebootSandbox's safety gate accepts a memory-snapshot build.
+func wrapTemplate(tmpl template.Template, noPrefetch, forceFsOnly bool) template.Template {
+	if noPrefetch {
+		tmpl = &noPrefetchTemplate{tmpl}
+	}
+	if forceFsOnly {
+		tmpl = &forceFsOnlyTemplate{tmpl}
+	}
+
+	return tmpl
+}
+
+// startSandbox starts a sandbox from the build, either resuming from its memory
+// snapshot or cold-booting (rebooting) from its rootfs when -reboot or
+// -force-reboot is set.
+func (r *runner) startSandbox(ctx context.Context, runtime sandbox.RuntimeMetadata, start, end time.Time) (*sandbox.Sandbox, error) {
+	if r.reboot || r.forceReboot {
+		var procOpts []func(*fc.ProcessOptions)
+		if r.console {
+			// Forward the guest kernel console (tty) + FC output to this process.
+			procOpts = append(procOpts, func(o *fc.ProcessOptions) {
+				o.KernelLogs = true
+				o.Stdout = os.Stdout
+				o.Stderr = os.Stderr
+			})
+		}
+
+		return r.factory.RebootSandbox(ctx, r.tmpl, r.sbxConfig, runtime, end, nil, procOpts...)
+	}
+
+	return r.factory.ResumeSandbox(ctx, r.tmpl, r.sbxConfig, runtime, start, end, nil)
 }
 
 func (r *runner) resumeOnce(ctx context.Context, iter int) (time.Duration, error) {
@@ -276,7 +421,7 @@ func (r *runner) resumeOnce(ctx context.Context, iter int) (time.Duration, error
 	}
 
 	t0 := time.Now()
-	sbx, err := r.factory.ResumeSandbox(ctx, r.tmpl, r.sbxConfig, runtime, t0, t0.Add(24*time.Hour), nil)
+	sbx, err := r.startSandbox(ctx, runtime, t0, t0.Add(24*time.Hour))
 	dur := time.Since(t0)
 
 	if sbx != nil {
@@ -296,18 +441,30 @@ func (r *runner) interactive(ctx context.Context) error {
 
 	fmt.Println("🚀 Starting...")
 	t0 := time.Now()
-	sbx, err := r.factory.ResumeSandbox(ctx, r.tmpl, r.sbxConfig, runtime, t0, t0.Add(24*time.Hour), nil)
+	sbx, err := r.startSandbox(ctx, runtime, t0, t0.Add(24*time.Hour))
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("✅ Running (resumed in %s)\n", time.Since(t0))
 	fmt.Printf("   sudo nsenter --net=/var/run/netns/%s ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@169.254.0.21\n", sbx.Slot.NamespaceID())
-	fmt.Println("Ctrl+C to stop")
 
+	defer func() {
+		fmt.Println("🧹 Cleanup...")
+		sbx.Close(context.WithoutCancel(ctx))
+	}()
+
+	if r.shell {
+		err := attachShell(ctx, sbx)
+		if err != nil && !isShellExited(err) {
+			return err
+		}
+
+		return nil
+	}
+
+	fmt.Println("Ctrl+C to stop")
 	<-ctx.Done()
-	fmt.Println("🧹 Cleanup...")
-	sbx.Close(context.WithoutCancel(ctx))
 
 	return nil
 }
@@ -334,7 +491,7 @@ func (r *runner) cmdOnce(ctx context.Context, opts runOptions, verbose bool) (cm
 		fmt.Println("🚀 Starting sandbox...")
 	}
 	t0 := time.Now()
-	sbx, err := r.factory.ResumeSandbox(ctx, r.tmpl, r.sbxConfig, runtime, t0, t0.Add(24*time.Hour), nil)
+	sbx, err := r.startSandbox(ctx, runtime, t0, t0.Add(24*time.Hour))
 	resumeDur := time.Since(t0)
 	if err != nil {
 		return cmdTimings{resume: resumeDur, err: err}, err
@@ -394,10 +551,7 @@ func (r *runner) cmdBenchmark(ctx context.Context, opts runOptions) error {
 			if err != nil {
 				return fmt.Errorf("reload template: %w", err)
 			}
-			if r.noPrefetch {
-				tmpl = &noPrefetchTemplate{tmpl}
-			}
-			r.tmpl = tmpl
+			r.tmpl = wrapTemplate(tmpl, r.noPrefetch, r.forceReboot)
 		}
 
 		fmt.Printf("\r[%d/%d] Running...    ", i+1, opts.iterations)
@@ -537,7 +691,7 @@ func (r *runner) pauseOnce(ctx context.Context, opts pauseOptions, verbose bool)
 		fmt.Println("🚀 Starting sandbox...")
 	}
 	t0 := time.Now()
-	sbx, err := r.factory.ResumeSandbox(ctx, r.tmpl, r.sbxConfig, runtime, t0, t0.Add(24*time.Hour), nil)
+	sbx, err := r.startSandbox(ctx, runtime, t0, t0.Add(24*time.Hour))
 	resumeDur := time.Since(t0)
 	if err != nil {
 		return pauseTimings{resume: resumeDur, err: err}, err
@@ -600,8 +754,12 @@ func (r *runner) pauseOnce(ctx context.Context, opts pauseOptions, verbose bool)
 	}
 
 	// Pause and create snapshot
+	var pauseSnapshotOpts []sandbox.PauseOption
+	if opts.fsOnly {
+		pauseSnapshotOpts = append(pauseSnapshotOpts, sandbox.WithFilesystemSnapshot())
+	}
 	pauseStart := time.Now()
-	snapshot, err := sbx.Pause(ctx, newMeta)
+	snapshot, err := sbx.Pause(ctx, newMeta, sandbox.SnapshotUseCasePause, pauseSnapshotOpts...)
 	pauseDur := time.Since(pauseStart)
 	totalDur := time.Since(t0)
 
@@ -627,20 +785,22 @@ func (r *runner) pauseOnce(ctx context.Context, opts pauseOptions, verbose bool)
 
 	// Only upload when not in benchmark mode (verbose = true means single run)
 	if verbose {
-		templateFiles := storage.TemplateFiles{BuildID: opts.newBuildID}
 		if opts.isRemoteStorage {
 			fmt.Println("📤 Uploading snapshot...")
-			if err := snapshot.Upload(ctx, r.storage, templateFiles); err != nil {
-				return timings, fmt.Errorf("failed to upload snapshot: %w", err)
-			}
-			fmt.Println("✅ Snapshot uploaded successfully")
 		} else {
 			fmt.Println("💾 Saving snapshot to local storage...")
-			if err := snapshot.Upload(ctx, r.storage, templateFiles); err != nil {
-				return timings, fmt.Errorf("failed to save snapshot: %w", err)
-			}
-			fmt.Println("✅ Snapshot saved successfully")
 		}
+
+		upload, err := sandbox.NewUpload(ctx, nil, snapshot, r.storage, storage.CompressConfig{}, nil, "", nil)
+		if err != nil {
+			return timings, fmt.Errorf("failed to prepare upload: %w", err)
+		}
+
+		if err := upload.Run(ctx); err != nil {
+			return timings, fmt.Errorf("failed to upload snapshot: %w", err)
+		}
+
+		fmt.Println("✅ Snapshot uploaded successfully")
 
 		fmt.Printf("\n✅ Build finished: %s\n", opts.newBuildID)
 		printArtifactSizes(opts.storagePath, opts.newBuildID)
@@ -676,10 +836,7 @@ func (r *runner) pauseBenchmark(ctx context.Context, opts pauseOptions) error {
 			if err != nil {
 				return fmt.Errorf("reload template: %w", err)
 			}
-			if r.noPrefetch {
-				tmpl = &noPrefetchTemplate{tmpl}
-			}
-			r.tmpl = tmpl
+			r.tmpl = wrapTemplate(tmpl, r.noPrefetch, r.forceReboot)
 		}
 
 		// Generate unique build ID for each iteration (not saved)
@@ -853,7 +1010,7 @@ func (r *runner) collectAndUploadPrefetch(ctx context.Context, opts pauseOptions
 		Memory: mapping,
 	})
 
-	if err := metadata.UploadMetadata(ctx, r.storage, updatedMeta); err != nil {
+	if err := metadata.UploadMetadata(ctx, r.storage, updatedMeta, nil); err != nil {
 		return fmt.Errorf("upload metadata: %w", err)
 	}
 
@@ -924,10 +1081,7 @@ func (r *runner) benchmark(ctx context.Context, n int) error {
 			if err != nil {
 				return fmt.Errorf("reload template: %w", err)
 			}
-			if r.noPrefetch {
-				tmpl = &noPrefetchTemplate{tmpl}
-			}
-			r.tmpl = tmpl
+			r.tmpl = wrapTemplate(tmpl, r.noPrefetch, r.forceReboot)
 		}
 
 		fmt.Printf("\r[%d/%d] Running...    ", i+1, n)
@@ -948,16 +1102,33 @@ func (r *runner) benchmark(ctx context.Context, n int) error {
 	return lastErr
 }
 
-func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefetch, verbose bool, pauseOpts pauseOptions, runOpts runOptions) error {
+func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefetch, noEgress, verbose, shell, reboot, forceReboot bool, pauseOpts pauseOptions, runOpts runOptions, fphBenchOpts fphBenchOptions, gdbOpts gdbOptions) error {
 	// Silence other loggers unless verbose mode
 	var l logger.Logger
 	if !verbose {
 		cmdutil.SuppressNoisyLogs()
 		l = logger.NewNopLogger()
+		sbxlogger.SetSandboxLoggerInternal(logger.NewNopLogger())
 	} else {
-		l, _ = logger.NewDevelopmentLogger()
+		var err error
+		l, err = logger.NewDevelopmentLogger()
+		if err != nil {
+			return fmt.Errorf("logger: %w", err)
+		}
+		logger.ReplaceGlobals(ctx, l)
+		sbxlogger.SetSandboxLoggerExternal(l)
+		sbxlogger.SetSandboxLoggerInternal(l)
 	}
-	sbxlogger.SetSandboxLoggerInternal(logger.NewNopLogger())
+
+	tel, err := telemetry.NewAnonymous(ctx, "resume-build")
+	if err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+	defer func() {
+		if err := tel.Shutdown(context.WithoutCancel(ctx)); err != nil {
+			log.Printf("error shutting down telemetry: %v", err)
+		}
+	}()
 
 	if os.Getenv("NODE_IP") == "" {
 		os.Setenv("NODE_IP", "127.0.0.1")
@@ -985,14 +1156,28 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	if verbose {
 		fmt.Println("🔧 Starting TCP firewall...")
 	}
-	tcpFw := tcpfirewall.New(l, config.NetworkConfig, sandboxes, noop.NewMeterProvider(), flags)
+	tcpFw := tcpfirewall.New(l, config.NetworkConfig, sandboxes, tel.MeterProvider, flags)
 	go tcpFw.Start(ctx)
 	defer tcpFw.Close(context.WithoutCancel(ctx))
+
+	// gdb mode debugs real customer snapshots. The guest is frozen at the entry
+	// breakpoint and never boots, so it cannot itself open a connection — but force
+	// egress off regardless, so a debugging run can never leave an exfiltration path
+	// open. This makes the runbook's "always -no-egress" mechanical rather than a
+	// manual step the operator can forget.
+	if gdbOpts.enabled {
+		noEgress = true
+	}
+
+	var egressProxy network.EgressProxy = network.NoopEgressProxy{}
+	if noEgress {
+		egressProxy = noEgressProxy{}
+	}
 
 	if verbose {
 		fmt.Println("🔧 Creating network storage...")
 	}
-	slotStorage, err := network.NewStorageLocal(ctx, config.NetworkConfig, network.NoopEgressProxy{})
+	slotStorage, err := network.NewStorageLocal(ctx, config.NetworkConfig, egressProxy)
 	if err != nil {
 		return fmt.Errorf("network storage: %w", err)
 	}
@@ -1007,7 +1192,7 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	if verbose {
 		fmt.Println("🔧 Creating NBD device pool...")
 	}
-	devicePool, err := nbd.NewDevicePool()
+	devicePool, err := nbd.NewDevicePool(config.NBDPoolSize)
 	if err != nil {
 		return fmt.Errorf("nbd pool: %w", err)
 	}
@@ -1017,7 +1202,11 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	if verbose {
 		fmt.Println("🔧 Creating storage provider...")
 	}
-	persistence, err := storage.GetStorageProvider(ctx, storage.TemplateStorageConfig)
+	templateSpec, err := cfg.TemplateStorage()
+	if err != nil {
+		return fmt.Errorf("resolve template storage: %w", err)
+	}
+	persistence, err := storage.NewProvider(ctx, templateSpec)
 	if verbose {
 		fmt.Println("🔧 Storage provider created, err:", err)
 	}
@@ -1025,13 +1214,16 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 		return fmt.Errorf("storage provider: %w", err)
 	}
 	if persistence == nil {
-		return fmt.Errorf("storage provider is nil")
+		return errors.New("storage provider is nil")
 	}
 
 	if verbose {
 		fmt.Println("🔧 Creating block metrics...")
 	}
-	blockMetrics, _ := blockmetrics.NewMetrics(&noop.MeterProvider{})
+	blockMetrics, err := blockmetrics.NewMetrics(tel.MeterProvider)
+	if err != nil {
+		return fmt.Errorf("block metrics: %w", err)
+	}
 
 	if verbose {
 		fmt.Println("🔧 Creating template cache...")
@@ -1046,7 +1238,7 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	if verbose {
 		fmt.Println("🔧 Creating sandbox factory...")
 	}
-	factory := sandbox.NewFactory(config.BuilderConfig, networkPool, devicePool, flags, nil, nil, sandboxes)
+	factory := sandbox.NewFactory(config.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), egressProxy, sandbox.NoopNetworkAssignHook{}, sandboxes)
 
 	fmt.Printf("📦 Loading %s...\n", buildID)
 	tmpl, err := cache.GetTemplate(ctx, buildID, false, false)
@@ -1061,34 +1253,62 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 
 	printTemplateInfo(ctx, tmpl, meta)
 
-	// Wrap template to disable prefetching if requested
 	if noPrefetch {
-		tmpl = &noPrefetchTemplate{tmpl}
 		fmt.Println("   Prefetch: disabled")
+	}
+	if forceReboot && !meta.IsFilesystemOnly() {
+		fmt.Println("⚠️  Forcing reboot of a memory-snapshot build: the disk is only crash-consistent — writes that lived in the guest page cache at pause time may be missing.")
+	}
+	tmpl = wrapTemplate(tmpl, noPrefetch, forceReboot)
+
+	fcVersion := meta.Template.FirecrackerVersion
+	if runOpts.firecrackerVersion != "" {
+		fmt.Printf("   Overriding Firecracker version: %s -> %s\n", meta.Template.FirecrackerVersion, runOpts.firecrackerVersion)
+		fcVersion = runOpts.firecrackerVersion
 	}
 
 	token := "local"
 	sbxCfg := sandbox.NewConfig(sandbox.Config{
-		BaseTemplateID: buildID,
-		Vcpu:           1,
-		RamMB:          512,
-		Envd:           sandbox.EnvdMetadata{Vars: map[string]string{}, AccessToken: &token, Version: "1.0.0"},
+		BaseTemplateID:    buildID,
+		Vcpu:              1,
+		RamMB:             512,
+		FreePageReporting: fphBenchOpts.enabled,
+		Envd:              sandbox.EnvdMetadata{Vars: map[string]string{}, AccessToken: &token, Version: "1.0.0"},
 		FirecrackerConfig: fc.Config{
 			KernelVersion:      meta.Template.KernelVersion,
-			FirecrackerVersion: meta.Template.FirecrackerVersion,
+			FirecrackerVersion: fcVersion,
 		},
 	})
 
 	r := &runner{
-		factory:    factory,
-		tmpl:       tmpl,
-		buildID:    buildID,
-		cache:      cache,
-		coldStart:  coldStart,
-		noPrefetch: noPrefetch,
-		config:     config.BuilderConfig,
-		storage:    persistence,
-		sbxConfig:  sbxCfg,
+		factory:     factory,
+		tmpl:        tmpl,
+		buildID:     buildID,
+		cache:       cache,
+		coldStart:   coldStart,
+		noPrefetch:  noPrefetch,
+		shell:       shell,
+		reboot:      reboot,
+		forceReboot: forceReboot,
+		console:     runOpts.console,
+		config:      config.BuilderConfig,
+		storage:     persistence,
+		sbxConfig:   sbxCfg,
+	}
+
+	if gdbOpts.enabled {
+		// gdb mode holds the guest at the entry breakpoint and never runs a
+		// workload, so it is mutually exclusive with the pause/cmd/bench modes —
+		// reject the combination rather than silently ignoring the other flags.
+		if fphBenchOpts.enabled || runOpts.enabled() || pauseOpts.enabled() || iterations > 0 || reboot || forceReboot || shell {
+			return errors.New("-gdb cannot be combined with -pause/-cmd/-iterations/-reboot/-force-reboot/-shell/-fph-bench")
+		}
+
+		return r.gdbMode(ctx, gdbOpts)
+	}
+
+	if fphBenchOpts.enabled {
+		return r.fphBench(ctx, fphBenchOpts)
 	}
 
 	if runOpts.enabled() {
@@ -1127,32 +1347,15 @@ func printTemplateInfo(ctx context.Context, tmpl template.Template, meta metadat
 	}
 }
 
-// runCommandInSandbox runs a command inside the sandbox via envd
+// runCommandInSandboxTimeout caps how long a single resume-build command may
+// run before envd kills it. Restores the prior 10-minute upper bound that the
+// shared http.Client used to enforce, so a stuck command can't block the CLI.
+const runCommandInSandboxTimeout = 10 * time.Minute
+
+// runCommandInSandbox runs a command inside the sandbox via envd as a
+// login shell so /etc/profile is sourced.
 func runCommandInSandbox(ctx context.Context, sbx *sandbox.Sandbox, command string) error {
-	// Connect directly to envd on the sandbox
-	envdURL := fmt.Sprintf("http://%s:%d", sbx.Slot.HostIPString(), consts.DefaultEnvdServerPort)
-
-	hc := http.Client{
-		Timeout:   10 * time.Minute,
-		Transport: sandbox.SandboxHttpTransport,
-	}
-
-	processC := processconnect.NewProcessClient(&hc, envdURL)
-
-	req := connect.NewRequest(&process.StartRequest{
-		Process: &process.ProcessConfig{
-			Cmd:  "/bin/bash",
-			Args: []string{"-l", "-c", command},
-		},
-	})
-	grpc.SetUserHeader(req.Header(), "root")
-
-	// Set access token if available
-	if sbx.Config.Envd.AccessToken != nil {
-		req.Header().Set("X-Access-Token", *sbx.Config.Envd.AccessToken)
-	}
-
-	stream, err := processC.Start(ctx, req)
+	stream, err := sbx.StartEnvdShell(ctx, "/bin/bash", []string{"-l", "-c", command}, "root", runCommandInSandboxTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to start process: %w", err)
 	}
@@ -1277,12 +1480,12 @@ func parseSignal(name string) os.Signal {
 
 // printArtifactSizes prints artifact sizes
 func printArtifactSizes(_, buildID string) {
-	basePath := os.Getenv("LOCAL_TEMPLATE_STORAGE_BASE_PATH")
-	if basePath == "" {
+	spec, err := cfg.TemplateStorage()
+	if err != nil || spec.Provider != storage.LocalStorageProvider {
 		return
 	}
 
-	dir := filepath.Join(basePath, buildID)
+	dir := filepath.Join(spec.BasePath, buildID)
 
 	fmt.Println("\n📦 Artifacts:")
 
@@ -1437,4 +1640,50 @@ func (t *noPrefetchTemplate) Metadata() (metadata.Template, error) {
 	meta.Prefetch = nil
 
 	return meta, nil
+}
+
+// forceFsOnlyTemplate wraps a template to mask its metadata as filesystem-only
+// so RebootSandbox's safety gate accepts a memory-snapshot build (-force-reboot).
+// The mask never touches the stored metadata; a memory snapshot's disk is only
+// crash-consistent, so writes cached in guest RAM at pause time may be missing.
+type forceFsOnlyTemplate struct {
+	template.Template
+}
+
+func (t *forceFsOnlyTemplate) Metadata() (metadata.Template, error) {
+	meta, err := t.Template.Metadata()
+	if err != nil {
+		return meta, err
+	}
+
+	return meta.MarkFilesystemOnly(true), nil
+}
+
+// noEgressProxy is an EgressProxy that removes the default route from the
+// sandbox's netns at slot-creation time.
+type noEgressProxy struct {
+	network.NoopEgressProxy
+}
+
+func (noEgressProxy) OnSlotCreate(s *network.Slot, _ *iptables.IPTables) error {
+	nsPath := filepath.Join("/var/run/netns", s.NamespaceID())
+
+	handle, err := ns.GetNS(nsPath)
+	if err != nil {
+		return fmt.Errorf("get netns %q: %w", nsPath, err)
+	}
+	defer handle.Close()
+
+	// Match the route installed earlier in Slot.CreateNetwork:
+	//   Scope = SCOPE_UNIVERSE, Gw = VethIP.
+	return handle.Do(func(_ ns.NetNS) error {
+		if err := netlink.RouteDel(&netlink.Route{
+			Scope: netlink.SCOPE_UNIVERSE,
+			Gw:    s.VethIP(),
+		}); err != nil {
+			return fmt.Errorf("delete default route in %s: %w", s.NamespaceID(), err)
+		}
+
+		return nil
+	})
 }

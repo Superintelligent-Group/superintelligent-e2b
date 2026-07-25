@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
-	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 	"github.com/e2b-dev/infra/tests/integration/internal/api"
 	"github.com/e2b-dev/infra/tests/integration/internal/envd"
 	"github.com/e2b-dev/infra/tests/integration/internal/setup"
@@ -123,6 +122,7 @@ func TestSandboxCreateWithTag(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a sandbox using the tagged template (templateID:tag format)
+	testutils.AcquireSandboxSlot(t)
 	sbxTimeout := int32(60)
 	resp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
 		TemplateID: template.TemplateID + ":v1.0",
@@ -153,6 +153,7 @@ func TestSandboxCreateWithDefaultTag(t *testing.T) {
 	c := setup.GetAPIClient()
 
 	// Create a sandbox using explicit :default tag - should work same as without tag
+	testutils.AcquireSandboxSlot(t)
 	sbxTimeout := int32(60)
 	resp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
 		TemplateID: setup.SandboxTemplateID + ":" + id.DefaultTag,
@@ -182,6 +183,7 @@ func TestSandboxCreateWithNonExistentTag(t *testing.T) {
 	c := setup.GetAPIClient()
 
 	// Try to create a sandbox with a non-existent tag
+	testutils.AcquireSandboxSlot(t)
 	sbxTimeout := int32(60)
 	resp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
 		TemplateID: setup.SandboxTemplateID + ":nonexistent-tag",
@@ -213,6 +215,7 @@ func TestSandboxCreateWithAliasAndTag(t *testing.T) {
 	require.Equal(t, http.StatusCreated, tagResp.StatusCode())
 
 	// Create a sandbox using alias:tag format (API should resolve alias to templateID)
+	testutils.AcquireSandboxSlot(t)
 	sbxTimeout := int32(60)
 	resp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
 		TemplateID: alias + ":stable",
@@ -289,11 +292,12 @@ func TestMultipleTagsOnSameTemplate(t *testing.T) {
 			Tags:   []string{tag},
 		}, setup.WithAPIKey())
 		require.NoError(t, err)
-		assert.Equal(t, http.StatusCreated, tagResp.StatusCode())
+		require.Equal(t, http.StatusCreated, tagResp.StatusCode())
 		assert.Equal(t, template.BuildID, tagResp.JSON201.BuildID.String())
 	}
 
 	// Verify we can create sandboxes with each tag
+	release := testutils.AcquireSandboxSlot(t)
 	for _, tag := range tags {
 		sbxTimeout := int32(60)
 		resp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
@@ -308,6 +312,7 @@ func TestMultipleTagsOnSameTemplate(t *testing.T) {
 
 		assert.Equal(t, http.StatusCreated, resp.StatusCode(), "Failed to create sandbox with tag: %s", tag)
 	}
+	release()
 }
 
 func TestTagReassignment(t *testing.T) {
@@ -324,12 +329,12 @@ func TestTagReassignment(t *testing.T) {
 	template1 := testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: alias,
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
-			Steps: utils.ToPtr([]api.TemplateStep{
+			FromImage: new("ubuntu:22.04"),
+			Steps: new([]api.TemplateStep{
 				{
 					Type:  "ENV",
-					Force: utils.ToPtr(true),
-					Args:  utils.ToPtr([]string{"VERSION", "1"}),
+					Force: new(true),
+					Args:  new([]string{"VERSION", "1"}),
 				},
 			}),
 		},
@@ -348,12 +353,12 @@ func TestTagReassignment(t *testing.T) {
 	template2 := testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: alias,
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
-			Steps: utils.ToPtr([]api.TemplateStep{
+			FromImage: new("ubuntu:22.04"),
+			Steps: new([]api.TemplateStep{
 				{
 					Type:  "ENV",
-					Force: utils.ToPtr(true),
-					Args:  utils.ToPtr([]string{"VERSION", "2"}),
+					Force: new(true),
+					Args:  new([]string{"VERSION", "2"}),
 				},
 			}),
 		},
@@ -388,14 +393,15 @@ func TestTemplateBuildWithTags(t *testing.T) {
 	tags := []string{"v1.0.0", "stable"}
 	testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: name,
-		Tags: utils.ToPtr(tags),
+		Tags: new(tags),
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
+			FromImage: new("ubuntu:22.04"),
 		},
 		ReqEditors: []api.RequestEditorFn{setup.WithAPIKey()},
 	})
 
 	// Verify we can create sandboxes with each tag that was specified during creation
+	release := testutils.AcquireSandboxSlot(t)
 	for _, tag := range tags {
 		sbxTimeout := int32(60)
 		sbxResp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
@@ -410,6 +416,7 @@ func TestTemplateBuildWithTags(t *testing.T) {
 
 		assert.Equal(t, http.StatusCreated, sbxResp.StatusCode(), "Failed to create sandbox with tag: %s", name)
 	}
+	release()
 }
 
 func TestTemplateBuildWithTagsAndSandboxCreation(t *testing.T) {
@@ -426,12 +433,13 @@ func TestTemplateBuildWithTagsAndSandboxCreation(t *testing.T) {
 	testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: name,
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
+			FromImage: new("ubuntu:22.04"),
 		},
 		ReqEditors: []api.RequestEditorFn{setup.WithAPIKey()},
 	})
 
 	// Create sandbox using alias:tag format
+	testutils.AcquireSandboxSlot(t)
 	sbxTimeout := int32(60)
 	sbxResp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
 		TemplateID: name,
@@ -468,12 +476,13 @@ func TestTemplateBuildWithTagInAlias(t *testing.T) {
 		Name: "test-alias-with-tag:v2.0",
 		// Tags: intentionally not provided - should be inferred from alias
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
+			FromImage: new("ubuntu:22.04"),
 		},
 		ReqEditors: []api.RequestEditorFn{setup.WithAPIKey()},
 	})
 
 	// Create sandbox using the tag that was embedded in the alias
+	testutils.AcquireSandboxSlot(t)
 	sbxTimeout := int32(60)
 	sbxResp, err := c.PostSandboxesWithResponse(ctx, api.NewSandbox{
 		TemplateID: template.TemplateID + ":v2.0",
@@ -513,12 +522,12 @@ func TestAssignmentOrderingLatestWins(t *testing.T) {
 	template1 := testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: alias,
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
-			Steps: utils.ToPtr([]api.TemplateStep{
+			FromImage: new("ubuntu:22.04"),
+			Steps: new([]api.TemplateStep{
 				{
 					Type:  "RUN",
-					Force: utils.ToPtr(true),
-					Args:  utils.ToPtr([]string{"echo -n 'build-1' > " + versionFilePath}),
+					Force: new(true),
+					Args:  new([]string{"echo -n 'build-1' > " + versionFilePath}),
 				},
 			}),
 		},
@@ -529,12 +538,12 @@ func TestAssignmentOrderingLatestWins(t *testing.T) {
 	template2 := testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: alias,
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
-			Steps: utils.ToPtr([]api.TemplateStep{
+			FromImage: new("ubuntu:22.04"),
+			Steps: new([]api.TemplateStep{
 				{
 					Type:  "RUN",
-					Force: utils.ToPtr(true),
-					Args:  utils.ToPtr([]string{"echo -n 'build-2' > " + versionFilePath}),
+					Force: new(true),
+					Args:  new([]string{"echo -n 'build-2' > " + versionFilePath}),
 				},
 			}),
 		},
@@ -552,7 +561,7 @@ func TestAssignmentOrderingLatestWins(t *testing.T) {
 	envdClient := setup.GetEnvdClient(t, ctx)
 	fileResp, err := envdClient.HTTPClient.GetFilesWithResponse(
 		ctx,
-		&envd.GetFilesParams{Path: &versionFilePath, Username: utils.ToPtr("user")},
+		&envd.GetFilesParams{Path: &versionFilePath, Username: new("user")},
 		setup.WithSandbox(t, sbx.SandboxID),
 	)
 	require.NoError(t, err)
@@ -580,9 +589,9 @@ func TestAssignmentOrderingAfterTagReassignment(t *testing.T) {
 	template1 := testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: alias,
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
-			Steps: utils.ToPtr([]api.TemplateStep{
-				{Type: "RUN", Force: utils.ToPtr(true), Args: utils.ToPtr([]string{"echo -n 'version-1' > " + versionFilePath})},
+			FromImage: new("ubuntu:22.04"),
+			Steps: new([]api.TemplateStep{
+				{Type: "RUN", Force: new(true), Args: new([]string{"echo -n 'version-1' > " + versionFilePath})},
 			}),
 		},
 		ReqEditors: []api.RequestEditorFn{setup.WithAPIKey()},
@@ -591,9 +600,9 @@ func TestAssignmentOrderingAfterTagReassignment(t *testing.T) {
 	template2 := testutils.BuildTemplate(t, testutils.TemplateBuildOptions{
 		Name: alias,
 		BuildData: api.TemplateBuildStartV2{
-			FromImage: utils.ToPtr("ubuntu:22.04"),
-			Steps: utils.ToPtr([]api.TemplateStep{
-				{Type: "RUN", Force: utils.ToPtr(true), Args: utils.ToPtr([]string{"echo -n 'version-2' > " + versionFilePath})},
+			FromImage: new("ubuntu:22.04"),
+			Steps: new([]api.TemplateStep{
+				{Type: "RUN", Force: new(true), Args: new([]string{"echo -n 'version-2' > " + versionFilePath})},
 			}),
 		},
 		ReqEditors: []api.RequestEditorFn{setup.WithAPIKey()},
@@ -621,7 +630,7 @@ func TestAssignmentOrderingAfterTagReassignment(t *testing.T) {
 	envdClient := setup.GetEnvdClient(t, ctx)
 	fileResp, err := envdClient.HTTPClient.GetFilesWithResponse(
 		ctx,
-		&envd.GetFilesParams{Path: &versionFilePath, Username: utils.ToPtr("user")},
+		&envd.GetFilesParams{Path: &versionFilePath, Username: new("user")},
 		setup.WithSandbox(t, sbx.SandboxID),
 	)
 	require.NoError(t, err)

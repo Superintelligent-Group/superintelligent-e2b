@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/dashboard-api/internal/api"
-	"github.com/e2b-dev/infra/packages/db/queries"
+	dashboardqueries "github.com/e2b-dev/infra/packages/db/pkg/dashboard/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -22,12 +22,12 @@ func (s *APIStore) PatchTeamsTeamID(c *gin.Context, teamID api.TeamID) {
 	ctx := c.Request.Context()
 	telemetry.ReportEvent(ctx, "update team")
 
-	teamInfo, ok := s.requireAuthedTeamMatchesPath(c, teamID)
+	authTeamID, ok := s.requireAuthedTeamMatchesPath(c, teamID)
 	if !ok {
 		return
 	}
 
-	telemetry.SetAttributes(ctx, telemetry.WithTeamID(teamInfo.Team.ID.String()))
+	telemetry.SetAttributes(ctx, telemetry.WithTeamID(authTeamID.String()))
 
 	body, err := ginutils.ParseBodyWith(ctx, c, parseUpdateTeamBody)
 	if err != nil {
@@ -48,15 +48,15 @@ func (s *APIStore) PatchTeamsTeamID(c *gin.Context, teamID api.TeamID) {
 		return
 	}
 
-	row, err := s.db.UpdateTeam(ctx, queries.UpdateTeamParams{
-		TeamID:               teamInfo.Team.ID,
+	row, err := s.db.Dashboard.UpdateTeam(ctx, dashboardqueries.UpdateTeamParams{
+		TeamID:               authTeamID,
 		Name:                 body.NamePtr(),
 		NameSet:              body.NameSet,
 		ProfilePictureUrl:    body.ProfilePictureUrl,
 		ProfilePictureUrlSet: body.ProfilePictureUrlSet,
 	})
 	if err != nil {
-		logger.L().Error(ctx, "failed to update team", zap.Error(err), logger.WithTeamID(teamInfo.Team.ID.String()))
+		logger.L().Error(ctx, "failed to update team", zap.Error(err), logger.WithTeamID(authTeamID.String()))
 		s.sendAPIStoreError(c, http.StatusInternalServerError, "Failed to update team")
 
 		return

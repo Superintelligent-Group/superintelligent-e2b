@@ -1,12 +1,19 @@
+//go:build linux
+
 package rootfs
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"runtime"
 	"text/template"
 
 	"github.com/dustin/go-humanize"
@@ -18,15 +25,14 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/buildcontext"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/filesystem"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/oci"
-	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/systeminit"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases"
-	"github.com/e2b-dev/infra/packages/orchestrator/pkg/units"
 	artifactsregistry "github.com/e2b-dev/infra/packages/shared/pkg/artifacts-registry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/dockerhub"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/rootfs")
@@ -34,6 +40,23 @@ var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/tem
 //go:embed files
 var files embed.FS
 var fileTemplates = template.Must(template.ParseFS(files, "files/*"))
+
+// filesHash is a stable hash of the embedded rootfs file templates. It is used
+// only as part of the fallback provision version; explicit provision versions
+// remain the rollout control.
+var filesHash = func() string {
+	entries, _ := fs.ReadDir(files, "files")
+	h := sha256.New()
+	for _, e := range entries {
+		data, _ := files.ReadFile("files/" + e.Name())
+		fmt.Fprintf(h, "%s\x00%x\x00", e.Name(), data)
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}()
+
+// FilesHash returns a stable hash over the embedded rootfs file templates.
+func FilesHash() string { return filesHash }
 
 const (
 	BusyBoxPath     = "usr/bin/busybox"
@@ -201,16 +224,22 @@ func additionalOCILayers(
 		return nil, fmt.Errorf("error reading envd file: %w", err)
 	}
 
+	busyboxPath := filepath.Join(buildContext.BuilderConfig.HostBusyboxDir, buildContext.BuilderConfig.BusyboxVersion, runtime.GOARCH, "busybox")
+	busyboxData, err := os.ReadFile(busyboxPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading busybox file %s: %w", busyboxPath, err)
+	}
+
 	filesMap := map[string]oci.File{
 		storage.GuestEnvdPath: {Bytes: envdFileData, Mode: 0o777},
 
 		// Provision script
 		"usr/local/bin/provision.sh": {Bytes: []byte(provisionScript), Mode: 0o777},
 		// Setup init system
-		BusyBoxPath: {Bytes: systeminit.BusyboxBinary, Mode: 0o755},
+		BusyBoxPath: {Bytes: busyboxData, Mode: 0o755},
 		// Set to bin/init so it's not in conflict with systemd
 		// Any rewrite of the init file when booted from it will corrupt the filesystem
-		BusyBoxInitPath: {Bytes: systeminit.BusyboxBinary, Mode: 0o755},
+		BusyBoxInitPath: {Bytes: busyboxData, Mode: 0o755},
 	}
 
 	// add templates

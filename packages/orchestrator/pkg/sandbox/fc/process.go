@@ -1,3 +1,5 @@
+//go:build linux
+
 package fc
 
 import (
@@ -8,7 +10,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/socket"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
+	"github.com/e2b-dev/infra/packages/shared/pkg/fc/client/operations"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
@@ -76,6 +78,13 @@ func (f *fcLogFilter) Write(p []byte) (n int, err error) {
 	return len(p), err
 }
 
+// ext4RootFlags are the ext4 mount flags passed on the kernel cmdline.
+// discard: ext4 issues TRIM on freed blocks so they are elided from the
+// snapshot diff. It must never include "noload": a filesystem-only snapshot
+// resume cold-boots from the snapshot rootfs and relies on ext4 replaying the
+// journal on mount.
+const ext4RootFlags = "discard"
+
 type ProcessOptions struct {
 	// IoEngine is the io engine to use for the rootfs drive.
 	IoEngine *string
@@ -93,6 +102,14 @@ type ProcessOptions struct {
 	// KvmClock is a flag to enable kvm-clock as the clocksource for the kernel.
 	KvmClock bool
 
+	// AccessToken, when non-nil, makes Create write the guest MMDS metadata
+	// (sandbox/template IDs, logs address, and the access-token hash) before the
+	// VM boots, so a cold-booted envd can authenticate /init the same way it does
+	// after a memory resume. An empty string hashes to the "no token" value,
+	// matching Resume. Template-build cold boots leave it nil and skip the write,
+	// preserving their existing behavior.
+	AccessToken *string
+
 	// Stdout is the writer to which the process stdout will be written.
 	Stdout io.Writer
 
@@ -108,9 +125,9 @@ type TokenBucketConfig struct {
 	RefillTimeMs int64
 }
 
-// TxRateLimiterConfig holds TX rate limit parameters for a VM's network interface.
+// RateLimiterConfig holds rate limit parameters for a Firecracker device (network or block).
 // Mirrors the Firecracker RateLimiter structure: two independent token buckets.
-type TxRateLimiterConfig struct {
+type RateLimiterConfig struct {
 	Ops       TokenBucketConfig // packets; effective rate = BucketSize * 1000 / RefillTimeMs ops/s
 	Bandwidth TokenBucketConfig // bytes;   effective rate = BucketSize * 1000 / RefillTimeMs bytes/s
 }
@@ -133,6 +150,10 @@ type Process struct {
 	Exit *utils.ErrorOnce
 
 	client *apiClient
+
+	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
+	// metrics-reader goroutine (FC's SharedIncMetric resets per flush).
+	balloonAccum atomic.Pointer[BalloonMetricsSnapshot]
 }
 
 func NewProcess(
@@ -180,11 +201,7 @@ func NewProcess(
 		startScript.Value,
 	)
 
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Create a new session
-	}
-
-	return &Process{
+	p := &Process{
 		Versions:              versions,
 		Exit:                  utils.NewErrorOnce(),
 		cmd:                   cmd,
@@ -198,7 +215,13 @@ func NewProcess(
 
 		kernelPath: startScript.KernelPath,
 		rootfsPath: startScript.RootfsPath,
-	}, nil
+	}
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // Create a new session
+	}
+
+	return p, nil
 }
 
 func (p *Process) configure(
@@ -249,7 +272,7 @@ func (p *Process) configure(
 	}
 
 	startCtx, cancelStart := context.WithCancelCause(ctx)
-	defer cancelStart(fmt.Errorf("fc finished starting"))
+	defer cancelStart(errors.New("fc finished starting"))
 
 	go func() {
 		defer stderrWriter.Close()
@@ -299,8 +322,11 @@ func (p *Process) Create(
 	vCPUCount int64,
 	memoryMB int64,
 	hugePages bool,
+	freePageReporting bool,
+	freePageHinting bool,
 	options ProcessOptions,
-	txRateLimit TxRateLimiterConfig,
+	txRateLimit RateLimiterConfig,
+	driveRateLimit RateLimiterConfig,
 	cgroupFD int,
 ) error {
 	ctx, childSpan := tracer.Start(ctx, "create-fc")
@@ -362,6 +388,8 @@ func (p *Process) Create(
 		"i8042.nokbd":      "",
 		"i8042.noaux":      "",
 		"random.trust_cpu": "on",
+
+		"rootflags": ext4RootFlags,
 	}
 
 	if options.KvmClock {
@@ -405,7 +433,7 @@ func (p *Process) Create(
 	}
 	telemetry.ReportEvent(ctx, "symlinked rootfs")
 
-	err = p.client.setRootfsDrive(ctx, p.rootfsPath, options.IoEngine)
+	err = p.client.setRootfsDrive(ctx, p.rootfsPath, options.IoEngine, buildRateLimiter(driveRateLimit))
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -413,7 +441,7 @@ func (p *Process) Create(
 	}
 	telemetry.ReportEvent(ctx, "set fc drivers config")
 
-	err = p.client.setNetworkInterface(ctx, p.slot.VpeerName(), p.slot.TapName(), p.slot.TapMAC(), buildTxRateLimiter(txRateLimit))
+	err = p.client.setNetworkInterface(ctx, p.slot.VpeerName(), p.slot.TapName(), p.slot.TapMAC(), buildRateLimiter(txRateLimit))
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -437,6 +465,39 @@ func (p *Process) Create(
 	}
 	telemetry.ReportEvent(ctx, "set fc entropy config")
 
+	if freePageReporting || freePageHinting {
+		if err := p.client.installBalloon(ctx, freePageReporting, freePageHinting); err != nil {
+			fcStopErr := p.Stop(ctx)
+
+			return errors.Join(fmt.Errorf("error installing balloon device: %w", err), fcStopErr)
+		}
+		telemetry.ReportEvent(ctx, "installed balloon device",
+			attribute.Bool("balloon.free_page_reporting", freePageReporting),
+			attribute.Bool("balloon.free_page_hinting", freePageHinting),
+		)
+	}
+
+	// Write MMDS metadata before boot when an access token is provided (the
+	// cold-boot/reboot user path) so the guest envd can authenticate /init the
+	// same way it does after a memory resume. The MMDS transport is already
+	// configured by setNetworkInterface above. Template-build cold boots leave
+	// AccessToken nil and skip this, preserving their existing behavior.
+	if options.AccessToken != nil {
+		md := sbxMetadata.LoggerMetadata()
+		meta := &MmdsMetadata{
+			SandboxID:            md.SandboxID,
+			TemplateID:           md.TemplateID,
+			LogsCollectorAddress: fmt.Sprintf("http://%s/logs", p.config.NetworkConfig.OrchestratorInSandboxIPAddress),
+			AccessTokenHash:      keys.HashAccessToken(*options.AccessToken),
+		}
+		if err := p.client.setMmds(ctx, meta); err != nil {
+			fcStopErr := p.Stop(ctx)
+
+			return errors.Join(fmt.Errorf("error setting mmds: %w", err), fcStopErr)
+		}
+		telemetry.ReportEvent(ctx, "set fc mmds metadata")
+	}
+
 	err = p.client.startVM(ctx)
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
@@ -457,7 +518,9 @@ func (p *Process) Resume(
 	uffdReady chan struct{},
 	accessToken *string,
 	cgroupFD int,
-	txRateLimit TxRateLimiterConfig,
+	useMemfd bool,
+	txRateLimit RateLimiterConfig,
+	driveRateLimit RateLimiterConfig,
 ) error {
 	ctx, span := tracer.Start(ctx, "resume-fc")
 	defer span.End()
@@ -489,7 +552,10 @@ func (p *Process) Resume(
 	})
 
 	eg.Go(func() error {
-		err := socket.Wait(egCtx, uffdSocketPath)
+		ctx, uffdSpan := tracer.Start(egCtx, "wait-uffd-socket")
+		err := socket.Wait(ctx, uffdSocketPath)
+		uffdSpan.End()
+
 		if err != nil {
 			return fmt.Errorf("error waiting for uffd socket: %w", err)
 		}
@@ -500,7 +566,10 @@ func (p *Process) Resume(
 	})
 
 	eg.Go(func() error {
+		_, rootfsSpan := tracer.Start(egCtx, "wait-rootfs-path")
 		rootfsPath, err := p.rootfsProvider.Path()
+		rootfsSpan.End()
+
 		if err != nil {
 			return fmt.Errorf("error getting rootfs path: %w", err)
 		}
@@ -538,6 +607,7 @@ func (p *Process) Resume(
 		uffdSocketPath,
 		uffdReady,
 		snapfile,
+		useMemfd,
 	)
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
@@ -545,14 +615,21 @@ func (p *Process) Resume(
 		return errors.Join(fmt.Errorf("error loading snapshot: %w", err), fcStopErr)
 	}
 
-	// Always apply/reset the TX rate limit before resuming so any rate limit
-	// persisted in the snapshot is overwritten by the current config.
+	// Always apply/reset rate limits before resuming so any limits
+	// persisted in the snapshot are overwritten by the current config.
 	if setErr := p.client.setTxRateLimit(ctx, p.slot.VpeerName(), txRateLimit); setErr != nil {
 		fcStopErr := p.Stop(ctx)
 
 		return errors.Join(fmt.Errorf("error setting TX rate limit: %w", setErr), fcStopErr)
 	}
 	telemetry.ReportEvent(ctx, "configured tx rate limit")
+
+	if setErr := p.client.setDriveRateLimit(ctx, rootfsDriveID, driveRateLimit); setErr != nil {
+		fcStopErr := p.Stop(ctx)
+
+		return errors.Join(fmt.Errorf("error setting drive rate limit: %w", setErr), fcStopErr)
+	}
+	telemetry.ReportEvent(ctx, "configured drive rate limit")
 
 	err = p.client.resumeVM(ctx)
 	if err != nil {
@@ -591,28 +668,15 @@ func (p *Process) Resume(
 
 func (p *Process) Pid() (int, error) {
 	if p.cmd.Process == nil {
-		return 0, fmt.Errorf("fc process not started")
+		return 0, errors.New("fc process not started")
 	}
 
 	return p.cmd.Process.Pid, nil
 }
 
-// getProcessState returns the state of the process.
-// It's used to check if the process is in the D state, because gopsutil doesn't show that.
-func getProcessState(ctx context.Context, pid int) (string, error) {
-	output, err := exec.CommandContext(ctx, "ps", "-o", "stat=", "-p", fmt.Sprint(pid)).Output()
-	if err != nil {
-		return "", fmt.Errorf("error getting state of pid=%d: %w", pid, err)
-	}
-
-	state := strings.TrimSpace(string(output))
-
-	return state, nil
-}
-
 func (p *Process) Stop(ctx context.Context) error {
 	if p.cmd.Process == nil {
-		return fmt.Errorf("fc process not started")
+		return errors.New("fc process not started")
 	}
 
 	// Always remove the metrics FIFO, even if the process already exited,
@@ -621,7 +685,10 @@ func (p *Process) Stop(ctx context.Context) error {
 		logger.L().Warn(ctx, "failed to remove fc metrics FIFO", zap.Error(removeErr), logger.WithSandboxID(p.files.SandboxID))
 	}
 
-	// Check if process has already exited.
+	pid := p.cmd.Process.Pid
+
+	// Check if the Firecracker leader has already exited. Descendant cleanup is
+	// handled by the sandbox cgroup so Stop never signals a numeric process group.
 	select {
 	case <-p.Exit.Done():
 		logger.L().Info(ctx, "fc process already exited", logger.WithSandboxID(p.files.SandboxID))
@@ -633,14 +700,8 @@ func (p *Process) Stop(ctx context.Context) error {
 	// this function should never fail b/c a previous context was canceled.
 	ctx = context.WithoutCancel(ctx)
 
-	state, err := getProcessState(ctx, p.cmd.Process.Pid)
-	if err != nil {
-		logger.L().Warn(ctx, "failed to get fc process state", zap.Error(err), logger.WithSandboxID(p.files.SandboxID))
-	} else if state == "D" {
-		logger.L().Info(ctx, "fc process is in the D state before we call SIGTERM", logger.WithSandboxID(p.files.SandboxID))
-	}
-
-	err = p.cmd.Process.Signal(syscall.SIGTERM)
+	// On Linux >= 5.4, Go backs os.Process with pidfd, so Signal is safe against PID reuse.
+	err := p.cmd.Process.Signal(syscall.SIGTERM)
 	if err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			logger.L().Info(ctx, "fc process already exited", logger.WithSandboxID(p.files.SandboxID))
@@ -651,31 +712,38 @@ func (p *Process) Stop(ctx context.Context) error {
 		logger.L().Warn(ctx, "failed to send SIGTERM to fc process", zap.Error(err), logger.WithSandboxID(p.files.SandboxID))
 	}
 
-	go func() {
-		select {
-		// Wait 10 sec for the FC process to exit, if it doesn't, send SIGKILL.
-		case <-time.After(10 * time.Second):
-			err := p.cmd.Process.Kill()
-			if err != nil {
-				logger.L().Warn(ctx, "failed to send SIGKILL to fc process", zap.Error(err), logger.WithSandboxID(p.files.SandboxID))
-			} else {
-				logger.L().Info(ctx, "sent SIGKILL to fc process because it was not responding to SIGTERM for 10 seconds", logger.WithSandboxID(p.files.SandboxID))
-			}
+	termDeadline := time.NewTimer(10 * time.Second)
+	defer termDeadline.Stop()
 
-			state, err := getProcessState(ctx, p.cmd.Process.Pid)
-			if err != nil {
-				logger.L().Warn(ctx, "failed to get fc process state after sending SIGKILL", zap.Error(err), logger.WithSandboxID(p.files.SandboxID))
-			} else if state == "D" {
-				logger.L().Info(ctx, "fc process is in the D state after we call SIGKILL", logger.WithSandboxID(p.files.SandboxID))
-			}
-
-		// If the FC process exited, we can return.
-		case <-p.Exit.Done():
-			return
+	select {
+	case <-p.Exit.Done():
+		return nil
+	case <-termDeadline.C:
+		killErr := p.cmd.Process.Kill()
+		if killErr == nil {
+			logger.L().Info(ctx, "sent SIGKILL to fc process because it was not responding to SIGTERM for 10 seconds",
+				logger.WithSandboxID(p.files.SandboxID),
+			)
 		}
-	}()
+		if errors.Is(killErr, os.ErrProcessDone) {
+			logger.L().Info(ctx, "fc process already exited", logger.WithSandboxID(p.files.SandboxID))
 
-	return nil
+			return nil
+		}
+		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			logger.L().Warn(ctx, "failed to send SIGKILL to fc process", zap.Error(killErr), logger.WithSandboxID(p.files.SandboxID))
+		}
+
+		killDeadline := time.NewTimer(time.Second)
+		defer killDeadline.Stop()
+
+		select {
+		case <-p.Exit.Done():
+			return nil
+		case <-killDeadline.C:
+			return fmt.Errorf("fc process %d still exists after SIGKILL", pid)
+		}
+	}
 }
 
 func (p *Process) Pause(ctx context.Context) error {
@@ -683,6 +751,72 @@ func (p *Process) Pause(ctx context.Context) error {
 	defer childSpan.End()
 
 	return p.client.pauseVM(ctx)
+}
+
+// freePageHintDone is FC's FREE_PAGE_HINT_DONE: the host_cmd value FC writes
+// back after the guest's FREE_PAGE_HINT_STOP when start used acknowledge_on_stop.
+const freePageHintDone int64 = 1
+
+// DrainBalloon triggers a free-page-hinting run and blocks until the cycle
+// completes or ctx fires. No-op on FC < v1.14 and when no balloon is configured.
+func (p *Process) DrainBalloon(ctx context.Context) error {
+	ctx, span := tracer.Start(ctx, "drain-balloon")
+	outcome := "ok"
+	defer func() {
+		span.SetAttributes(attribute.String("drain-balloon.outcome", outcome))
+		span.End()
+	}()
+
+	if !FCSupportsFreePageHinting(p.Versions.FirecrackerVersion) {
+		outcome = "fc-unsupported"
+
+		return nil
+	}
+
+	if err := p.client.startBalloonHinting(ctx, true); err != nil {
+		var notConfigured *operations.StartBalloonHintingBadRequest
+		if errors.As(err, &notConfigured) {
+			outcome = "not-configured"
+
+			return nil
+		}
+
+		outcome = "start-failed"
+
+		return fmt.Errorf("start balloon hinting: %w", err)
+	}
+
+	if err := pollFphDone(ctx, p.client.describeBalloonHinting); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			outcome = "timeout"
+		} else {
+			outcome = "describe-failed"
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func pollFphDone(ctx context.Context, describe func(ctx context.Context) (int64, error)) error {
+	backoff := 5 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+
+		host, err := describe(ctx)
+		if err != nil {
+			return fmt.Errorf("balloon hinting status: %w", err)
+		}
+		if host == freePageHintDone {
+			return nil
+		}
+		backoff = min(backoff*2, 50*time.Millisecond)
+	}
 }
 
 // CreateSnapshot VM needs to be paused before creating a snapshot.

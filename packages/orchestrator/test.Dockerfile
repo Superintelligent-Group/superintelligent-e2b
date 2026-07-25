@@ -1,6 +1,11 @@
-ARG GOLANG_VERSION=1.25.4
+ARG GOLANG_VERSION=1.26.5
 
-# It has to match with the host OS version (Ubuntu 22.04 = bookworm)
+# The orchestrator binary is built with CGO and dynamically links against
+# glibc, so the build image's glibc must be <= the host's glibc (forward
+# compatibility only). The host runs Ubuntu 24.04 (glibc 2.39), so bookworm
+# (glibc 2.36) is safe; do NOT bump to trixie (glibc 2.41) without also
+# upgrading the host, or the binary will fail to start with
+# "GLIBC_2.4x not found" errors.
 ARG DEBIAN_VERSION=bookworm
 
 # Dockerfile for running orchestrator golang tests
@@ -16,7 +21,7 @@ COPY .shared/pkg pkg
 
 WORKDIR /build/clickhouse
 
-# Copy clickhouse package dependencies  
+# Copy clickhouse package dependencies
 COPY .clickhouse/go.mod .clickhouse/go.sum ./
 RUN go mod download
 
@@ -30,7 +35,9 @@ RUN go mod download
 
 # Copy source code
 COPY main.go Makefile ./
-COPY internal internal
+COPY scripts scripts
+COPY pkg pkg
+COPY cmd cmd
 
 FROM base AS runner
 

@@ -1,7 +1,10 @@
+//go:build linux
+
 package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +26,10 @@ func (c *Checks) getHealth(ctx context.Context, timeout time.Duration) (bool, er
 
 	response, err := sandboxHttpClient.Do(request)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return false, errors.New("health check timed out")
+		}
+
 		return false, err
 	}
 	defer func() {

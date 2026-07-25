@@ -11,16 +11,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asaskevich/govalidator"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/launchdarkly/go-sdk-common/v3/ldcontext"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
-	"github.com/e2b-dev/infra/packages/api/internal/middleware/otel/metrics"
+	apiorch "github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
@@ -32,6 +34,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
+	"github.com/e2b-dev/infra/packages/shared/pkg/middleware/otel/metrics"
 	sandbox_network "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-network"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -44,6 +47,15 @@ const (
 
 	// Network validation error messages
 	ErrMsgDomainsRequireBlockAll = "When specifying allowed domains in allow out, you must include 'ALL_TRAFFIC' in deny out to block all other traffic."
+
+	maxNetworkRuleDomains             = 10
+	maxNetworkRuleTransformsPerDomain = 1
+	maxNetworkRuleDomainLen           = 128
+	maxNetworkRuleHeaderNameLen       = 64
+	maxNetworkRuleHeaderValueLen      = 2048
+	maxNetworkRuleHeadersPerRule      = 20
+
+	maxIamTokens = 5
 )
 
 func (a *APIStore) PostSandboxes(c *gin.Context) {
@@ -89,7 +101,17 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 
 	env, build, err := a.templateCache.Get(ctx, aliasInfo.TemplateID, tag, teamInfo.Team.ID, clusterID)
 	if err != nil {
-		apiErr := templatecache.ErrorToAPIError(err, aliasInfo.TemplateID)
+		visible := aliasInfo.TeamID == teamInfo.Team.ID
+		if metadata, mErr := a.templateCache.GetMetadata(ctx, aliasInfo.TemplateID); mErr == nil {
+			visible = visible || metadata.Public
+		}
+
+		ref := templatecache.TemplateRef{
+			Identifier: aliasInfo.MatchedIdentifier,
+			Visible:    visible,
+		}
+
+		apiErr := ref.APIError(err)
 		telemetry.ReportErrorByCode(ctx, apiErr.Code, "error when getting template", apiErr.Err, telemetry.WithTemplateID(aliasInfo.TemplateID))
 		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
@@ -122,6 +144,9 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 	)
 
 	autoPause := sharedUtils.DerefOrDefault(body.AutoPause, sandbox.AutoPauseDefault)
+	// autoPauseMemory defaults to true (full memory snapshot). When false, a
+	// timeout auto-pause takes a filesystem-only snapshot (cold-boots on resume).
+	autoPauseFilesystemOnly := !sharedUtils.DerefOrDefault(body.AutoPauseMemory, true)
 	envVars := sharedUtils.DerefOrDefault(body.EnvVars, nil)
 	mcp := sharedUtils.DerefOrDefault(body.Mcp, nil)
 	metadata := sharedUtils.DerefOrDefault(body.Metadata, nil)
@@ -139,6 +164,27 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 	}
 
 	autoResume := buildAutoResumeConfig(body.AutoResume)
+	if autoResume != nil {
+		minAutoResumeTimeout := time.Duration(a.featureFlags.IntFlag(ctx, featureflags.MinAutoResumeTimeoutSeconds)) * time.Second
+		autoResume.Timeout = calculateTimeoutSeconds(timeout, minAutoResumeTimeout, teamInfo)
+	}
+
+	// autoPauseMemory only controls the snapshot kind of a timeout auto-pause, so
+	// it is meaningless without autoPause; reject it rather than silently storing
+	// a no-op policy.
+	if autoPauseFilesystemOnly && !autoPause {
+		a.sendAPIStoreError(c, http.StatusBadRequest, "autoPauseMemory=false only applies when autoPause is true.")
+
+		return
+	}
+
+	// A filesystem-only auto-pause produces a snapshot that traffic cannot
+	// auto-resume (it must be resumed explicitly), so the two are incompatible.
+	if autoPauseFilesystemOnly && autoResume != nil && autoResume.Policy == types.SandboxAutoResumeAny {
+		a.sendAPIStoreError(c, http.StatusBadRequest, "autoPauseMemory=false (filesystem-only auto-pause) cannot be combined with autoResume: a filesystem-only snapshot cannot be auto-resumed by traffic and must be resumed explicitly.")
+
+		return
+	}
 
 	var envdAccessToken *string = nil
 	if body.Secure != nil && *body.Secure == true {
@@ -153,11 +199,25 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 		envdAccessToken = &accessToken
 	}
 
+	iamCfg, iamErr := buildSandboxIam(body.Iam)
+	if iamErr != nil {
+		telemetry.ReportError(ctx, "invalid iam config", iamErr.Err, telemetry.WithSandboxID(sandboxID))
+		a.sendAPIStoreError(c, iamErr.Code, iamErr.ClientMsg)
+
+		return
+	}
+
+	if iamCfg != nil && !a.featureFlags.BoolFlag(ctx, featureflags.SandboxIamTokensFlag, featureflags.TeamContext(teamInfo.Team.ID.String())) {
+		a.sendAPIStoreError(c, http.StatusBadRequest, "Sandbox IAM workload tokens are not available for your team.")
+
+		return
+	}
+
 	allowInternetAccess := body.AllowInternetAccess
 
 	var network *types.SandboxNetworkConfig
 	if n := body.Network; n != nil {
-		if err := validateNetworkConfig(n); err != nil {
+		if err := validateNetworkConfig(ctx, a.featureFlags, teamInfo.Team.ID, sharedUtils.DerefOrDefault(build.EnvdVersion, ""), n); err != nil {
 			telemetry.ReportError(ctx, "invalid network config", err.Err, telemetry.WithSandboxID(sandboxID))
 			a.sendAPIStoreError(c, err.Code, err.ClientMsg)
 
@@ -172,7 +232,34 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 			Egress: &types.SandboxNetworkEgressConfig{
 				AllowedAddresses: sharedUtils.DerefOrDefault(n.AllowOut, nil),
 				DeniedAddresses:  sharedUtils.DerefOrDefault(n.DenyOut, nil),
+				Rules:            apiRulesToDBRules(n.Rules),
 			},
+		}
+
+		if ep := n.EgressProxy; ep != nil {
+			if !a.featureFlags.BoolFlag(ctx, featureflags.BYOPProxyEnabledFlag) {
+				telemetry.ReportEvent(ctx, "egressProxy rejected by BYOPProxyEnabledFlag")
+				a.sendAPIStoreError(c, http.StatusForbidden,
+					"Egress proxy (network.egressProxy) is not enabled for this team.")
+
+				return
+			}
+
+			canonical, err := sandbox_network.ValidateEgressProxy(ctx, &sandbox_network.EgressProxyConfig{
+				Address:  ep.Address,
+				Username: sharedUtils.DerefOrDefault(ep.Username, ""),
+				Password: sharedUtils.DerefOrDefault(ep.Password, ""),
+			}, nil)
+			if err != nil {
+				telemetry.ReportError(ctx, "invalid egress proxy config", err, telemetry.WithSandboxID(sandboxID))
+				a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid egress proxy config: %s", err))
+
+				return
+			}
+
+			network.Egress.EgressProxyAddress = canonical.Address
+			network.Egress.EgressProxyUsername = canonical.Username
+			network.Egress.EgressProxyPassword = canonical.Password
 		}
 
 		// Make sure envd seucre access is enforced when public access is disabled,
@@ -185,9 +272,15 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 	}
 
 	sbxVolumeMounts, err := convertAPIVolumesToOrchestratorVolumes(
-		ctx, a.sqlcDB, a.featureFlags, teamInfo.ID, apiVolumeMounts,
+		ctx, a.sqlcDB, a.featureFlags, teamInfo.ID, apiVolumeMounts, build,
 	)
 	if err != nil {
+		if errors.Is(err, errVolumesNotSupported) || errors.Is(err, errNoEnvdVersion) {
+			a.sendAPIStoreError(c, http.StatusBadRequest, err.Error())
+
+			return
+		}
+
 		if errors.Is(err, ErrVolumeMountsDisabled) {
 			a.sendAPIStoreError(c, http.StatusBadRequest, "Volume mounts are not enabled.")
 
@@ -207,27 +300,36 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 		return
 	}
 
+	getSandboxData := func(_ context.Context) (apiorch.SandboxMetadata, *api.APIError) {
+		// The data can't be influenced by action on the same sandbox as other operations,
+		// so it's safe to reuse the data
+		return apiorch.SandboxMetadata{
+			Metadata:                metadata,
+			EnvVars:                 envVars,
+			Build:                   *build,
+			AllowInternetAccess:     allowInternetAccess,
+			Network:                 network,
+			Alias:                   alias,
+			TemplateID:              env.TemplateID,
+			BaseTemplateID:          env.TemplateID,
+			AutoPause:               autoPause,
+			AutoPauseFilesystemOnly: autoPauseFilesystemOnly,
+			AutoResume:              autoResume,
+			VolumeMounts:            sbxVolumeMounts,
+			EnvdAccessToken:         envdAccessToken,
+			Iam:                     iamCfg,
+		}, nil
+	}
+
 	sbx, createErr := a.startSandbox(
 		ctx,
 		sandboxID,
 		timeout,
-		envVars,
-		metadata,
-		alias,
 		teamInfo,
-		*build,
+		getSandboxData,
 		&c.Request.Header,
 		false,
-		nil,
-		env.TemplateID,
-		env.TemplateID,
-		autoPause,
-		autoResume,
-		envdAccessToken,
-		allowInternetAccess,
-		network,
 		mcp,
-		sbxVolumeMounts,
 	)
 	if createErr != nil {
 		a.sendAPIStoreError(c, createErr.Code, createErr.ClientMsg)
@@ -235,7 +337,64 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 		return
 	}
 
+	if n := body.Network; n != nil && n.Rules != nil && len(*n.Rules) > 0 {
+		domains := make([]string, 0, len(*n.Rules))
+		for domain := range *n.Rules {
+			domains = append(domains, domain)
+		}
+
+		a.posthog.CreateAnalyticsTeamEvent(ctx, teamInfo.Team.ID.String(), "sandbox with network transform rules created",
+			a.posthog.GetPackageToPosthogProperties(&c.Request.Header).
+				Set("sandbox_id", sandboxID).
+				Set("domains", domains),
+		)
+	}
+
 	c.JSON(http.StatusCreated, &sbx)
+}
+
+// iamTokenTypeJWTSVID is the only workload token type accepted in this version.
+const iamTokenTypeJWTSVID = "JWT-SVID"
+
+// buildSandboxIam validates the optional iam.tokens map and returns the sandbox
+// workload identity configuration to persist. An absent or empty map means
+// workload identity is disabled and returns nil. The audience is preserved
+// exactly as received.
+func buildSandboxIam(iam *api.SandboxIam) (*types.SandboxIam, *api.APIError) {
+	if iam == nil || iam.Tokens == nil || len(*iam.Tokens) == 0 {
+		return nil, nil
+	}
+
+	reject := func(field, msg string) *api.APIError {
+		return &api.APIError{
+			Code:      http.StatusBadRequest,
+			Err:       fmt.Errorf("%s: %s", field, msg),
+			ClientMsg: fmt.Sprintf("%s: %s", field, msg),
+		}
+	}
+
+	if len(*iam.Tokens) > maxIamTokens {
+		return nil, reject("iam.tokens", fmt.Sprintf("too many tokens: %d (max %d)", len(*iam.Tokens), maxIamTokens))
+	}
+
+	tokens := make(map[string]types.SandboxIamToken, len(*iam.Tokens))
+	for name, def := range *iam.Tokens {
+		if name == "" {
+			return nil, reject("iam.tokens", "token name must not be empty")
+		}
+
+		if def.Audience == "" {
+			return nil, reject(fmt.Sprintf("iam.tokens.%s.audience", name), "audience is required")
+		}
+
+		if def.TokenType != iamTokenTypeJWTSVID {
+			return nil, reject(fmt.Sprintf("iam.tokens.%s.tokenType", name), fmt.Sprintf("only %q is supported", iamTokenTypeJWTSVID))
+		}
+
+		tokens[name] = types.SandboxIamToken{Audience: def.Audience, TokenType: def.TokenType}
+	}
+
+	return &types.SandboxIam{Tokens: tokens}, nil
 }
 
 func buildAutoResumeConfig(autoResume *api.SandboxAutoResumeConfig) *types.SandboxAutoResumeConfig {
@@ -292,19 +451,52 @@ func (im InvalidVolumeMountsError) Error() string {
 	return fmt.Sprintf("invalid mounts:\n%s", strings.Join(errs, "\n"))
 }
 
-func convertAPIVolumesToOrchestratorVolumes(
-	ctx context.Context,
-	sqlClient *sqlcdb.Client,
-	featureFlags featureFlagsClient,
-	teamID uuid.UUID,
-	volumeMounts []api.SandboxVolumeMount,
-) ([]*orchestrator.SandboxVolumeMount, error) {
+var errVolumesNotSupported = errors.New("volumes are not supported")
+
+var errNetworkRulesNotSupported = errors.New("network transform rules are not supported")
+
+var errNoEnvdVersion = errors.New("template must be rebuilt: envd version is not set")
+
+const minEnvdVersionForNetworkRules = "0.5.13"
+
+const minEnvdVersionForVolumes = "0.5.14"
+
+// checkEnvdVersionRequirement returns errNoEnvdVersion when buildVersion is empty, a parse
+// error when the version string is invalid, or a wrapped featureErr when the build does not
+// meet requiredMinVersion. The caller decides how to convert the returned error into an API
+// response so each call-site can produce its own status code / message.
+func checkEnvdVersionRequirement(buildVersion, requiredMinVersion string, featureErr error) error {
+	if buildVersion == "" {
+		return errNoEnvdVersion
+	}
+
+	ok, err := sharedUtils.IsGTEVersion(buildVersion, requiredMinVersion)
+	if err != nil {
+		return fmt.Errorf("invalid envd version %q: %w", buildVersion, err)
+	}
+
+	if !ok {
+		return fmt.Errorf("%w; template must be rebuilt. Template envd version is %s, must be at least %s", featureErr, buildVersion, requiredMinVersion)
+	}
+
+	return nil
+}
+
+func convertAPIVolumesToOrchestratorVolumes(ctx context.Context, sqlClient *sqlcdb.Client, featureFlags featureFlagsClient, teamID uuid.UUID, volumeMounts []api.SandboxVolumeMount, env *queries.EnvBuild) ([]*orchestrator.SandboxVolumeMount, error) {
+	// are any volumes configured?
 	if len(volumeMounts) == 0 {
 		return []*orchestrator.SandboxVolumeMount{}, nil // only b/c you should never return (nil, nil)
 	}
 
+	// are volumes enabled?
 	if !featureFlags.BoolFlag(ctx, featureflags.PersistentVolumesFlag) {
 		return nil, ErrVolumeMountsDisabled
+	}
+
+	// does your envd version support volumes?
+	envdVersion := sharedUtils.DerefOrDefault(env.EnvdVersion, "")
+	if err := checkEnvdVersionRequirement(envdVersion, minEnvdVersionForVolumes, errVolumesNotSupported); err != nil {
+		return nil, err
 	}
 
 	// get volumes from the database
@@ -469,7 +661,33 @@ func splitHostPortOptional(hostport string) (host string, port string, err error
 	return host, port, nil
 }
 
-func validateNetworkConfig(network *api.SandboxNetworkConfig) *api.APIError {
+func apiRulesToDBRules(apiRules *map[string][]api.SandboxNetworkRule) map[string][]types.SandboxNetworkRule {
+	if apiRules == nil {
+		return nil
+	}
+
+	dbRules := make(map[string][]types.SandboxNetworkRule, len(*apiRules))
+	for domain, rules := range *apiRules {
+		dbDomainRules := make([]types.SandboxNetworkRule, 0, len(rules))
+		for _, r := range rules {
+			dbRule := types.SandboxNetworkRule{}
+
+			if r.Transform != nil {
+				dbRule.Transform = &types.SandboxNetworkTransform{
+					Headers: sharedUtils.DerefOrDefault(r.Transform.Headers, nil),
+				}
+			}
+
+			dbDomainRules = append(dbDomainRules, dbRule)
+		}
+
+		dbRules[domain] = dbDomainRules
+	}
+
+	return dbRules
+}
+
+func validateNetworkConfig(ctx context.Context, featureFlags featureFlagsClient, teamID uuid.UUID, envdVersion string, network *api.SandboxNetworkConfig) *api.APIError {
 	if network == nil {
 		return nil
 	}
@@ -505,7 +723,11 @@ func validateNetworkConfig(network *api.SandboxNetworkConfig) *api.APIError {
 	denyOut := sharedUtils.DerefOrDefault(network.DenyOut, nil)
 	allowOut := sharedUtils.DerefOrDefault(network.AllowOut, nil)
 
-	return validateEgressRules(allowOut, denyOut)
+	if err := validateEgressRules(allowOut, denyOut); err != nil {
+		return err
+	}
+
+	return validateNetworkRules(ctx, featureFlags, teamID, envdVersion, network.Rules)
 }
 
 // validateEgressRules validates egress allow/deny rules:
@@ -540,8 +762,139 @@ func validateEgressRules(allowOut, denyOut []string) *api.APIError {
 		if len(allowedDomains) > 0 && !hasBlockAll {
 			return &api.APIError{
 				Code:      http.StatusBadRequest,
-				Err:       fmt.Errorf("allow out contains domains but deny out is missing 0.0.0.0/0 (ALL_TRAFFIC)"),
+				Err:       errors.New("allow out contains domains but deny out is missing 0.0.0.0/0 (ALL_TRAFFIC)"),
 				ClientMsg: ErrMsgDomainsRequireBlockAll,
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateNetworkRules(ctx context.Context, featureFlags featureFlagsClient, teamID uuid.UUID, envdVersion string, rules *map[string][]api.SandboxNetworkRule) *api.APIError {
+	if rules == nil {
+		return nil
+	}
+
+	if !featureFlags.BoolFlag(ctx, featureflags.NetworkTransformRulesFlag, featureflags.TeamContext(teamID.String())) {
+		return &api.APIError{
+			Code:      http.StatusBadRequest,
+			Err:       fmt.Errorf("team %s is not allowed to use network transform rules", teamID),
+			ClientMsg: "Network transform rules are not available for your team.",
+		}
+	}
+
+	if err := checkEnvdVersionRequirement(envdVersion, minEnvdVersionForNetworkRules, errNetworkRulesNotSupported); err != nil {
+		if errors.Is(err, errNetworkRulesNotSupported) || errors.Is(err, errNoEnvdVersion) {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       err,
+				ClientMsg: err.Error(),
+			}
+		}
+
+		return &api.APIError{
+			Code:      http.StatusInternalServerError,
+			Err:       err,
+			ClientMsg: "internal error while validating network rules",
+		}
+	}
+
+	if len(*rules) > maxNetworkRuleDomains {
+		return &api.APIError{
+			Code:      http.StatusBadRequest,
+			Err:       fmt.Errorf("too many rule domains: %d (max %d)", len(*rules), maxNetworkRuleDomains),
+			ClientMsg: fmt.Sprintf("Network rules can have at most %d domains.", maxNetworkRuleDomains),
+		}
+	}
+
+	for domain, domainRules := range *rules {
+		if len(domain) == 0 {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       errors.New("rule domain must not be empty"),
+				ClientMsg: "Rule domain must not be empty.",
+			}
+		}
+
+		if len(domain) > maxNetworkRuleDomainLen {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       fmt.Errorf("rule domain %q exceeds max length %d", domain, maxNetworkRuleDomainLen),
+				ClientMsg: fmt.Sprintf("Rule domain %q exceeds maximum length of %d characters.", domain, maxNetworkRuleDomainLen),
+			}
+		}
+
+		if !govalidator.IsDNSName(domain) {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       fmt.Errorf("rule domain %q is not a valid domain", domain),
+				ClientMsg: fmt.Sprintf("Rule domain %q is not a valid domain name.", domain),
+			}
+		}
+
+		if len(domainRules) > maxNetworkRuleTransformsPerDomain {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       fmt.Errorf("domain %q has %d transforms (max %d)", domain, len(domainRules), maxNetworkRuleTransformsPerDomain),
+				ClientMsg: fmt.Sprintf("Domain %q can have at most %d transform rule.", domain, maxNetworkRuleTransformsPerDomain),
+			}
+		}
+
+		for _, rule := range domainRules {
+			if rule.Transform == nil {
+				continue
+			}
+
+			headers := sharedUtils.DerefOrDefault(rule.Transform.Headers, nil)
+			if len(headers) > maxNetworkRuleHeadersPerRule {
+				return &api.APIError{
+					Code:      http.StatusBadRequest,
+					Err:       fmt.Errorf("domain %q has %d headers (max %d)", domain, len(headers), maxNetworkRuleHeadersPerRule),
+					ClientMsg: fmt.Sprintf("Domain %q can have at most %d headers per rule.", domain, maxNetworkRuleHeadersPerRule),
+				}
+			}
+
+			for name, value := range headers {
+				if len(name) == 0 {
+					return &api.APIError{
+						Code:      http.StatusBadRequest,
+						Err:       fmt.Errorf("header name in rule for domain %q must not be empty", domain),
+						ClientMsg: fmt.Sprintf("Header name in rule for domain %q must not be empty.", domain),
+					}
+				}
+
+				if !httpguts.ValidHeaderFieldName(name) {
+					return &api.APIError{
+						Code:      http.StatusBadRequest,
+						Err:       fmt.Errorf("header name %q in rule for domain %q contains invalid characters", name, domain),
+						ClientMsg: fmt.Sprintf("Header name %q in rule for domain %q must contain only valid HTTP token characters.", name, domain),
+					}
+				}
+
+				if len(name) > maxNetworkRuleHeaderNameLen {
+					return &api.APIError{
+						Code:      http.StatusBadRequest,
+						Err:       fmt.Errorf("header name %q in rule for domain %q exceeds max length %d", name, domain, maxNetworkRuleHeaderNameLen),
+						ClientMsg: fmt.Sprintf("Header name %q in rule for domain %q exceeds maximum length of %d characters.", name, domain, maxNetworkRuleHeaderNameLen),
+					}
+				}
+
+				if !httpguts.ValidHeaderFieldValue(value) {
+					return &api.APIError{
+						Code:      http.StatusBadRequest,
+						Err:       fmt.Errorf("value for header %q in rule for domain %q contains invalid characters", name, domain),
+						ClientMsg: fmt.Sprintf("Value for header %q in rule for domain %q contains invalid characters.", name, domain),
+					}
+				}
+
+				if len(value) > maxNetworkRuleHeaderValueLen {
+					return &api.APIError{
+						Code:      http.StatusBadRequest,
+						Err:       fmt.Errorf("value for header %q in rule for domain %q exceeds max length %d", name, domain, maxNetworkRuleHeaderValueLen),
+						ClientMsg: fmt.Sprintf("Value for header %q in rule for domain %q exceeds maximum length of %d characters.", name, domain, maxNetworkRuleHeaderValueLen),
+					}
+				}
 			}
 		}
 	}

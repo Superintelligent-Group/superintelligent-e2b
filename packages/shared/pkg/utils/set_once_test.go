@@ -2,7 +2,7 @@ package utils
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -27,7 +27,7 @@ func TestSetOnce(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, value)
 
-	setOnce.SetError(fmt.Errorf("error"))
+	setOnce.SetError(errors.New("error"))
 
 	value, err = setOnce.Wait()
 	require.NoError(t, err)
@@ -37,7 +37,7 @@ func TestSetOnce(t *testing.T) {
 func TestSetOnceSetError(t *testing.T) {
 	t.Parallel()
 	setOnce := NewSetOnce[int]()
-	expectedErr := fmt.Errorf("error")
+	expectedErr := errors.New("error")
 
 	err := setOnce.SetError(expectedErr)
 	require.NoError(t, err)
@@ -109,6 +109,24 @@ func TestSetOnceWaitWithContextCanceled(t *testing.T) {
 	require.Error(t, err)
 
 	wg.Wait()
+}
+
+func TestSetOnceWaitWithContextCanceledValueSet(t *testing.T) {
+	t.Parallel()
+	setOnce := NewSetOnce[int]()
+
+	require.NoError(t, setOnce.SetValue(1))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// A set value must always win over a cancelled context. Repeat to catch
+	// the random select choice when both channels are ready.
+	for range 200 {
+		value, err := setOnce.WaitWithContext(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, value)
+	}
 }
 
 func TestSetOnceSetResultConcurrent(t *testing.T) {

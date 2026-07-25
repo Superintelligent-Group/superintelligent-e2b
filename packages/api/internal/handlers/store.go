@@ -13,7 +13,10 @@ import (
 	"github.com/google/uuid"
 	nomadapi "github.com/hashicorp/nomad/api"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
@@ -21,23 +24,44 @@ import (
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	clustersdiscovery "github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
+	orchdiscovery "github.com/e2b-dev/infra/packages/api/internal/orchestrator/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	template_manager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
 	clickhouse "github.com/e2b-dev/infra/packages/clickhouse/pkg"
+	"github.com/e2b-dev/infra/packages/clickhouse/pkg/sandboxlogs"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
+	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
 	"github.com/e2b-dev/infra/packages/db/pkg/pool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+// newInClusterKubeClient builds a Kubernetes API client using the pod's
+// in-cluster ServiceAccount token. The api Pod must be running in K8s with a
+// projected SA token (the default for any pod with a ServiceAccount).
+func newInClusterKubeClient() (kubernetes.Interface, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("rest.InClusterConfig: %w", err)
+	}
+	c, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes.NewForConfig: %w", err)
+	}
+
+	return c, nil
+}
 
 var _ api.ServerInterface = (*APIStore)(nil)
 
@@ -54,9 +78,10 @@ type APIStore struct {
 	templateCache         *templatecache.TemplateCache
 	templateBuildsCache   *templatecache.TemplatesBuildCache
 	snapshotCache         *snapshotcache.SnapshotCache
-	authService           *sharedauth.AuthService[*types.Team]
+	authService           sharedauth.Service
 	templateSpawnCounter  *utils.TemplateSpawnCounter
 	clickhouseStore       clickhouse.Clickhouse
+	sandboxLogsReader     *sandboxlogs.Reader
 	accessTokenGenerator  *sandbox.AccessTokenGenerator
 	featureFlags          *featureflags.Client
 	clusters              *clusters.Pool
@@ -76,7 +101,6 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 	authDB, err := authdb.NewClient(
 		ctx,
 		config.AuthDBConnectionString,
-		config.AuthDBReadReplicaConnectionString,
 		pool.WithMaxConnections(config.AuthDBMaxOpenConnections),
 		pool.WithMinIdle(config.AuthDBMinIdleConnections),
 	)
@@ -86,16 +110,37 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 
 	logger.L().Info(ctx, "Created database client")
 
-	var clickhouseStore clickhouse.Clickhouse
+	// LD-gated switcher: empty flag → singular DSN (self-managed); "0", "1", …
+	// → alternates from CLICKHOUSE_CONNECTION_STRINGS. Lets reads shift between
+	// clusters per-query without restarts. Empty singular DSN falls back to a
+	// noop client.
+	clickhouseStore, err := clickhouse.NewSwitchingClient(
+		ctx,
+		featureFlags,
+		config.ClickhouseConnectionString,
+		config.ClickhouseConnectionStrings,
+		clickhouse.WithAllowNoopDefault(true),
+	)
+	if err != nil {
+		logger.L().Fatal(ctx, "initializing ClickHouse switching client", zap.Error(err))
+	}
 
-	clickhouseConnectionString := config.ClickhouseConnectionString
-	if clickhouseConnectionString == "" {
-		clickhouseStore = clickhouse.NewNoopClient()
-	} else {
-		clickhouseStore, err = clickhouse.New(clickhouseConnectionString)
-		if err != nil {
-			logger.L().Fatal(ctx, "initializing ClickHouse store", zap.Error(err))
+	// ClickHouse-backed sandbox/build log reader for the local cluster, gated at
+	// read time by the logs-read-config flag. Built from the singular DSN; when
+	// it is unset, the local cluster stays on Loki.
+	var sandboxLogsReader *sandboxlogs.Reader
+	// clusterLogsReader carries the reader into the clusters pool as an
+	// interface. It is left as a nil interface (not a typed-nil pointer boxed in
+	// an interface) when no reader is configured, so the nil check in the local
+	// cluster resource provider fires correctly and reads stay on Loki.
+	var clusterLogsReader clusters.ClickhouseLogsReader
+	if config.ClickhouseConnectionString != "" {
+		conn, readerErr := clickhouse.NewDriver(config.ClickhouseConnectionString)
+		if readerErr != nil {
+			logger.L().Fatal(ctx, "initializing ClickHouse sandbox logs reader", zap.Error(readerErr))
 		}
+		sandboxLogsReader = sandboxlogs.NewReader(conn)
+		clusterLogsReader = sandboxLogsReader
 	}
 
 	posthogClient, posthogErr := analyticscollector.NewPosthogClient(ctx, config.PosthogAPIKey)
@@ -103,14 +148,71 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "Initializing Posthog client", zap.Error(posthogErr))
 	}
 
-	nomadConfig := &nomadapi.Config{
-		Address:  config.NomadAddress,
-		SecretID: config.NomadToken,
-	}
-
-	nomadClient, err := nomadapi.NewClient(nomadConfig)
-	if err != nil {
-		logger.L().Fatal(ctx, "Initializing Nomad client", zap.Error(err))
+	// Build the orchestrator-discovery and template-builder-discovery backends
+	// based on cfg.ServiceDiscoveryProvider:
+	//   nomad      - both go through the local Nomad agent
+	//   kubernetes - both list pods via the in-cluster K8s API
+	var (
+		nodeDiscovery            orchdiscovery.Discovery
+		templateBuilderDiscovery clustersdiscovery.Discovery
+	)
+	switch config.ServiceDiscoveryProvider {
+	case cfg.ServiceDiscoveryProviderKubernetes:
+		k8sClient, k8sErr := newInClusterKubeClient()
+		if k8sErr != nil {
+			logger.L().Fatal(ctx, "Initializing in-cluster Kubernetes client", zap.Error(k8sErr))
+		}
+		nodeDiscovery = orchdiscovery.NewKubernetes(
+			k8sClient,
+			config.K8sNamespace,
+			config.K8sOrchestratorPodLabelSelector,
+		)
+		templateBuilderDiscovery = clustersdiscovery.NewKubernetesDiscovery(
+			consts.LocalClusterID,
+			k8sClient,
+			config.K8sNamespace,
+			config.K8sTemplateManagerPodLabelSelector,
+		)
+	case cfg.ServiceDiscoveryProviderLocal:
+		localND, localErr := orchdiscovery.NewLocal(config.LocalOrchestratorAddress)
+		if localErr != nil {
+			logger.L().Fatal(ctx, "Initializing local orchestrator discovery", zap.Error(localErr))
+		}
+		nodeDiscovery = localND
+		// The local orchestrator doubles as the template builder when it is
+		// started with ORCHESTRATOR_SERVICES=orchestrator,template-manager, so
+		// point builder discovery at the same address. Instances that do not
+		// report the TemplateBuilder role (the darwin dummy orchestrator) are
+		// registered with IsBuilder=false and never selected for builds, which
+		// keeps the dummy setup behaving as before.
+		templateBuilderDiscovery, err = clustersdiscovery.NewStaticFromAddress(config.LocalOrchestratorAddress)
+		if err != nil {
+			logger.L().Fatal(ctx, "Initializing local template builder discovery", zap.Error(err))
+		}
+	default: // ServiceDiscoveryProviderNomad
+		nomadClient, nomadErr := nomadapi.NewClient(&nomadapi.Config{
+			Address:  config.NomadAddress,
+			SecretID: config.NomadToken,
+		})
+		if nomadErr != nil {
+			logger.L().Fatal(ctx, "Initializing Nomad client", zap.Error(nomadErr))
+		}
+		nodeDiscovery = orchdiscovery.NewNomad(nomadClient, config.NomadOrchestratorServiceNames)
+		// Migration fallback: orchestrator jobs deployed from jobspecs that
+		// predate the service port-label fix register their service with an
+		// empty Address, so service discovery alone would miss them until
+		// they are redeployed. Union in the legacy node-pool listing (service
+		// entries win on conflict) so the API flip has no rollout ordering
+		// constraint. Disable via NOMAD_ORCHESTRATOR_LEGACY_DISCOVERY_ENABLED
+		// once no legacy jobs remain. The pool is hardcoded: legacy jobs only
+		// ever ran on the "default" pool.
+		if config.NomadOrchestratorLegacyDiscoveryEnabled {
+			nodeDiscovery = orchdiscovery.NewMerged(
+				nodeDiscovery,
+				orchdiscovery.NewNomadNodePool(nomadClient, "default"),
+			)
+		}
+		templateBuilderDiscovery = clustersdiscovery.NewLocalDiscovery(consts.LocalClusterID, nomadClient)
 	}
 
 	queryLogsProvider, err := loki.NewLokiQueryProvider(config.LokiURL, config.LokiUser, config.LokiPassword)
@@ -118,7 +220,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "error when getting logs query provider", zap.Error(err))
 	}
 
-	clusters, err := clusters.NewPool(ctx, tel, sqlcDB, nomadClient, clickhouseStore, queryLogsProvider, config)
+	clusters, err := clusters.NewPool(ctx, tel, sqlcDB, templateBuilderDiscovery, clickhouseStore, queryLogsProvider, clusterLogsReader, featureFlags, config)
 	if err != nil {
 		logger.L().Fatal(ctx, "initializing edge clusters pool failed", zap.Error(err))
 	}
@@ -145,14 +247,18 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "failed to create snapshot build query semaphore", zap.Error(err))
 	}
 
-	orch, err := orchestrator.New(ctx, config, tel, nomadClient, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem)
+	orch, err := orchestrator.New(ctx, config, tel, nodeDiscovery, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Orchestrator client", zap.Error(err))
 	}
 
-	authCache := sharedauth.NewAuthCache[*types.Team]()
-	authStore := sharedauth.NewAuthStore(authDB)
-	authService := sharedauth.NewAuthService[*types.Team](authStore, authCache, config.SupabaseJWTSecrets)
+	authClient := &http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
+	authService, err := sharedauth.NewAuthService(ctx, redisClient, authDB, config.AuthProvider, authClient)
+	if err != nil {
+		logger.L().Fatal(ctx, "Initializing auth service", zap.Error(err))
+	}
 	templateCache := templatecache.NewTemplateCache(sqlcDB, redisClient)
 	templateSpawnCounter := utils.NewTemplateSpawnCounter(ctx, time.Minute, sqlcDB)
 
@@ -179,6 +285,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		authService:           authService,
 		templateSpawnCounter:  templateSpawnCounter,
 		clickhouseStore:       clickhouseStore,
+		sandboxLogsReader:     sandboxLogsReader,
 		accessTokenGenerator:  accessTokenGenerator,
 		clusters:              clusters,
 		featureFlags:          featureFlags,
@@ -255,6 +362,17 @@ func (a *APIStore) Close(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("closing snapshot cache: %w", err))
 	}
 
+	if a.clickhouseStore != nil {
+		if err := a.clickhouseStore.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("closing ClickHouse store: %w", err))
+		}
+	}
+	if a.sandboxLogsReader != nil {
+		if err := a.sandboxLogsReader.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("closing ClickHouse sandbox logs reader: %w", err))
+		}
+	}
+
 	return errors.Join(errs...)
 }
 
@@ -311,19 +429,83 @@ func (a *APIStore) GetUserFromAccessToken(ctx context.Context, ginCtx *gin.Conte
 	ctx, span := tracer.Start(ctx, "get user from access token")
 	defer span.End()
 
-	return a.authService.ValidateAccessToken(ctx, ginCtx, accessToken)
+	userID, apiErr := a.authService.ValidateAccessToken(ctx, ginCtx, accessToken)
+	if apiErr != nil {
+		return uuid.UUID{}, apiErr
+	}
+
+	// Access token acceptance is gated after validation so the flag can be
+	// rolled out per-user via LD targeting during the deprecation cutover.
+	if a.featureFlags.BoolFlag(ctx, featureflags.DisableE2BAccessTokenAuthFlag, featureflags.UserContext(userID.String())) {
+		return uuid.UUID{}, &api.APIError{
+			Err:       errors.New("access token authentication is disabled"),
+			ClientMsg: "E2B_ACCESS_TOKEN is deprecated and no longer accepted. Use an API key (E2B_API_KEY) instead. See https://e2b.dev/docs/migration/access-token-deprecation",
+			Code:      http.StatusUnauthorized,
+		}
+	}
+
+	return userID, nil
 }
 
-func (a *APIStore) GetUserIDFromSupabaseToken(ctx context.Context, ginCtx *gin.Context, supabaseToken string) (uuid.UUID, *api.APIError) {
-	ctx, span := tracer.Start(ctx, "get user id from supabase token")
+func (a *APIStore) GetUserIDFromAuthProviderToken(ctx context.Context, ginCtx *gin.Context, token string) (uuid.UUID, *api.APIError) {
+	ctx, span := tracer.Start(ctx, "get user id from auth provider token")
 	defer span.End()
 
-	return a.authService.ValidateSupabaseToken(ctx, ginCtx, supabaseToken)
+	return a.authService.ValidateAuthProviderToken(ctx, ginCtx, token)
 }
 
-func (a *APIStore) GetTeamFromSupabaseToken(ctx context.Context, ginCtx *gin.Context, teamID string) (*types.Team, *api.APIError) {
-	ctx, span := tracer.Start(ctx, "get team from supabase token")
+func (a *APIStore) GetTeamFromAuthProviderToken(ctx context.Context, ginCtx *gin.Context, teamID string) (*types.Team, *api.APIError) {
+	ctx, span := tracer.Start(ctx, "get team from auth provider token")
 	defer span.End()
 
-	return a.authService.ValidateSupabaseTeam(ctx, ginCtx, teamID)
+	return a.authService.ValidateAuthProviderTeam(ctx, ginCtx, teamID)
+}
+
+func (a *APIStore) GetTeamFromAdminToken(ctx context.Context, _ *gin.Context, teamID string) (*types.Team, *api.APIError) {
+	ctx, span := tracer.Start(ctx, "get team from admin token")
+	defer span.End()
+
+	teamUUID, err := uuid.Parse(teamID)
+	if err != nil {
+		return nil, &api.APIError{
+			Code:      http.StatusBadRequest,
+			ClientMsg: "Invalid team ID",
+			Err:       fmt.Errorf("failed to parse team ID: %w", err),
+		}
+	}
+
+	team, err := a.authService.GetTeamByID(ctx, teamUUID)
+	if err != nil {
+		var forbiddenErr *sharedauth.TeamForbiddenError
+		if errors.As(err, &forbiddenErr) {
+			return nil, &api.APIError{
+				Code:      http.StatusForbidden,
+				ClientMsg: err.Error(),
+				Err:       fmt.Errorf("failed getting team: %w", err),
+			}
+		}
+
+		if dberrors.IsNotFoundError(err) {
+			return nil, &api.APIError{
+				Code:      http.StatusNotFound,
+				ClientMsg: "Team not found",
+				Err:       fmt.Errorf("failed getting team: %w", err),
+			}
+		}
+
+		return nil, &api.APIError{
+			Code:      http.StatusInternalServerError,
+			ClientMsg: "Backend authentication failed",
+			Err:       fmt.Errorf("failed getting team: %w", err),
+		}
+	}
+	if team == nil {
+		return nil, &api.APIError{
+			Code:      http.StatusNotFound,
+			ClientMsg: "Team not found",
+			Err:       errors.New("team not found"),
+		}
+	}
+
+	return team, nil
 }

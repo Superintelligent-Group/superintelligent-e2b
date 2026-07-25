@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os/user"
 	"strconv"
 	"time"
 
@@ -16,41 +15,6 @@ import (
 	"github.com/e2b-dev/infra/packages/envd/internal/services/process/handler"
 	rpc "github.com/e2b-dev/infra/packages/envd/internal/services/spec/process"
 )
-
-func (s *Service) InitializeStartProcess(ctx context.Context, user *user.User, req *rpc.StartRequest) error {
-	var err error
-
-	ctx = logs.AddRequestIDToContext(ctx)
-
-	defer s.logger.
-		Err(err).
-		Interface("request", req).
-		Str(string(logs.OperationIDKey), ctx.Value(logs.OperationIDKey).(string)).
-		Msg("Initialized startCmd")
-
-	handlerL := s.logger.With().Str(string(logs.OperationIDKey), ctx.Value(logs.OperationIDKey).(string)).Logger()
-
-	startProcCtx, startProcCancel := context.WithCancel(ctx)
-	proc, err := handler.New(startProcCtx, user, req, &handlerL, s.defaults, s.cgroupManager, startProcCancel)
-	if err != nil {
-		return err
-	}
-
-	pid, err := proc.Start()
-	if err != nil {
-		return err
-	}
-
-	s.processes.Store(pid, proc)
-
-	go func() {
-		defer s.processes.Delete(pid)
-
-		proc.Wait()
-	}()
-
-	return nil
-}
 
 func (s *Service) Start(ctx context.Context, req *connect.Request[rpc.StartRequest], stream *connect.ServerStream[rpc.StartResponse]) error {
 	return logs.LogServerStreamWithoutEvents(ctx, s.logger, req, stream, s.handleStart)
@@ -67,7 +31,7 @@ func (s *Service) handleStart(ctx context.Context, req *connect.Request[rpc.Star
 		return err
 	}
 
-	timeout, err := determineTimeoutFromHeader(stream.Conn().RequestHeader())
+	requestTimeout, err := determineTimeoutFromHeader(stream.Conn().RequestHeader())
 	if err != nil {
 		return connect.NewError(connect.CodeInvalidArgument, err)
 	}
@@ -75,8 +39,8 @@ func (s *Service) handleStart(ctx context.Context, req *connect.Request[rpc.Star
 	// Create a new context with a timeout if provided.
 	// We do not want the command to be killed if the request context is cancelled
 	procCtx, cancelProc := context.Background(), func() {}
-	if timeout > 0 { // zero timeout means no timeout
-		procCtx, cancelProc = context.WithTimeout(procCtx, timeout)
+	if requestTimeout > 0 { // zero timeout means no timeout
+		procCtx, cancelProc = context.WithTimeout(procCtx, requestTimeout)
 	}
 
 	proc, err := handler.New( //nolint:contextcheck // TODO: fix this later
@@ -97,11 +61,9 @@ func (s *Service) handleStart(ctx context.Context, req *connect.Request[rpc.Star
 
 	exitChan := make(chan struct{})
 
-	startMultiplexer := handler.NewMultiplexedChannel[rpc.ProcessEvent_Start](0)
-	defer close(startMultiplexer.Source)
-
-	start, startCancel := startMultiplexer.Fork()
-	defer startCancel()
+	// Buffered so the send below never blocks when the receiver
+	// goroutine has already exited on a cancelled context.
+	start := make(chan rpc.ProcessEvent_Start, 1)
 
 	data, dataCancel := proc.DataEvent.Fork()
 	defer dataCancel()
@@ -117,13 +79,7 @@ func (s *Service) handleStart(ctx context.Context, req *connect.Request[rpc.Star
 			cancel(ctx.Err())
 
 			return
-		case event, ok := <-start:
-			if !ok {
-				cancel(connect.NewError(connect.CodeUnknown, errors.New("start event channel closed before sending start event")))
-
-				return
-			}
-
+		case event := <-start:
 			streamErr := stream.Send(&rpc.StartResponse{
 				Event: &rpc.ProcessEvent{
 					Event: &event,
@@ -204,7 +160,7 @@ func (s *Service) handleStart(ctx context.Context, req *connect.Request[rpc.Star
 		}
 	}()
 
-	pid, err := proc.Start()
+	pid, err := proc.Start(requestTimeout)
 	if err != nil {
 		return connect.NewError(connect.CodeInvalidArgument, err)
 	}
@@ -223,12 +179,10 @@ func (s *Service) handleStart(ctx context.Context, req *connect.Request[rpc.Star
 		proc.Wait()
 	}()
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-exitChan:
-		return nil
-	}
+	// Wait for the sender goroutine; returning early panics envd.
+	<-exitChan
+
+	return ctx.Err()
 }
 
 func determineTimeoutFromHeader(header http.Header) (time.Duration, error) {

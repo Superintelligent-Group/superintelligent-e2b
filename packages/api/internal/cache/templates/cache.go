@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
@@ -17,6 +19,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/cache"
 	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
@@ -88,7 +91,7 @@ func (c *TemplateCache) GetByID(ctx context.Context, templateID string) (*AliasI
 
 // ResolveAliasWithMetadata chains alias resolution with metadata lookup.
 func (c *TemplateCache) ResolveAliasWithMetadata(ctx context.Context, identifier string, namespaceFallback string) (*AliasInfo, *TemplateMetadata, error) {
-	aliasInfo, err := c.aliasCache.Resolve(ctx, identifier, namespaceFallback)
+	aliasInfo, err := c.ResolveAlias(ctx, identifier, namespaceFallback)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -101,11 +104,20 @@ func (c *TemplateCache) ResolveAliasWithMetadata(ctx context.Context, identifier
 	return aliasInfo, metadata, nil
 }
 
+func (c *TemplateCache) GetMetadata(ctx context.Context, templateID string) (*TemplateMetadata, error) {
+	return c.metadataCache.Get(ctx, templateID)
+}
+
 // Get fetches a template with build by templateID and tag.
 // Does NOT do alias resolution - callers should use ResolveAlias first.
 // Performs access control and cluster checks.
 func (c *TemplateCache) Get(ctx context.Context, templateID string, tag *string, teamID uuid.UUID, clusterID uuid.UUID) (*api.Template, *queries.EnvBuild, error) {
-	ctx, span := tracer.Start(ctx, "get template")
+	ctx, span := tracer.Start(ctx, "get template", trace.WithAttributes(
+		telemetry.WithTemplateID(templateID),
+		telemetry.WithTeamID(teamID.String()),
+		telemetry.WithClusterID(clusterID),
+		attribute.String("tag", sharedUtils.DerefOrDefault(tag, id.DefaultTag)),
+	))
 	defer span.End()
 
 	// Step 1: Get template with build by ID and tag
@@ -154,14 +166,16 @@ func (c *TemplateCache) fetchTemplateWithBuild(templateID string, tag *string) f
 		})
 		if err != nil {
 			if dberrors.IsNotFoundError(err) {
-				return nil, ErrTemplateNotFound
+				return nil, templateTagNotFoundError{
+					Tag: sharedUtils.DerefOrDefault(tag, id.DefaultTag),
+				}
 			}
 
 			return nil, fmt.Errorf("fetching template with build: %w", err)
 		}
 
 		build := &result.EnvBuild
-		template := result.Env
+		template := result.ActiveEnv
 		clusterID := clusters.WithClusterFallback(template.ClusterID)
 
 		tagValue := sharedUtils.DerefOrDefault(tag, id.DefaultTag)

@@ -64,7 +64,10 @@ locals {
         timeout_sec        = 3
         check_interval_sec = 3
       }
-      groups = [{ group = var.api_instance_group }]
+      groups = concat(
+        [{ group = var.api_instance_group }],
+        [for g in var.extra_api_instance_groups : { group = g }],
+      )
     }
     docker-reverse-proxy = {
       protocol                        = "HTTP"
@@ -93,6 +96,14 @@ locals {
       groups = [{ group = var.server_instance_group }]
     }
   }
+  # The session backend serves wildcard sandbox traffic, including /ws.
+  # Before routing session-paths to H2C, keep WebSocket upgrade paths on
+  # the HTTP/1.1 backend or split them into a separate backend service.
+  h2c_backends = {
+    for backend_index, backend_value in local.backends : backend_index => backend_value
+    if contains(["api", "session", "docker-reverse-proxy"], backend_index)
+  }
+
   health_checked_backends = { for backend_index, backend_value in local.backends : backend_index => backend_value }
 }
 
@@ -270,19 +281,21 @@ resource "google_compute_url_map" "orch_map" {
     default_service = google_compute_backend_service.default["api"].self_link
 
     dynamic "path_rule" {
-      for_each = length(var.additional_api_paths_handled_by_ingress) > 0 ? [{}] : []
+      for_each = var.additional_api_paths_handled_by_ingress
 
-      content {
-        paths   = var.additional_api_paths_handled_by_ingress
-        service = google_compute_backend_service.ingress.self_link
-      }
-    }
-
-    dynamic "path_rule" {
-      for_each = var.additional_api_path_rules
       content {
         paths   = path_rule.value.paths
-        service = path_rule.value.service_id
+        service = google_compute_backend_service.ingress.self_link
+
+        dynamic "route_action" {
+          for_each = path_rule.value.timeout_sec != null ? [path_rule.value.timeout_sec] : []
+
+          content {
+            timeout {
+              seconds = route_action.value
+            }
+          }
+        }
       }
     }
   }
@@ -337,6 +350,39 @@ resource "google_compute_global_forwarding_rule" "https" {
   load_balancing_scheme = "EXTERNAL_MANAGED"
   port_range            = "443"
   labels                = var.labels
+}
+
+resource "google_compute_backend_service" "h2c" {
+  for_each = local.h2c_backends
+
+  name = "${var.prefix}h2c-${each.key}"
+
+  port_name = lookup(each.value, "port_name", "http")
+  protocol  = "H2C"
+
+  timeout_sec                     = lookup(each.value, "timeout_sec")
+  connection_draining_timeout_sec = 1
+  compression_mode                = "DISABLED"
+
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  health_checks         = [google_compute_health_check.default[each.key].self_link]
+
+  security_policy = google_compute_security_policy.default[each.key].self_link
+
+  log_config {
+    enable = var.environment != "dev"
+  }
+
+  dynamic "backend" {
+    for_each = toset(each.value["groups"])
+    content {
+      group = lookup(backend.value, "group")
+    }
+  }
+
+  depends_on = [
+    google_compute_health_check.default
+  ]
 }
 
 resource "google_compute_backend_service" "default" {
@@ -462,15 +508,6 @@ resource "google_compute_firewall" "default-hc" {
   allow {
     protocol = "tcp"
     ports    = [var.ingress_port.port]
-  }
-
-  dynamic "allow" {
-    for_each = toset(var.additional_ports)
-
-    content {
-      protocol = "tcp"
-      ports    = [allow.value]
-    }
   }
 }
 
@@ -636,6 +673,40 @@ resource "google_compute_security_policy_rule" "sandbox-throttling-host" {
   }
 }
 
+resource "google_compute_security_policy_rule" "sandbox-routing-headers-log" {
+  security_policy = google_compute_security_policy.default["session"].name
+  description     = "Log sandbox routing headers"
+
+  action   = "throttle"
+  priority = "250"
+  preview  = true
+  match {
+    expr {
+      expression = "has(request.headers['e2b-sandbox-id']) && has(request.headers['e2b-sandbox-port'])"
+    }
+  }
+
+  rate_limit_options {
+    conform_action = "allow"
+    exceed_action  = "deny(429)"
+
+    enforce_on_key_configs {
+      enforce_on_key_name = "e2b-sandbox-id"
+      enforce_on_key_type = "HTTP_HEADER"
+    }
+
+    enforce_on_key_configs {
+      enforce_on_key_name = "e2b-sandbox-port"
+      enforce_on_key_type = "HTTP_HEADER"
+    }
+
+    rate_limit_threshold {
+      count        = 1000000
+      interval_sec = 60
+    }
+  }
+}
+
 resource "google_compute_security_policy_rule" "sandbox-throttling-ip" {
   security_policy = google_compute_security_policy.default["session"].name
   action          = "throttle"
@@ -664,34 +735,6 @@ resource "google_compute_security_policy_rule" "sandbox-throttling-ip" {
   }
 
   description = "Requests to sandboxes from IP address"
-}
-
-resource "google_compute_security_policy" "disable-bots-log-collector" {
-  name = "disable-bots-log-collector"
-
-  rule {
-    action   = "allow"
-    priority = "300"
-    match {
-      expr {
-        expression = "request.path == \"/\" && request.method == \"POST\""
-      }
-    }
-
-    description = "Allow POST requests  to / (collecting logs)"
-  }
-
-  rule {
-    action      = "deny(403)"
-    priority    = "2147483647"
-    description = "Default rule, higher priority overrides it"
-    match {
-      versioned_expr = "SRC_IPS_V1"
-      config {
-        src_ip_ranges = ["*"]
-      }
-    }
-  }
 }
 
 # Cloud Router for NAT

@@ -26,7 +26,7 @@ func TestSandboxResume(t *testing.T) {
 		sbxId := sbx.SandboxID
 
 		// Set timeout to 0 to force sandbox to be stopped
-		resp, err := c.PostSandboxesSandboxIDPauseWithResponse(t.Context(), sbxId, setup.WithAPIKey())
+		resp, err := c.PostSandboxesSandboxIDPauseWithResponse(t.Context(), sbxId, api.PostSandboxesSandboxIDPauseJSONRequestBody{}, setup.WithAPIKey())
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNoContent, resp.StatusCode())
 
@@ -42,6 +42,7 @@ func TestSandboxResume(t *testing.T) {
 		require.Equal(t, http.StatusCreated, sbxResume.StatusCode())
 		require.NotNil(t, sbxResume.JSON201)
 		assert.Equal(t, sbxResume.JSON201.SandboxID, sbxId)
+		assert.Equal(t, sbx.TemplateID, sbxResume.JSON201.TemplateID)
 	})
 
 	t.Run("concurrent resumes", func(t *testing.T) {
@@ -76,6 +77,7 @@ func TestSandboxResume(t *testing.T) {
 		require.Equal(t, http.StatusOK, res.StatusCode())
 		require.NotNil(t, res.JSON200)
 		assert.Equal(t, api.Running, res.JSON200.State)
+		assert.Equal(t, sbx.TemplateID, res.JSON200.TemplateID)
 
 		assert.True(t, resumed.Load(), "at least one resume should succeed")
 	})
@@ -106,7 +108,7 @@ func TestSandboxResume(t *testing.T) {
 		sbxId := sbx.SandboxID
 
 		// Pause the sandbox
-		resp, err := c.PostSandboxesSandboxIDPauseWithResponse(t.Context(), sbxId, setup.WithAPIKey())
+		resp, err := c.PostSandboxesSandboxIDPauseWithResponse(t.Context(), sbxId, api.PostSandboxesSandboxIDPauseJSONRequestBody{}, setup.WithAPIKey())
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNoContent, resp.StatusCode())
 
@@ -130,7 +132,7 @@ func TestSandboxResume(t *testing.T) {
 		sbxId := sbx.SandboxID
 
 		// Pause the sandbox
-		resp, err := c.PostSandboxesSandboxIDPauseWithResponse(t.Context(), sbxId, setup.WithAPIKey())
+		resp, err := c.PostSandboxesSandboxIDPauseWithResponse(t.Context(), sbxId, api.PostSandboxesSandboxIDPauseJSONRequestBody{}, setup.WithAPIKey())
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNoContent, resp.StatusCode())
 

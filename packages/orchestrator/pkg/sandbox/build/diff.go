@@ -1,3 +1,5 @@
+//go:build linux
+
 package build
 
 import (
@@ -26,23 +28,27 @@ const (
 
 type Diff interface {
 	io.Closer
-	storage.SeekableReader
-	block.Slicer
+	block.FramedReader
+	block.FramedSlicer
 	CacheKey() DiffStoreKey
-	CachePath() (string, error)
-	FileSize() (int64, error)
-	Init(ctx context.Context) error
+	CachePath(ctx context.Context) (string, error)
+	// Size returns the logical (uncompressed, U-space) file size.
+	Size(ctx context.Context) (int64, error)
+	// FileSize returns the number of bytes resident in the local cache file
+	// on disk. Used by the DiffStore evictor.
+	FileSize(ctx context.Context) (int64, error)
+	BlockSize() int64
 }
 
 type NoDiff struct{}
 
 var _ Diff = (*NoDiff)(nil)
 
-func (n *NoDiff) CachePath() (string, error) {
-	return "", NoDiffError{}
+func (n *NoDiff) CachePath(context.Context) (string, error) {
+	return "", nil
 }
 
-func (n *NoDiff) Slice(_ context.Context, _, _ int64) ([]byte, error) {
+func (n *NoDiff) Slice(_ context.Context, _, _ int64, _ *storage.FrameTable) ([]byte, error) {
 	return nil, NoDiffError{}
 }
 
@@ -50,11 +56,11 @@ func (n *NoDiff) Close() error {
 	return nil
 }
 
-func (n *NoDiff) ReadAt(_ context.Context, _ []byte, _ int64) (int, error) {
+func (n *NoDiff) ReadAt(_ context.Context, _ []byte, _ int64, _ *storage.FrameTable) (int, error) {
 	return 0, NoDiffError{}
 }
 
-func (n *NoDiff) FileSize() (int64, error) {
+func (n *NoDiff) FileSize(_ context.Context) (int64, error) {
 	return 0, NoDiffError{}
 }
 
@@ -64,10 +70,6 @@ func (n *NoDiff) Size(_ context.Context) (int64, error) {
 
 func (n *NoDiff) CacheKey() DiffStoreKey {
 	return ""
-}
-
-func (n *NoDiff) Init(context.Context) error {
-	return NoDiffError{}
 }
 
 func (n *NoDiff) BlockSize() int64 {

@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/e2b-dev/infra/packages/api/internal"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
@@ -22,30 +23,109 @@ import (
 	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/fcversion"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/middleware/otel/joined"
 	sandbox_network "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-network"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	ut "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
+// SandboxDataFetcher is a callback that fetches sandbox metadata.
+// It is called after the concurrency lock is acquired to ensure fresh data.
+type SandboxDataFetcher func(ctx context.Context) (SandboxMetadata, *api.APIError)
+
+type SandboxMetadata struct {
+	Metadata            map[string]string
+	EnvVars             map[string]string
+	Build               queries.EnvBuild
+	AllowInternetAccess *bool
+	Network             *types.SandboxNetworkConfig
+	Alias               string
+	TemplateID          string
+	BaseTemplateID      string
+	AutoPause           bool
+	// AutoPauseFilesystemOnly makes a timeout auto-pause take a filesystem-only
+	// snapshot instead of a full memory one. Only meaningful when AutoPause.
+	AutoPauseFilesystemOnly bool
+	AutoResume              *types.SandboxAutoResumeConfig
+	VolumeMounts            []*orchestrator.SandboxVolumeMount
+	EnvdAccessToken         *string
+	// Iam records the sandbox workload identity configuration requested at create
+	// time. Nil means workload identity is disabled.
+	Iam    *types.SandboxIam
+	NodeID *string
+	// SnapshotSandboxID is the sandbox ID the resume snapshot is stored under.
+	// It differs from the ID of the sandbox being started when forking.
+	SnapshotSandboxID string
+}
+
+// iamToProto maps the sandbox workload identity configuration into the
+// orchestrator config. It returns nil when nothing is configured so older nodes
+// and stored configs stay unchanged.
+func iamToProto(iam *types.SandboxIam) *orchestrator.SandboxIam {
+	if iam == nil || len(iam.Tokens) == 0 {
+		return nil
+	}
+
+	protoTokens := make(map[string]*orchestrator.SandboxIamToken, len(iam.Tokens))
+	for name, def := range iam.Tokens {
+		protoTokens[name] = &orchestrator.SandboxIamToken{
+			Audience:  def.Audience,
+			TokenType: def.TokenType,
+		}
+	}
+
+	return &orchestrator.SandboxIam{Tokens: protoTokens}
+}
+
 // buildEgressConfig constructs the orchestrator egress configuration from
 // allow/deny entry lists. It splits allowed entries into CIDRs and domains,
 // and adds the default nameserver when domains are present so the sandbox can
 // resolve them.
-func buildEgressConfig(allowedEntries, deniedEntries []string) *orchestrator.SandboxNetworkEgressConfig {
+func buildEgressConfig(allowedEntries, deniedEntries []string, rules map[string][]types.SandboxNetworkRule) *orchestrator.SandboxNetworkEgressConfig {
 	allowedAddresses, allowedDomains := sandbox_network.ParseAddressesAndDomains(allowedEntries)
 
 	if len(allowedDomains) > 0 {
 		allowedAddresses = append(allowedAddresses, sandbox_network.DefaultNameserver)
 	}
 
+	var orchRules map[string]*orchestrator.SandboxNetworkDomainRules
+	if rules != nil {
+		orchRules = make(map[string]*orchestrator.SandboxNetworkDomainRules, len(rules))
+		for domain, domainRules := range rules {
+			orchRuleList := make([]*orchestrator.SandboxNetworkRule, 0, len(domainRules))
+			for _, r := range domainRules {
+				orchRule := &orchestrator.SandboxNetworkRule{}
+				if r.Transform != nil {
+					orchRule.Transform = &orchestrator.SandboxNetworkTransform{
+						Headers: r.Transform.Headers,
+					}
+				}
+				orchRuleList = append(orchRuleList, orchRule)
+			}
+			orchRules[domain] = &orchestrator.SandboxNetworkDomainRules{Rules: orchRuleList}
+		}
+	}
+
 	return &orchestrator.SandboxNetworkEgressConfig{
 		AllowedCidrs:   sandbox_network.AddressStringsToCIDRs(allowedAddresses),
 		DeniedCidrs:    sandbox_network.AddressStringsToCIDRs(deniedEntries),
 		AllowedDomains: allowedDomains,
+		Rules:          orchRules,
 	}
+}
+
+// applyEgressProxy copies BYOP SOCKS5 fields from src to dst. No-op on nil.
+func applyEgressProxy(dst *orchestrator.SandboxNetworkEgressConfig, src *types.SandboxNetworkEgressConfig) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.EgressProxyAddress = src.EgressProxyAddress
+	dst.EgressProxyUsername = src.EgressProxyUsername
+	dst.EgressProxyPassword = src.EgressProxyPassword
 }
 
 // buildNetworkConfig constructs the orchestrator network configuration from the input parameters
@@ -58,7 +138,9 @@ func buildNetworkConfig(network *types.SandboxNetworkConfig, allowInternetAccess
 	}
 
 	if network != nil && network.Egress != nil {
-		orchNetwork.Egress = buildEgressConfig(network.Egress.AllowedAddresses, network.Egress.DeniedAddresses)
+		egress := buildEgressConfig(network.Egress.AllowedAddresses, network.Egress.DeniedAddresses, network.Egress.Rules)
+		applyEgressProxy(egress, network.Egress)
+		orchNetwork.Egress = egress
 	}
 
 	if network != nil && network.Ingress != nil {
@@ -78,25 +160,14 @@ func buildNetworkConfig(network *types.SandboxNetworkConfig, allowInternetAccess
 func (o *Orchestrator) CreateSandbox(
 	ctx context.Context,
 	sandboxID,
-	executionID,
-	alias string,
+	executionID string,
 	team *teamtypes.Team,
-	build queries.EnvBuild,
-	metadata map[string]string,
-	envVars map[string]string,
+	getSandboxData SandboxDataFetcher,
 	startTime time.Time,
 	endTime time.Time,
 	timeout time.Duration,
 	isResume bool,
-	nodeID *string,
-	templateID string,
-	baseTemplateID string,
-	autoPause bool,
-	autoResume *types.SandboxAutoResumeConfig,
-	envdAuthToken *string,
-	allowInternetAccess *bool,
-	network *types.SandboxNetworkConfig,
-	volumeMounts []*orchestrator.SandboxVolumeMount,
+	creationMeta sandbox.CreationMetadata,
 ) (sbx sandbox.Sandbox, apiErr *api.APIError) {
 	ctx, childSpan := tracer.Start(ctx, "create-sandbox")
 	defer childSpan.End()
@@ -130,6 +201,9 @@ func (o *Orchestrator) CreateSandbox(
 	}
 
 	if waitForStart != nil {
+		// Mark as a joined request for telemetry purposes
+		joined.Mark(ctx)
+
 		logger.L().Info(ctx, "sandbox is already being started, waiting for it to be ready", logger.WithSandboxID(sandboxID))
 
 		sbx, err = waitForStart(ctx)
@@ -162,9 +236,14 @@ func (o *Orchestrator) CreateSandbox(
 		}
 	}()
 
-	fcSemver, err := sandbox.NewVersionInfo(build.FirecrackerVersion)
+	sbxData, fetchErr := getSandboxData(ctx)
+	if fetchErr != nil {
+		return sandbox.Sandbox{}, fetchErr
+	}
+
+	fcSemver, err := fcversion.New(sbxData.Build.FirecrackerVersion)
 	if err != nil {
-		errMsg := fmt.Errorf("failed to get fcSemver for firecracker fcSemver '%s': %w", build.FirecrackerVersion, err)
+		errMsg := fmt.Errorf("failed to get fcSemver for firecracker fcSemver '%s': %w", sbxData.Build.FirecrackerVersion, err)
 
 		return sandbox.Sandbox{}, &api.APIError{
 			Code:      http.StatusInternalServerError,
@@ -174,7 +253,6 @@ func (o *Orchestrator) CreateSandbox(
 	}
 
 	hasHugePages := fcSemver.HasHugePages()
-	firecrackerVersion := featureflags.ResolveFirecrackerVersion(ctx, o.featureFlagsClient, build.FirecrackerVersion)
 	telemetry.ReportEvent(ctx, "Got FC info")
 
 	var sbxDomain *string
@@ -192,6 +270,7 @@ func (o *Orchestrator) CreateSandbox(
 	}
 
 	var trafficAccessToken *string = nil
+	network := sbxData.Network
 	if network != nil && network.Ingress != nil && network.Ingress.AllowPublicAccess != nil && !*network.Ingress.AllowPublicAccess {
 		accessToken, err := o.accessTokenGenerator.GenerateTrafficAccessToken(sandboxID)
 		if err != nil {
@@ -205,42 +284,45 @@ func (o *Orchestrator) CreateSandbox(
 		trafficAccessToken = &accessToken
 	}
 
-	sbxNetwork := buildNetworkConfig(network, allowInternetAccess, trafficAccessToken)
+	sbxNetwork := buildNetworkConfig(network, sbxData.AllowInternetAccess, trafficAccessToken)
 
 	var orchAutoResume *orchestrator.SandboxAutoResumeConfig
-	if autoResume != nil {
-		policy := string(autoResume.Policy)
+	if sbxData.AutoResume != nil {
 		orchAutoResume = &orchestrator.SandboxAutoResumeConfig{
-			Policy: policy,
+			Policy:         string(sbxData.AutoResume.Policy),
+			TimeoutSeconds: sbxData.AutoResume.Timeout,
 		}
 	}
 
 	sbxRequest := &orchestrator.SandboxCreateRequest{
 		Sandbox: &orchestrator.SandboxConfig{
-			BaseTemplateId:      baseTemplateID,
-			TemplateId:          templateID,
-			Alias:               &alias,
-			TeamId:              team.ID.String(),
-			BuildId:             build.ID.String(),
-			SandboxId:           sandboxID,
-			ExecutionId:         executionID,
-			KernelVersion:       build.KernelVersion,
-			FirecrackerVersion:  firecrackerVersion,
-			EnvdVersion:         *build.EnvdVersion,
-			Metadata:            metadata,
-			EnvVars:             envVars,
-			EnvdAccessToken:     envdAuthToken,
-			MaxSandboxLength:    team.Limits.MaxLengthHours,
-			HugePages:           hasHugePages,
-			RamMb:               build.RamMb,
-			Vcpu:                build.Vcpu,
-			Snapshot:            isResume,
-			AutoPause:           autoPause,
-			AutoResume:          orchAutoResume,
-			AllowInternetAccess: allowInternetAccess,
-			Network:             sbxNetwork,
-			TotalDiskSizeMb:     ut.FromPtr(build.TotalDiskSizeMb),
-			VolumeMounts:        volumeMounts,
+			BaseTemplateId:          sbxData.BaseTemplateID,
+			TemplateId:              sbxData.TemplateID,
+			Alias:                   &sbxData.Alias,
+			TeamId:                  team.ID.String(),
+			BuildId:                 sbxData.Build.ID.String(),
+			SandboxId:               sandboxID,
+			ExecutionId:             executionID,
+			KernelVersion:           sbxData.Build.KernelVersion,
+			FirecrackerVersion:      sbxData.Build.FirecrackerVersion,
+			EnvdVersion:             *sbxData.Build.EnvdVersion,
+			Metadata:                sbxData.Metadata,
+			EnvVars:                 sbxData.EnvVars,
+			EnvdAccessToken:         sbxData.EnvdAccessToken,
+			MaxSandboxLength:        team.Limits.MaxLengthHours,
+			EventsTtlDays:           team.Limits.EventsTTLDays,
+			HugePages:               hasHugePages,
+			RamMb:                   sbxData.Build.RamMb,
+			Vcpu:                    sbxData.Build.Vcpu,
+			Snapshot:                isResume,
+			AutoPause:               sbxData.AutoPause,
+			AutoPauseFilesystemOnly: sbxData.AutoPauseFilesystemOnly,
+			AutoResume:              orchAutoResume,
+			AllowInternetAccess:     sbxData.AllowInternetAccess,
+			Network:                 sbxNetwork,
+			TotalDiskSizeMb:         ut.FromPtr(sbxData.Build.TotalDiskSizeMb),
+			VolumeMounts:            sbxData.VolumeMounts,
+			Iam:                     iamToProto(sbxData.Iam),
 		},
 		StartTime: timestamppb.New(startTime),
 		EndTime:   timestamppb.New(endTime),
@@ -248,11 +330,11 @@ func (o *Orchestrator) CreateSandbox(
 
 	var node *nodemanager.Node
 
-	if isResume && nodeID != nil {
+	if isResume && sbxData.NodeID != nil {
 		telemetry.ReportEvent(ctx, "Placing sandbox on the node where the snapshot was taken")
 
 		clusterID := clusters.WithClusterFallback(team.ClusterID)
-		node = o.GetNode(clusterID, *nodeID)
+		node = o.GetNode(clusterID, *sbxData.NodeID)
 		if node != nil && node.Status() != api.NodeStatusReady {
 			node = nil
 		}
@@ -261,10 +343,20 @@ func (o *Orchestrator) CreateSandbox(
 	nodeClusterID := clusters.WithClusterFallback(team.ClusterID)
 	clusterNodes := o.GetClusterNodes(nodeClusterID)
 
-	labelFilteringEnabled := o.featureFlagsClient.BoolFlag(ctx, featureflags.SandboxLabelBasedSchedulingFlag, featureflags.TeamContext(team.ID.String()), featureflags.SandboxContext(sandboxID))
+	allLabels, labelFilteringEnabled := o.generateRequiredNodeLabels(ctx, sandboxID, team, sbxData)
 
-	node, err = placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, builds.ToMachineInfo(build), labelFilteringEnabled, team.SandboxSchedulingLabels)
+	placed, err := placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, builds.ToMachineInfo(sbxData.Build), labelFilteringEnabled, allLabels)
 	if err != nil {
+		if isResume && placed.TimedOut {
+			// Remap by the snapshot's own sandbox ID: when forking, the started
+			// sandbox ID has no snapshot row and the remap would silently no-op.
+			snapshotSandboxID := sandboxID
+			if sbxData.SnapshotSandboxID != "" {
+				snapshotSandboxID = sbxData.SnapshotSandboxID
+			}
+			o.maybeRemapResumeOriginNode(ctx, snapshotSandboxID, team, sbxData.NodeID, placed.WarmedNode)
+		}
+
 		return sandbox.Sandbox{}, &api.APIError{
 			Code:      http.StatusInternalServerError,
 			ClientMsg: "Failed to place sandbox",
@@ -272,11 +364,13 @@ func (o *Orchestrator) CreateSandbox(
 		}
 	}
 
+	node = placed.Node
+
 	// The sandbox was created successfully
 	attributes := []attribute.KeyValue{
 		attribute.Bool("is_resume", isResume),
-		attribute.Bool("node_affinity_requested", nodeID != nil),
-		attribute.Bool("node_affinity_success", nodeID != nil && node.ID == *nodeID),
+		attribute.Bool("node_affinity_requested", sbxData.NodeID != nil),
+		attribute.Bool("node_affinity_success", sbxData.NodeID != nil && node.ID == *sbxData.NodeID),
 	}
 	o.createdSandboxesCounter.Add(ctx, 1, metric.WithAttributes(attributes...))
 
@@ -290,36 +384,38 @@ func (o *Orchestrator) CreateSandbox(
 
 	sbx = sandbox.NewSandbox(
 		sandboxID,
-		templateID,
+		sbxData.TemplateID,
 		consts.ClientID,
-		&alias,
+		&sbxData.Alias,
 		executionID,
 		team.ID,
-		build.ID,
-		metadata,
+		sbxData.Build.ID,
+		sbxData.Metadata,
 		time.Duration(team.Limits.MaxLengthHours)*time.Hour,
 		startTime,
 		endTime,
-		build.Vcpu,
-		*build.TotalDiskSizeMb,
-		build.RamMb,
-		build.KernelVersion,
-		firecrackerVersion,
-		*build.EnvdVersion,
+		sbxData.Build.Vcpu,
+		*sbxData.Build.TotalDiskSizeMb,
+		sbxData.Build.RamMb,
+		sbxData.Build.KernelVersion,
+		sbxData.Build.FirecrackerVersion,
+		*sbxData.Build.EnvdVersion,
 		node.ID,
 		node.ClusterID,
-		autoPause,
-		autoResume,
-		envdAuthToken,
-		allowInternetAccess,
-		baseTemplateID,
+		sbxData.AutoPause,
+		sbxData.AutoPauseFilesystemOnly,
+		sbxData.AutoResume,
+		sbxData.EnvdAccessToken,
+		sbxData.AllowInternetAccess,
+		sbxData.BaseTemplateID,
 		sbxDomain,
-		network,
+		sbxData.Network,
 		trafficAccessToken,
-		nodemanager.ConvertOrchestratorMountsToDatabaseMounts(volumeMounts),
+		nodemanager.ConvertOrchestratorMountsToDatabaseMounts(sbxData.VolumeMounts),
+		sbxData.Iam,
 	)
 
-	err = o.sandboxStore.Add(ctx, sbx, true)
+	err = o.sandboxStore.Add(ctx, sbx, &creationMeta)
 	if err != nil {
 		telemetry.ReportError(ctx, "failed to add sandbox to store", err)
 
@@ -327,9 +423,19 @@ func (o *Orchestrator) CreateSandbox(
 		// Copy to a new variable to avoid race conditions
 		sbxToRemove := sbx
 		go func() {
-			killErr := o.removeSandboxFromNode(context.WithoutCancel(ctx), sbxToRemove, sandbox.StateActionKill)
+			killErr := o.removeSandboxFromNode(
+				context.WithoutCancel(ctx),
+				sbxToRemove,
+				sandbox.StateActionKill,
+				sandbox.KillReasonUnknown,
+				false, // kill: no snapshot
+			)
 			if killErr != nil {
-				logger.L().Error(ctx, "Error removing sandbox", zap.Error(killErr), logger.WithSandboxID(sbxToRemove.SandboxID))
+				logger.L().Error(ctx, "Error removing sandbox",
+					zap.Error(killErr),
+					logger.WithSandboxID(sbxToRemove.SandboxID),
+					zap.String("kill_reason", sandbox.KillReasonUnknown.String()),
+				)
 			}
 		}()
 
@@ -341,4 +447,93 @@ func (o *Orchestrator) CreateSandbox(
 	}
 
 	return sbx, nil
+}
+
+// maybeRemapResumeOriginNode repoints the snapshot's origin_node_id to the
+// fallback node a resume timed out on. Pinning the next resume attempt to avoid
+// re-pulling the snapshot onto another node and spraying load across the cluster
+//
+// It only acts on placement timeouts (warmedNode is nil otherwise), and only
+// when the warming node differs from the origin we already tried. The write runs
+// on a detached context because the request context is already past its deadline
+// (that is why placement timed out).
+func (o *Orchestrator) maybeRemapResumeOriginNode(ctx context.Context, sandboxID string, team *teamtypes.Team, originNodeID *string, warmedNode *nodemanager.Node) {
+	if warmedNode == nil {
+		return
+	}
+
+	newNode := warmedNode
+	if originNodeID != nil && *originNodeID == newNode.ID {
+		return
+	}
+
+	// The request context is already past its deadline (that is why placement
+	// timed out), so detach it for everything below: the feature-flag read, the
+	// DB write, cache invalidation, the counter, and logging would all otherwise
+	// observe a cancelled context.
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	if !o.featureFlagsClient.BoolFlag(wctx, featureflags.ResumeOriginNodeRemapFlag, featureflags.TeamContext(team.ID.String()), featureflags.SandboxContext(sandboxID)) {
+		return
+	}
+
+	if err := o.sqlcDB.UpdateSnapshotOriginNode(wctx, queries.UpdateSnapshotOriginNodeParams{
+		OriginNodeID: newNode.ID,
+		SandboxID:    sandboxID,
+	}); err != nil {
+		logger.L().Warn(wctx, "failed to remap resume origin node",
+			zap.Error(err),
+			logger.WithSandboxID(sandboxID),
+		)
+
+		return
+	}
+
+	// Drop the cached snapshot so the next resume reads the new origin node.
+	o.snapshotCache.Invalidate(wctx, sandboxID)
+	o.resumeOriginNodeRemapCounter.Add(wctx, 1)
+
+	oldNodeID := ""
+	if originNodeID != nil {
+		oldNodeID = *originNodeID
+	}
+
+	logger.L().Info(wctx, "remapped resume origin node to the node a previous resume timed out on",
+		logger.WithSandboxID(sandboxID),
+		zap.String("old_origin_node_id", oldNodeID),
+		zap.String("new_origin_node_id", newNode.ID),
+	)
+}
+
+func (o *Orchestrator) generateRequiredNodeLabels(ctx context.Context, sandboxID string, team *teamtypes.Team, sbxData SandboxMetadata) ([]string, bool) {
+	labelFilteringEnabled := o.featureFlagsClient.BoolFlag(ctx, featureflags.SandboxLabelBasedSchedulingFlag, featureflags.TeamContext(team.ID.String()), featureflags.SandboxContext(sandboxID))
+	if !labelFilteringEnabled {
+		return nil, false
+	}
+
+	// if the team doesn't require a specific label, we default to "default",
+	// which corresponds to all unoptimized nodes (nodes that don't expect
+	// high cpu, high memory, long lifespan, etc)
+	allLabels := append([]string{}, team.SandboxSchedulingLabels...)
+	if len(allLabels) == 0 {
+		allLabels = append(allLabels, "default")
+	}
+
+	clusterID := clusters.WithClusterFallback(team.ClusterID)
+	volumeFilteringEnabled := o.featureFlagsClient.BoolFlag(ctx,
+		featureflags.SandboxVolumeLabelBasedSchedulingFlag,
+		featureflags.TeamContext(team.ID.String()),
+		featureflags.ClusterContext(clusterID),
+		featureflags.SandboxContext(sandboxID),
+	)
+
+	if volumeFilteringEnabled {
+		for _, mount := range sbxData.VolumeMounts {
+			label := internal.MakeVolumeTypeLabel(mount.GetType())
+			allLabels = append(allLabels, label)
+		}
+	}
+
+	return allLabels, labelFilteringEnabled
 }

@@ -13,6 +13,7 @@ locals {
     FC_KERNELS_BUCKET_NAME      = var.fc_kernels_bucket_name
     FC_VERSIONS_BUCKET_NAME     = var.fc_versions_bucket_name
     FC_ENV_PIPELINE_BUCKET_NAME = var.fc_env_pipeline_bucket_name
+    FC_BUSYBOX_BUCKET_NAME      = var.fc_busybox_bucket_name
     NODE_LABELS                 = join(",", var.node_labels)
     BASE_HUGEPAGES_PERCENTAGE   = var.base_hugepages_percentage
 
@@ -65,6 +66,9 @@ data "aws_iam_policy_document" "client_node_policy" {
 
       "${var.fc_versions_bucket_arn}/*",
       var.fc_versions_bucket_arn,
+
+      "${var.fc_busybox_bucket_arn}/*",
+      var.fc_busybox_bucket_arn,
     ]
   }
 
@@ -125,6 +129,10 @@ resource "aws_launch_template" "client" {
   user_data     = base64encode(local.user_data)
 
   vpc_security_group_ids = var.security_group_ids
+
+  metadata_options {
+    http_tokens = "required"
+  }
 
   iam_instance_profile {
     name = aws_iam_instance_profile.client.name

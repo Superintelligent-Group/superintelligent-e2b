@@ -1,3 +1,5 @@
+//go:build linux
+
 package buildcontext
 
 import (
@@ -11,7 +13,7 @@ import (
 type BuildContext struct {
 	BuilderConfig  cfg.BuilderConfig
 	Config         config.TemplateConfig
-	Template       storage.TemplateFiles
+	Template       storage.Paths
 	UploadErrGroup *errgroup.Group
 	EnvdVersion    string
 	CacheScope     string

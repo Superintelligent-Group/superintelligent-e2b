@@ -31,7 +31,6 @@ test/%:
 	export TESTS_SANDBOX_TEMPLATE_ID=$(TESTS_SANDBOX_TEMPLATE_ID); \
 	export TESTS_E2B_API_KEY=$(TESTS_E2B_API_KEY); \
 	export TESTS_E2B_ACCESS_TOKEN=$(TESTS_E2B_ACCESS_TOKEN); \
-	export TESTS_SUPABASE_JWT_SECRET=$(TESTS_SUPABASE_JWT_SECRET); \
 	export TESTS_SANDBOX_TEAM_ID=$(TESTS_SANDBOX_TEAM_ID); \
 	export TESTS_SANDBOX_USER_ID=$(TESTS_SANDBOX_USER_ID); \
 	go test -v ./internal/main_test.go -count=1 && \
@@ -40,9 +39,9 @@ test/%:
 		*.go:*) \
 			BASE=$${TEST_PATH%%:*}; \
 			TEST_FN=$${TEST_PATH#*:}; \
-			go tool gotestsum --rerun-fails=1 --packages="$$BASE" --format standard-verbose --junitfile=test-results.xml -- -count=1 -parallel=4 -run "$${TEST_FN}" ;; \
-		*.go) go tool gotestsum --rerun-fails=1 --packages="$$TEST_PATH" --format standard-verbose --junitfile=test-results.xml -- -count=1 -parallel=4 ;; \
-		*) go tool gotestsum --rerun-fails=1 --packages="$$TEST_PATH/..." --format standard-verbose --junitfile=test-results.xml -- -count=1 -parallel=4 ;; \
+			go tool gotestsum --rerun-fails=1 --packages="$$BASE" --format standard-verbose --junitfile=test-results.xml -- -count=1 -parallel=4 -timeout=20m -run "$${TEST_FN}" ;; \
+		*.go) go tool gotestsum --rerun-fails=1 --packages="$$TEST_PATH" --format standard-verbose --junitfile=test-results.xml -- -count=1 -parallel=4 -timeout=20m ;; \
+		*) go tool gotestsum --rerun-fails=1 --packages="$$TEST_PATH/..." --format standard-verbose --junitfile=test-results.xml -- -count=1 -parallel=4 -timeout=20m ;; \
 	esac
 
 .PHONY: connect-orchestrator

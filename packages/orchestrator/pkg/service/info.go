@@ -1,3 +1,5 @@
+//go:build linux
+
 package service
 
 import (
@@ -13,6 +15,12 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
+// ServiceStatus bundles the service status with the time of its last change.
+type ServiceStatus struct {
+	Status    orchestratorinfo.ServiceInfoStatus
+	ChangedAt time.Time
+}
+
 type ServiceInfo struct {
 	ClientId  string
 	ServiceId string
@@ -25,7 +33,7 @@ type ServiceInfo struct {
 	Labels      []string
 	MachineInfo machineinfo.MachineInfo
 
-	status   orchestratorinfo.ServiceInfoStatus
+	status   ServiceStatus
 	statusMu sync.RWMutex
 }
 
@@ -34,7 +42,7 @@ var serviceRolesMapper = map[cfg.ServiceType]orchestratorinfo.ServiceInfoRole{
 	cfg.TemplateManager: orchestratorinfo.ServiceInfoRole_TemplateBuilder,
 }
 
-func (s *ServiceInfo) GetStatus() orchestratorinfo.ServiceInfoStatus {
+func (s *ServiceInfo) GetStatus() ServiceStatus {
 	s.statusMu.RLock()
 	defer s.statusMu.RUnlock()
 
@@ -45,13 +53,30 @@ func (s *ServiceInfo) SetStatus(ctx context.Context, status orchestratorinfo.Ser
 	s.statusMu.Lock()
 	defer s.statusMu.Unlock()
 
-	if s.status != status {
+	s.setStatus(ctx, status)
+}
+
+func (s *ServiceInfo) OverrideStatus(ctx context.Context, status orchestratorinfo.ServiceInfoStatus) bool {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+
+	if s.status.Status == orchestratorinfo.ServiceInfoStatus_Draining && status == orchestratorinfo.ServiceInfoStatus_Standby {
+		return false
+	}
+
+	s.setStatus(ctx, status)
+
+	return true
+}
+
+func (s *ServiceInfo) setStatus(ctx context.Context, status orchestratorinfo.ServiceInfoStatus) {
+	if s.status.Status != status {
 		logger.L().Info(ctx, "Service status changed", zap.String("status", status.String()))
-		s.status = status
+		s.status = ServiceStatus{Status: status, ChangedAt: time.Now()}
 	}
 }
 
-func NewInfoContainer(ctx context.Context, clientId string, version string, commit string, instanceID string, machineInfo machineinfo.MachineInfo, config cfg.Config) *ServiceInfo {
+func NewInfoContainer(clientId string, version string, commit string, instanceID string, machineInfo machineinfo.MachineInfo, config cfg.Config) *ServiceInfo {
 	services := cfg.GetServices(config)
 	serviceRoles := make([]orchestratorinfo.ServiceInfoRole, 0)
 
@@ -61,11 +86,14 @@ func NewInfoContainer(ctx context.Context, clientId string, version string, comm
 		}
 	}
 
+	startup := time.Now()
 	serviceInfo := &ServiceInfo{
 		ClientId:  clientId,
 		ServiceId: instanceID,
 
-		Startup:     time.Now(),
+		status: ServiceStatus{Status: orchestratorinfo.ServiceInfoStatus_Healthy, ChangedAt: startup},
+
+		Startup:     startup,
 		Roles:       serviceRoles,
 		Labels:      config.NodeLabels,
 		MachineInfo: machineInfo,
@@ -73,8 +101,6 @@ func NewInfoContainer(ctx context.Context, clientId string, version string, comm
 		SourceVersion: version,
 		SourceCommit:  commit,
 	}
-
-	serviceInfo.SetStatus(ctx, orchestratorinfo.ServiceInfoStatus_Healthy)
 
 	return serviceInfo
 }

@@ -1,9 +1,13 @@
+//go:build linux
+
 package service
 
 import (
 	"context"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -17,36 +21,36 @@ import (
 type Server struct {
 	orchestratorinfo.UnimplementedInfoServiceServer
 
-	info      *ServiceInfo
-	sandboxes *sandbox.Map
+	info        *ServiceInfo
+	sandboxes   *sandbox.Map
+	hostMetrics *metrics.HostMetrics
 }
 
-func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map) *Server {
-	s := &Server{
-		info:      info,
-		sandboxes: sandboxes,
+func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map, hostMetrics *metrics.HostMetrics) *Server {
+	return &Server{
+		info:        info,
+		sandboxes:   sandboxes,
+		hostMetrics: hostMetrics,
 	}
-
-	return s
 }
 
 func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestratorinfo.ServiceInfoResponse, error) {
 	info := s.info
 
 	// Get host metrics for the orchestrator
-	cpuMetrics, err := metrics.GetCPUMetrics()
+	cpuMetrics, err := s.hostMetrics.GetCPUMetrics()
 	if err != nil {
 		logger.L().Warn(ctx, "Failed to get host metrics", zap.Error(err))
 		cpuMetrics = &metrics.CPUMetrics{}
 	}
 
-	memoryMetrics, err := metrics.GetMemoryMetrics()
+	memoryMetrics, err := s.hostMetrics.GetMemoryMetrics()
 	if err != nil {
 		logger.L().Warn(ctx, "Failed to get host metrics", zap.Error(err))
 		memoryMetrics = &metrics.MemoryMetrics{}
 	}
 
-	diskMetrics, err := metrics.GetDiskMetrics()
+	diskMetrics, err := s.hostMetrics.GetDiskMetrics()
 	if err != nil {
 		logger.L().Warn(ctx, "Failed to get host metrics", zap.Error(err))
 		diskMetrics = []metrics.DiskInfo{}
@@ -63,10 +67,13 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		sandboxDiskAllocated += uint64(item.Config.TotalDiskSizeMB) * 1024 * 1024
 	}
 
+	serviceStatus := info.GetStatus()
+
 	return &orchestratorinfo.ServiceInfoResponse{
-		NodeId:        info.ClientId,
-		ServiceId:     info.ServiceId,
-		ServiceStatus: info.GetStatus(),
+		NodeId:                 info.ClientId,
+		ServiceId:              info.ServiceId,
+		ServiceStatus:          serviceStatus.Status,
+		ServiceStatusChangedAt: timestamppb.New(serviceStatus.ChangedAt),
 
 		ServiceVersion: info.SourceVersion,
 		ServiceCommit:  info.SourceCommit,
@@ -89,6 +96,12 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		// Host system total resources
 		MetricCpuCount:         cpuMetrics.Count,
 		MetricMemoryTotalBytes: memoryMetrics.TotalBytes,
+
+		// Hugepage pool metrics (page counts)
+		MetricHugepagesTotal:    memoryMetrics.HugePagesTotal,
+		MetricHugepagesUsed:     memoryMetrics.HugePagesUsed,
+		MetricHugepagesReserved: memoryMetrics.HugePagesReserved,
+		MetricHugepageSizeBytes: memoryMetrics.HugePageSizeBytes,
 
 		// Detailed disk metrics
 		MetricDisks: convertDiskMetrics(diskMetrics),
@@ -129,7 +142,9 @@ func convertMachineInfo(machineInfo machineinfo.MachineInfo) *orchestratorinfo.M
 
 func (s *Server) ServiceStatusOverride(ctx context.Context, req *orchestratorinfo.ServiceStatusChangeRequest) (*emptypb.Empty, error) {
 	logger.L().Info(ctx, "service status override request received", zap.String("status", req.GetServiceStatus().String()))
-	s.info.SetStatus(ctx, req.GetServiceStatus())
+	if !s.info.OverrideStatus(ctx, req.GetServiceStatus()) {
+		return nil, status.Error(codes.FailedPrecondition, "cannot change node status from draining to standby")
+	}
 
 	return &emptypb.Empty{}, nil
 }

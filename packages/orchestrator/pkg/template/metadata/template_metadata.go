@@ -19,7 +19,20 @@ const (
 	CurrentVersion = 2
 
 	DeprecatedVersion = 1
+
+	// FilesystemOnlyVersion is the metadata version that introduced the
+	// filesystem_only field. A filesystem-only snapshot must be stamped at least
+	// this version so deserialize() (which strips every field from a version <=
+	// DeprecatedVersion snapshot) keeps the flag. It is pinned rather than
+	// CurrentVersion: CurrentVersion advances as the format grows, and stamping a
+	// minimal V1-derived snapshot with a newer version would falsely imply it
+	// carries later-version fields.
+	FilesystemOnlyVersion = DeprecatedVersion + 1
 )
+
+// ErrReplaceCommitted means the replacement is visible, but parent-directory
+// durability could not be confirmed.
+var ErrReplaceCommitted = ioutils.ErrAtomicWriteCommitted
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata")
 
@@ -109,6 +122,39 @@ type Template struct {
 	FromImage    *string          `json:"from_image,omitempty"`
 	FromTemplate *FromTemplate    `json:"from_template,omitempty"`
 	Prefetch     *Prefetch        `json:"prefetch,omitempty"`
+
+	// FilesystemOnly marks a snapshot that persists only the filesystem (no
+	// memory snapshot); resuming it must cold-boot (reboot) from the rootfs. The
+	// zero value (false) is a full memory snapshot, so pre-existing snapshots
+	// (no field) are correctly treated as memory without a migration. Stamped at
+	// pause time; it is the resume path's source of truth for
+	// reboot-vs-memory-resume. Deliberately NOT carried by the
+	// With*/SameVersionTemplate copy-constructors — Sandbox.Pause re-stamps it.
+	FilesystemOnly bool `json:"filesystem_only,omitempty"`
+}
+
+// IsFilesystemOnly reports whether this snapshot persists only the filesystem
+// (no memory snapshot), so resuming it must cold-boot (reboot) from the rootfs.
+func (t Template) IsFilesystemOnly() bool {
+	return t.FilesystemOnly
+}
+
+// MarkFilesystemOnly records whether this snapshot persists only the filesystem.
+//
+// When marking it filesystem-only, the metadata version is upgraded to at least
+// FilesystemOnlyVersion if needed: deserialize() strips every field (including
+// filesystem_only) from a snapshot whose version is <= DeprecatedVersion, so a
+// snapshot taken from a V1 template would otherwise lose the flag on resume and
+// be wrongly memory-resumed — and since the filesystem-only pause uploaded no
+// memory snapshot, that resume hard-fails. Clearing the flag never changes the
+// version.
+func (t Template) MarkFilesystemOnly(filesystemOnly bool) Template {
+	t.FilesystemOnly = filesystemOnly
+	if filesystemOnly && t.Version < FilesystemOnlyVersion {
+		t.Version = FilesystemOnlyVersion
+	}
+
+	return t
 }
 
 func V1TemplateVersion() Template {
@@ -179,6 +225,20 @@ func (t Template) ToFile(path string) error {
 	return nil
 }
 
+func (t Template) ReplaceFile(path string) error {
+	mr, err := serialize(t)
+	if err != nil {
+		return err
+	}
+
+	err = ioutils.WriteToFileFromReaderAtomically(path, mr)
+	if err != nil {
+		return fmt.Errorf("failed to replace metadata file: %w", err)
+	}
+
+	return nil
+}
+
 func FromFile(path string) (Template, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -195,16 +255,16 @@ func FromFile(path string) (Template, error) {
 }
 
 func FromBuildID(ctx context.Context, s storage.StorageProvider, buildID string) (Template, error) {
-	return fromTemplate(ctx, s, storage.TemplateFiles{
+	return fromTemplate(ctx, s, storage.Paths{
 		BuildID: buildID,
 	})
 }
 
-func fromTemplate(ctx context.Context, s storage.StorageProvider, files storage.TemplateFiles) (Template, error) {
+func fromTemplate(ctx context.Context, s storage.StorageProvider, paths storage.Paths) (Template, error) {
 	ctx, span := tracer.Start(ctx, "from template")
 	defer span.End()
 
-	obj, err := s.OpenBlob(ctx, files.StorageMetadataPath(), storage.MetadataObjectType)
+	obj, err := s.OpenBlob(ctx, paths.Metadata())
 	if err != nil {
 		return Template{}, fmt.Errorf("error opening object for template metadata: %w", err)
 	}

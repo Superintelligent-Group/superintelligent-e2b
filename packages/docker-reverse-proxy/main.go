@@ -12,9 +12,15 @@ import (
 	"github.com/e2b-dev/infra/packages/docker-reverse-proxy/internal/constants"
 	"github.com/e2b-dev/infra/packages/docker-reverse-proxy/internal/handlers"
 	"github.com/e2b-dev/infra/packages/docker-reverse-proxy/internal/utils"
+	"github.com/e2b-dev/infra/packages/shared/pkg/httpserver"
 )
 
-var commitSHA string
+var (
+	commitSHA string
+	// version is stamped via -ldflags at build time from the release tag
+	// (see Makefile). Defaults to "dev" for local/source builds.
+	version = "dev"
+)
 
 func main() {
 	ctx := context.Background()
@@ -27,12 +33,14 @@ func main() {
 	port := flag.Int("port", 5000, "Port for test HTTP server")
 	flag.Parse()
 
-	log.Println("Starting docker reverse proxy", "commit", commitSHA)
+	log.Println("Starting docker reverse proxy", "version", version, "commit", commitSHA)
 
 	store := handlers.NewStore(ctx)
 
+	mux := http.NewServeMux()
+
 	// https://distribution.github.io/distribution/spec/api/
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		path := req.URL.String()
 		log.Printf("Request: %s %s\n", req.Method, utils.SubstringMax(path, 100))
 
@@ -95,5 +103,11 @@ func main() {
 	})
 
 	log.Printf("Starting server on port: %d\n", *port)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", strconv.Itoa(*port)), nil))
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%s", strconv.Itoa(*port)),
+		Handler: mux,
+	}
+	httpserver.ConfigureH2C(server)
+
+	log.Fatal(server.ListenAndServe())
 }

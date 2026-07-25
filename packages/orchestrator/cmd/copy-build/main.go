@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,7 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -20,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
@@ -77,13 +77,13 @@ func NewDestinationFromPath(prefix, file string) (*Destination, error) {
 	}, nil
 }
 
-func NewHeaderFromObject(ctx context.Context, bucketName string, headerPath string, objectType storage.ObjectType) (*header.Header, error) {
+func NewHeaderFromObject(ctx context.Context, bucketName string, headerPath string) (*header.Header, error) {
 	b, err := storage.NewGCP(ctx, bucketName, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCS bucket storage provider: %w", err)
 	}
 
-	obj, err := b.OpenBlob(ctx, headerPath, objectType)
+	obj, err := b.OpenBlob(ctx, headerPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open object: %w", err)
 	}
@@ -108,8 +108,8 @@ func (o *osFileBlob) Exists(_ context.Context) (bool, error) {
 	return true, nil
 }
 
-func (o *osFileBlob) Put(_ context.Context, _ []byte) error {
-	return fmt.Errorf("not implemented")
+func (o *osFileBlob) Put(_ context.Context, _ []byte, _ ...storage.PutOption) error {
+	return errors.New("not implemented")
 }
 
 func NewHeaderFromPath(ctx context.Context, from, headerPath string) (*header.Header, error) {
@@ -128,28 +128,25 @@ func NewHeaderFromPath(ctx context.Context, from, headerPath string) (*header.He
 	return h, nil
 }
 
-func getReferencedData(h *header.Header, objectType storage.ObjectType) []string {
-	builds := make(map[string]struct{})
+func getReferencedData(h *header.Header, dataFileName string) []string {
+	builds := make(map[uuid.UUID]struct{})
 
-	for _, mapping := range h.Mapping {
-		builds[mapping.BuildId.String()] = struct{}{}
+	for _, mapping := range h.Mapping.All() {
+		builds[mapping.BuildId] = struct{}{}
 	}
 
-	delete(builds, uuid.Nil.String())
+	delete(builds, uuid.Nil)
 
 	var dataReferences []string
 
 	for build := range builds {
-		template := storage.TemplateFiles{
-			BuildID: build,
+		paths := storage.Paths{
+			BuildID: build.String(),
 		}
 
-		switch objectType {
-		case storage.MemfileHeaderObjectType:
-			dataReferences = append(dataReferences, template.StorageMemfilePath())
-		case storage.RootFSHeaderObjectType:
-			dataReferences = append(dataReferences, template.StorageRootfsPath())
-		}
+		ct := h.GetBuildFrameData(build).CompressionType()
+
+		dataReferences = append(dataReferences, paths.DataFile(dataFileName, ct))
 	}
 
 	return dataReferences
@@ -216,7 +213,7 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "Copying build '%s' from '%s' to '%s'\n", *buildId, *from, *to)
 
-	template := storage.TemplateFiles{
+	paths := storage.Paths{
 		BuildID: *buildId,
 	}
 
@@ -224,40 +221,74 @@ func main() {
 
 	var filesToCopy []string
 
-	// Extract all files referenced by the build memfile header
-	buildMemfileHeaderPath := template.StorageMemfileHeaderPath()
-
-	var memfileHeader *header.Header
+	// Metadata is the source of truth for whether the build is a
+	// filesystem-only snapshot (no memfile, no snapfile).
+	var meta metadata.Template
 	if strings.HasPrefix(*from, "gs://") {
 		bucketName, _ := strings.CutPrefix(*from, "gs://")
 
-		h, err := NewHeaderFromObject(ctx, bucketName, buildMemfileHeaderPath, storage.MemfileHeaderObjectType)
+		provider, err := storage.NewGCP(ctx, bucketName, nil)
 		if err != nil {
-			log.Fatalf("failed to create header from object: %s", err)
+			log.Fatalf("failed to create GCS bucket storage provider: %s", err)
 		}
 
-		memfileHeader = h
+		m, err := metadata.FromBuildID(ctx, provider, *buildId)
+		if err != nil {
+			log.Fatalf("failed to read build metadata: %s", err)
+		}
+
+		meta = m
 	} else {
-		h, err := NewHeaderFromPath(ctx, *from, buildMemfileHeaderPath)
+		m, err := metadata.FromFile(path.Join(*from, "templates", paths.Metadata()))
 		if err != nil {
-			log.Fatalf("failed to create header from path: %s", err)
+			log.Fatalf("failed to read build metadata: %s", err)
 		}
 
-		memfileHeader = h
+		meta = m
 	}
 
-	dataReferences := getReferencedData(memfileHeader, storage.MemfileHeaderObjectType)
+	if meta.IsFilesystemOnly() {
+		fmt.Fprintf(os.Stderr, "Build is a filesystem-only snapshot; skipping memfile and snapfile\n")
+	} else {
+		// Extract all files referenced by the build memfile header
+		buildMemfileHeaderPath := paths.MemfileHeader()
 
-	filesToCopy = append(filesToCopy, buildMemfileHeaderPath)
-	filesToCopy = append(filesToCopy, dataReferences...)
+		var memfileHeader *header.Header
+		if strings.HasPrefix(*from, "gs://") {
+			bucketName, _ := strings.CutPrefix(*from, "gs://")
+
+			h, err := NewHeaderFromObject(ctx, bucketName, buildMemfileHeaderPath)
+			if err != nil {
+				log.Fatalf("failed to create header from object: %s", err)
+			}
+
+			memfileHeader = h
+		} else {
+			h, err := NewHeaderFromPath(ctx, *from, buildMemfileHeaderPath)
+			if err != nil {
+				log.Fatalf("failed to create header from path: %s", err)
+			}
+
+			memfileHeader = h
+		}
+
+		dataReferences := getReferencedData(memfileHeader, storage.MemfileName)
+
+		filesToCopy = append(filesToCopy, buildMemfileHeaderPath)
+		filesToCopy = append(filesToCopy, dataReferences...)
+
+		// Add the snapfile to the list of files to copy
+		snapfilePath := paths.Snapfile()
+		filesToCopy = append(filesToCopy, snapfilePath)
+	}
 
 	// Extract all files referenced by the build rootfs header
-	buildRootfsHeaderPath := template.StorageRootfsHeaderPath()
+	buildRootfsHeaderPath := paths.RootfsHeader()
 
 	var rootfsHeader *header.Header
 	if strings.HasPrefix(*from, "gs://") {
 		bucketName, _ := strings.CutPrefix(*from, "gs://")
-		h, err := NewHeaderFromObject(ctx, bucketName, buildRootfsHeaderPath, storage.RootFSHeaderObjectType)
+		h, err := NewHeaderFromObject(ctx, bucketName, buildRootfsHeaderPath)
 		if err != nil {
 			log.Fatalf("failed to create header from object: %s", err)
 		}
@@ -272,20 +303,16 @@ func main() {
 		rootfsHeader = h
 	}
 
-	dataReferences = getReferencedData(rootfsHeader, storage.RootFSHeaderObjectType)
+	dataReferences := getReferencedData(rootfsHeader, storage.RootfsName)
 
 	filesToCopy = append(filesToCopy, buildRootfsHeaderPath)
 	filesToCopy = append(filesToCopy, dataReferences...)
 
-	// Add the snapfile to the list of files to copy
-	snapfilePath := template.StorageSnapfilePath()
-	filesToCopy = append(filesToCopy, snapfilePath)
-
-	metadataPath := template.StorageMetadataPath()
+	metadataPath := paths.Metadata()
 	filesToCopy = append(filesToCopy, metadataPath)
 
 	// sort files to copy
-	sort.Strings(filesToCopy)
+	slices.Sort(filesToCopy)
 
 	googleStorageClient, err := googleStorage.NewClient(ctx)
 	if err != nil {
@@ -382,35 +409,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Build '%s' copied to '%s'\n", *buildId, *to)
 
 	if *teamID != "" {
-		// Read metadata.json from destination to get kernel and firecracker versions.
-		var metadataReader io.ReadCloser
-		if strings.HasPrefix(*to, "gs://") {
-			bucketName, _ := strings.CutPrefix(*to, "gs://")
-			obj := googleStorageClient.Bucket(bucketName).Object(metadataPath)
-			r, err := obj.NewReader(ctx)
-			if err != nil {
-				log.Fatalf("failed to read metadata from GCS: %s", err)
-			}
-			metadataReader = r
-		} else {
-			f, err := os.Open(path.Join(*to, "templates", metadataPath))
-			if err != nil {
-				log.Fatalf("failed to read metadata from local path: %s", err)
-			}
-			metadataReader = f
+		if meta.Template.KernelVersion == "" || meta.Template.FirecrackerVersion == "" {
+			log.Fatalf("kernel/firecracker version missing in build metadata (version %d), cannot generate SQL", meta.Version)
 		}
-
-		var meta struct {
-			Template struct {
-				KernelVersion      string `json:"kernel_version"`
-				FirecrackerVersion string `json:"firecracker_version"`
-			} `json:"template"`
-		}
-		if err := json.NewDecoder(metadataReader).Decode(&meta); err != nil {
-			metadataReader.Close()
-			log.Fatalf("failed to decode metadata.json: %s", err)
-		}
-		metadataReader.Close()
 
 		envID := id.Generate()
 		fmt.Fprintf(os.Stderr, "\n\nGenerated env ID: %s\n\n", envID)

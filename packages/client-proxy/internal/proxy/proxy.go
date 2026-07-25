@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
@@ -13,7 +16,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	proxygrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/proxy"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -32,7 +34,10 @@ const (
 	idleTimeout = 610 * time.Second
 )
 
-var ErrNodeNotFound = errors.New("node not found")
+var (
+	ErrNodeNotFound         = errors.New("node not found")
+	ErrNodeRouteUnavailable = errors.New("node route unavailable")
+)
 
 type autoResumeResult uint8
 
@@ -44,11 +49,35 @@ const (
 	autoResumeErrored
 )
 
-func catalogResolution(ctx context.Context, sandboxId string, sandboxPort uint64, trafficAccessToken string, envdAccessToken string, c catalog.SandboxesCatalog, pausedChecker PausedSandboxResumer, featureFlags *featureflags.Client) (string, error) {
+func catalogSandboxNodeIP(s *catalog.SandboxInfo) (string, error) {
+	return normalizeNodeIP(s.OrchestratorIP)
+}
+
+func normalizeNodeIP(nodeIP string) (string, error) {
+	nodeIP = strings.TrimSpace(nodeIP)
+	if nodeIP == "" {
+		return "", ErrNodeRouteUnavailable
+	}
+
+	return nodeIP, nil
+}
+
+func clientProxyMaskRequestHost(ctx context.Context, featureFlags *featureflags.Client, host string, sandboxID string, port uint64) *string {
+	domain, sharedHost := reverseproxy.SandboxSharedHostDomain(host)
+	if !sharedHost || featureFlags.BoolFlag(ctx, featureflags.OrchAcceptsCombinedHostFlag) {
+		return nil
+	}
+
+	orchestratorHost := fmt.Sprintf("%d-%s.%s", port, sandboxID, domain)
+
+	return &orchestratorHost
+}
+
+func catalogResolution(ctx context.Context, sandboxId string, sandboxPort uint64, trafficAccessToken string, envdAccessToken string, c catalog.SandboxesCatalog, pausedChecker PausedSandboxResumer) (string, error) {
 	s, err := c.GetSandbox(ctx, sandboxId)
 	if err != nil {
 		if errors.Is(err, catalog.ErrSandboxNotFound) {
-			nodeIP, res, pausedErr := handlePausedSandbox(ctx, sandboxId, sandboxPort, trafficAccessToken, envdAccessToken, pausedChecker, featureFlags)
+			nodeIP, res, pausedErr := handlePausedSandbox(ctx, sandboxId, sandboxPort, trafficAccessToken, envdAccessToken, pausedChecker)
 			if pausedErr != nil {
 				return "", pausedErr
 			}
@@ -62,9 +91,7 @@ func catalogResolution(ctx context.Context, sandboxId string, sandboxPort uint64
 		return "", fmt.Errorf("failed to get sandbox from catalog: %w", err)
 	}
 
-	// todo: when we will use edge for orchestrators discovery we can stop sending IP in the catalog
-	//  and just resolve node from pool to get the IP of the node
-	return s.OrchestratorIP, nil
+	return catalogSandboxNodeIP(s)
 }
 
 func handlePausedSandbox(
@@ -74,15 +101,8 @@ func handlePausedSandbox(
 	trafficAccessToken string,
 	envdAccessToken string,
 	pausedChecker PausedSandboxResumer,
-	featureFlags *featureflags.Client,
 ) (string, autoResumeResult, error) {
 	if pausedChecker == nil {
-		return "", autoResumeNotAllowed, nil
-	}
-
-	if !featureFlags.BoolFlag(ctx, featureflags.SandboxAutoResumeFlag, featureflags.SandboxContext(sandboxId)) {
-		logger.L().Debug(ctx, "sandbox auto-resume disabled; skipping api resume", logger.WithSandboxID(sandboxId))
-
 		return "", autoResumeNotAllowed, nil
 	}
 
@@ -96,6 +116,9 @@ func handlePausedSandbox(
 			if st.Code() == codes.NotFound {
 				return "", autoResumeNotAllowed, nil
 			}
+			if st.Code() == codes.FailedPrecondition && st.Message() == proxygrpc.SandboxStillTransitioningMessage {
+				return "", autoResumeErrored, reverseproxy.NewErrSandboxStillTransitioning(sandboxId)
+			}
 			if st.Code() == codes.ResourceExhausted {
 				return "", autoResumeResourceExhausted, reverseproxy.NewErrSandboxResourceExhausted(sandboxId, st.Message())
 			}
@@ -104,11 +127,16 @@ func handlePausedSandbox(
 		return "", autoResumeErrored, err
 	}
 
+	nodeIP, err = normalizeNodeIP(nodeIP)
+	if err != nil {
+		return "", autoResumeErrored, err
+	}
+
 	return nodeIP, autoResumeSucceeded, nil
 }
 
 func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port uint16, catalog catalog.SandboxesCatalog, pausedSandboxResumer PausedSandboxResumer, featureFlagsClient *featureflags.Client) (*reverseproxy.Proxy, error) {
-	getTargetFromRequest := reverseproxy.GetTargetFromRequest(env.IsLocal())
+	getTargetFromRequest := reverseproxy.GetTargetFromRequest()
 	proxy := reverseproxy.New(
 		port,
 		// Retries that are needed to handle port forwarding delays in sandbox envd are handled by the orchestrator proxy
@@ -125,7 +153,7 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 
 			trafficAccessToken := r.Header.Get(proxygrpc.MetadataTrafficAccessToken)
 			envdAccessToken := r.Header.Get(proxygrpc.MetadataEnvdHTTPAccessToken)
-			nodeIP, err := catalogResolution(ctx, sandboxId, port, trafficAccessToken, envdAccessToken, catalog, pausedSandboxResumer, featureFlagsClient)
+			nodeIP, err := catalogResolution(ctx, sandboxId, port, trafficAccessToken, envdAccessToken, catalog, pausedSandboxResumer)
 			if err != nil {
 				var resumeDeniedErr *reverseproxy.SandboxResumePermissionDeniedError
 				if errors.As(err, &resumeDeniedErr) {
@@ -141,7 +169,16 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 					return nil, resourceExhaustedErr
 				}
 
-				if !errors.Is(err, ErrNodeNotFound) {
+				var stillTransitioningErr *reverseproxy.SandboxStillTransitioningError
+				if errors.As(err, &stillTransitioningErr) {
+					l.Warn(ctx, "sandbox still transitioning", zap.Error(err))
+
+					return nil, stillTransitioningErr
+				}
+
+				if errors.Is(err, ErrNodeRouteUnavailable) {
+					l.Warn(ctx, "sandbox route unavailable", zap.Error(err))
+				} else if !errors.Is(err, ErrNodeNotFound) {
 					l.Warn(ctx, "failed to resolve node ip with Redis resolution", zap.Error(err))
 				}
 
@@ -150,7 +187,7 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 
 			url := &url.URL{
 				Scheme: "http",
-				Host:   fmt.Sprintf("%s:%d", nodeIP, orchestratorProxyPort),
+				Host:   net.JoinHostPort(nodeIP, strconv.Itoa(orchestratorProxyPort)),
 			}
 
 			l = l.With(
@@ -164,6 +201,13 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 				SandboxPort:   port,
 				ConnectionKey: pool.ClientProxyConnectionKey,
 				Url:           url,
+				MaskRequestHost: clientProxyMaskRequestHost(
+					ctx,
+					featureFlagsClient,
+					r.Host,
+					sandboxId,
+					port,
+				),
 			}, nil
 		},
 		nil,
@@ -173,7 +217,7 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 	meter := meterProvider.Meter(serviceName)
 	_, err := telemetry.GetObservableUpDownCounter(
 		meter, telemetry.ClientProxyPoolConnectionsMeterCounterName, func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(proxy.CurrentServerConnections())
+			observer.Observe(proxy.CurrentPoolConnections())
 
 			return nil
 		},
@@ -195,7 +239,7 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 
 	_, err = telemetry.GetObservableUpDownCounter(
 		meter, telemetry.ClientProxyServerConnectionsMeterCounterName, func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(proxy.CurrentPoolConnections())
+			observer.Observe(proxy.CurrentServerConnections())
 
 			return nil
 		},

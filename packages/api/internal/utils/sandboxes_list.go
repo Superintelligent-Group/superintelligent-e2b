@@ -3,6 +3,7 @@ package utils
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -46,7 +47,7 @@ func ParseMetadata(ctx context.Context, metadata *string) (*map[string]string, e
 	if metadata != nil {
 		parsedMetadataFilter, err := parseFilters(*metadata)
 		if err != nil {
-			logger.L().Error(ctx, "Error parsing metadata", zap.Error(err))
+			logger.L().Warn(ctx, "Error parsing metadata", zap.Error(err))
 
 			return nil, fmt.Errorf("error parsing metadata: %w", err)
 		}
@@ -65,7 +66,7 @@ func ParseCursor(cursor string) (time.Time, string, error) {
 
 	parts := strings.Split(string(decoded), "__")
 	if len(parts) != 2 {
-		return time.Time{}, "", fmt.Errorf("invalid cursor format")
+		return time.Time{}, "", errors.New("invalid cursor format")
 	}
 
 	cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
@@ -148,7 +149,7 @@ func parseFilters(query string) (map[string]string, error) {
 	for filter := range strings.SplitSeq(query, "&") {
 		parts := strings.Split(filter, "=")
 		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid key value pair in query")
+			return nil, errors.New("invalid key value pair in query")
 		}
 
 		key, err := url.QueryUnescape(parts[0])

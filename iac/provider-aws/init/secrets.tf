@@ -56,10 +56,13 @@ resource "aws_secretsmanager_secret" "grafana" {
 resource "aws_secretsmanager_secret_version" "grafana" {
   secret_id = aws_secretsmanager_secret.grafana.id
   secret_string = jsonencode({
-    "API_KEY"              = " ",
-    "OTLP_URL"             = " ",
-    "OTEL_COLLECTOR_TOKEN" = " ",
-    "USERNAME"             = " ",
+    "API_KEY"                  = " ",
+    "OTLP_URL"                 = " ",
+    "OTEL_COLLECTOR_TOKEN"     = " ",
+    "USERNAME"                 = " ",
+    "LOGS_USER"                = " ",
+    "LOGS_URL"                 = " ",
+    "LOGS_COLLECTOR_API_TOKEN" = " ",
   })
 
   lifecycle {
@@ -178,37 +181,6 @@ output "postgres_connection_string" {
 }
 
 // ---
-// Supabase
-// ---
-resource "aws_secretsmanager_secret" "supabase_jwt_secrets" {
-  name = "${var.prefix}supabase-jwt-secrets"
-}
-
-resource "aws_secretsmanager_secret_version" "supabase_jwt_secrets" {
-  secret_id     = aws_secretsmanager_secret.supabase_jwt_secrets.id
-  secret_string = " "
-
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
-}
-
-data "aws_secretsmanager_secret_version" "supabase_jwt_secrets" {
-  secret_id     = aws_secretsmanager_secret.supabase_jwt_secrets.id
-  version_stage = "AWSCURRENT"
-  depends_on    = [aws_secretsmanager_secret_version.supabase_jwt_secrets]
-}
-
-output "supabase_jwt_secret_name" {
-  value = aws_secretsmanager_secret.supabase_jwt_secrets.name
-}
-
-output "supabase_jwt_secrets" {
-  value     = data.aws_secretsmanager_secret_version.supabase_jwt_secrets.secret_string
-  sensitive = true
-}
-
-// ---
 // API Admin Token
 // ---
 resource "random_string" "admin_token" {
@@ -320,4 +292,3 @@ output "redis_cluster_url_secret_name" {
 output "redis_tls_ca_base64_secret_name" {
   value = aws_secretsmanager_secret.redis_tls_ca_base64.name
 }
-

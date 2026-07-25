@@ -15,6 +15,7 @@ import (
 	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
 	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
 	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/envd/pkg"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 	"github.com/e2b-dev/infra/packages/shared/pkg/templates"
 )
@@ -55,7 +56,7 @@ func run(ctx context.Context) int {
 		return 1
 	}
 	defer db.Close()
-	authDb, err := authdb.NewClient(ctx, connectionString, connectionString)
+	authDb, err := authdb.NewClient(ctx, connectionString)
 	if err != nil {
 		log.Printf("Failed to connect to database: %v", err)
 
@@ -96,7 +97,12 @@ VALUES ($1, $2)
 		return fmt.Errorf("failed to create user: %w", err)
 	}
 
-	// Access token
+	err = authdb.UpsertPublicUser(ctx, data.UserID)
+	if err != nil {
+		return fmt.Errorf("failed to create public user: %w", err)
+	}
+
+	// Access token for legacy template build endpoints that do not support API key auth.
 	tokenWithoutPrefix := strings.TrimPrefix(data.AccessToken, keys.AccessTokenPrefix)
 	accessTokenBytes, err := hex.DecodeString(tokenWithoutPrefix)
 	if err != nil {
@@ -110,7 +116,7 @@ VALUES ($1, $2)
 		return fmt.Errorf("failed to mask access token: %w", err)
 	}
 
-	_, err = authdb.Write.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
+	_, err = authdb.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
 		ID:                    uuid.New(),
 		UserID:                data.UserID,
 		AccessTokenHash:       accessTokenHash,
@@ -133,6 +139,16 @@ VALUES ($1, $2, $3, $4, $5, $6)
 		return fmt.Errorf("failed to create team: %w", err)
 	}
 
+	// Grant the integration test team extra capacity so parallel tests don't
+	// hit the base tier's 20-sandbox cap.
+	err = db.TestsRawSQL(ctx, `
+INSERT INTO addons (team_id, name, extra_concurrent_sandboxes, extra_concurrent_template_builds, added_by)
+VALUES ($1, 'integration-tests-extra-capacity', 200, 50, '00000000-0000-0000-0000-000000000000')
+`, data.TeamID)
+	if err != nil {
+		return fmt.Errorf("failed to create test team addon: %w", err)
+	}
+
 	// User-Team
 	err = authdb.TestsRawSQL(ctx, `
 INSERT INTO users_teams (user_id, team_id, is_default)
@@ -153,7 +169,7 @@ VALUES ($1, $2, $3)
 	if err != nil {
 		return fmt.Errorf("failed to mask api key: %w", err)
 	}
-	_, err = authdb.Write.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
+	_, err = authdb.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
 		TeamID:           data.TeamID,
 		CreatedBy:        &data.UserID,
 		ApiKeyHash:       apiKeyHash,
@@ -207,7 +223,7 @@ INSERT INTO env_builds (
 	cluster_node_id, version, created_at, updated_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
 `, build.id, "FROM e2bdev/base:latest", dbtypes.BuildStatusUploaded,
-				2, 512, 512, 1982, "vmlinux-6.1.102", "v1.12.1_a41d3fb", "0.5.0",
+				2, 512, 512, 1982, "vmlinux-6.1.158-c1a568c", "v1.14.1_431f1fc", pkg.Version,
 				"integration-test-node", templates.TemplateV1Version, build.createdAt)
 		} else {
 			err = db.TestsRawSQL(ctx, `
@@ -217,7 +233,7 @@ INSERT INTO env_builds (
 	cluster_node_id, version, updated_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
 `, build.id, "FROM e2bdev/base:latest", dbtypes.BuildStatusUploaded,
-				2, 512, 512, 1982, "vmlinux-6.1.102", "v1.12.1_a41d3fb", "0.5.0",
+				2, 512, 512, 1982, "vmlinux-6.1.158-c1a568c", "v1.14.1_431f1fc", pkg.Version,
 				"integration-test-node", templates.TemplateV1Version)
 		}
 		if err != nil {

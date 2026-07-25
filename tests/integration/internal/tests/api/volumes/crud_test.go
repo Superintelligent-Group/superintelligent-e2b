@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	sharedfs "github.com/e2b-dev/infra/packages/shared/pkg/grpc/envd/filesystem"
-	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 	"github.com/e2b-dev/infra/tests/integration/internal/api"
 	"github.com/e2b-dev/infra/tests/integration/internal/envd"
 	"github.com/e2b-dev/infra/tests/integration/internal/setup"
@@ -36,6 +35,7 @@ func TestVolumeRoundTrip(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, createVolume.StatusCode(), string(createVolume.Body))
+	require.NotNil(t, createVolume.JSON201)
 	assert.Equal(t, volumeName, createVolume.JSON201.Name)
 	assert.NotEmpty(t, createVolume.JSON201.VolumeID)
 	volume := createVolume.JSON201
@@ -74,7 +74,8 @@ func TestVolumeRoundTrip(t *testing.T) {
 	volumeMountPath := "/home/user/vol"
 	filePath := filepath.Join(volumeMountPath, "hello.txt")
 
-	// create a sandbox with the volume
+	// Acquire a single sandbox slot for the entire test — sandboxes are sequential.
+	utils.AcquireSandboxSlot(t)
 	timeout := int32(30)
 	createSandbox, err := client.PostSandboxesWithResponse(
 		t.Context(),
@@ -122,7 +123,7 @@ func TestVolumeRoundTrip(t *testing.T) {
 		envdClient := setup.GetEnvdClient(t, ctx)
 		readRes, readErr := envdClient.HTTPClient.GetFilesWithResponse(
 			ctx,
-			&envd.GetFilesParams{Path: &filePath, Username: sharedutils.ToPtr("user")},
+			&envd.GetFilesParams{Path: &filePath, Username: new("user")},
 			setup.WithSandbox(t, sbx.SandboxID),
 		)
 		require.NoError(t, readErr)
@@ -133,7 +134,7 @@ func TestVolumeRoundTrip(t *testing.T) {
 	// kill the sandbox
 	utils.TeardownSandbox(t, client, sbx.SandboxID)
 
-	// start a new sandbox
+	// start a new sandbox (reusing the same semaphore slot)
 	createSandbox2, err := client.PostSandboxesWithResponse(
 		t.Context(),
 		api.NewSandbox{
@@ -178,7 +179,7 @@ func TestVolumeRoundTrip(t *testing.T) {
 		envdClient := setup.GetEnvdClient(t, ctx)
 		readRes, readErr := envdClient.HTTPClient.GetFilesWithResponse(
 			ctx,
-			&envd.GetFilesParams{Path: &filePath, Username: sharedutils.ToPtr("user")},
+			&envd.GetFilesParams{Path: &filePath, Username: new("user")},
 			setup.WithSandbox(t, sbx2.SandboxID),
 		)
 		require.NoError(t, readErr)
@@ -199,7 +200,7 @@ func TestVolumeRoundTrip(t *testing.T) {
 		// verify it's gone
 		readRes, readErr := envdClient.HTTPClient.GetFilesWithResponse(
 			ctx,
-			&envd.GetFilesParams{Path: &filePath, Username: sharedutils.ToPtr("user")},
+			&envd.GetFilesParams{Path: &filePath, Username: new("user")},
 			setup.WithSandbox(t, sbx2.SandboxID),
 		)
 		require.NoError(t, readErr)

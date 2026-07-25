@@ -12,6 +12,9 @@ import (
 	clickhouse "github.com/e2b-dev/infra/packages/clickhouse/pkg"
 	"github.com/e2b-dev/infra/packages/dashboard-api/internal/api"
 	"github.com/e2b-dev/infra/packages/dashboard-api/internal/cfg"
+	"github.com/e2b-dev/infra/packages/dashboard-api/internal/identity"
+	"github.com/e2b-dev/infra/packages/dashboard-api/internal/provisioning"
+	internalteamprovision "github.com/e2b-dev/infra/packages/dashboard-api/internal/teamprovision"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
@@ -20,20 +23,32 @@ import (
 var _ api.ServerInterface = (*APIStore)(nil)
 
 type APIStore struct {
-	config      cfg.Config
-	db          *sqlcdb.Client
-	authDB      *authdb.Client
-	clickhouse  clickhouse.Clickhouse
-	authService *sharedauth.AuthService[*types.Team]
+	config              cfg.Config
+	db                  *sqlcdb.Client
+	authDB              *authdb.Client
+	clickhouse          clickhouse.Clickhouse
+	authService         sharedauth.Service
+	identityService     identity.Service
+	provisioningService *provisioning.Service
 }
 
-func NewAPIStore(config cfg.Config, db *sqlcdb.Client, authDB *authdb.Client, ch clickhouse.Clickhouse, authService *sharedauth.AuthService[*types.Team]) *APIStore {
+func NewAPIStore(
+	config cfg.Config,
+	db *sqlcdb.Client,
+	authDB *authdb.Client,
+	ch clickhouse.Clickhouse,
+	authService sharedauth.Service,
+	identityService identity.Service,
+	teamProvisionSink internalteamprovision.TeamProvisionSink,
+) *APIStore {
 	return &APIStore{
-		config:      config,
-		db:          db,
-		authDB:      authDB,
-		clickhouse:  ch,
-		authService: authService,
+		config:              config,
+		db:                  db,
+		authDB:              authDB,
+		clickhouse:          ch,
+		authService:         authService,
+		identityService:     identityService,
+		provisioningService: provisioning.New(authDB, identityService, teamProvisionSink),
 	}
 }
 
@@ -47,10 +62,14 @@ func (s *APIStore) GetHealth(c *gin.Context) {
 	})
 }
 
-func (s *APIStore) GetUserIDFromSupabaseToken(ctx context.Context, ginCtx *gin.Context, supabaseToken string) (uuid.UUID, *sharedauth.APIError) {
-	return s.authService.ValidateSupabaseToken(ctx, ginCtx, supabaseToken)
+func (s *APIStore) GetUserIDFromAuthProviderToken(ctx context.Context, ginCtx *gin.Context, token string) (uuid.UUID, *sharedauth.APIError) {
+	return s.authService.ValidateAuthProviderToken(ctx, ginCtx, token)
 }
 
-func (s *APIStore) GetTeamFromSupabaseToken(ctx context.Context, ginCtx *gin.Context, teamID string) (*types.Team, *sharedauth.APIError) {
-	return s.authService.ValidateSupabaseTeam(ctx, ginCtx, teamID)
+func (s *APIStore) GetTeamFromAPIKey(ctx context.Context, ginCtx *gin.Context, apiKey string) (*types.Team, *sharedauth.APIError) {
+	return s.authService.ValidateAPIKey(ctx, ginCtx, apiKey)
+}
+
+func (s *APIStore) GetTeamFromAuthProviderToken(ctx context.Context, ginCtx *gin.Context, teamID string) (*types.Team, *sharedauth.APIError) {
+	return s.authService.ValidateAuthProviderTeam(ctx, ginCtx, teamID)
 }

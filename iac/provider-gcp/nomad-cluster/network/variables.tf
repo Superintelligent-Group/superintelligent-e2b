@@ -94,6 +94,13 @@ variable "api_instance_group" {
   type = string
 }
 
+variable "extra_api_instance_groups" {
+  description = "Additional instance-group self-links to attach to the api LB backend (e.g. GKE-managed MIGs whose nodes run the api pod with hostPort = api_port.port)."
+  type        = list(string)
+  default     = []
+  nullable    = false
+}
+
 variable "server_instance_group" {
   type = string
 }
@@ -104,18 +111,8 @@ variable "labels" {
 }
 
 variable "additional_api_paths_handled_by_ingress" {
-  type = list(string)
-}
-
-variable "additional_api_path_rules" {
-  description = "Additional path rules to add to the load balancer routing."
   type = list(object({
-    paths      = list(string)
-    service_id = string
+    paths       = list(string)
+    timeout_sec = optional(number)
   }))
-}
-
-variable "additional_ports" {
-  description = "Additional ports to expose on the load balancer."
-  type        = list(number)
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
-	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 type ClusterResourceProviderImpl struct {
@@ -66,6 +65,7 @@ func (r *ClusterResourceProviderImpl) GetSandboxMetrics(ctx context.Context, tea
 			CpuCount:      m.CpuCount,
 			MemTotal:      m.MemTotal,
 			MemUsed:       m.MemUsed,
+			MemCache:      m.MemCache,
 			DiskTotal:     m.DiskTotal,
 			DiskUsed:      m.DiskUsed,
 		}
@@ -98,6 +98,7 @@ func (r *ClusterResourceProviderImpl) GetSandboxesMetrics(ctx context.Context, t
 			CpuCount:      v.CpuCount,
 			MemTotal:      v.MemTotal,
 			MemUsed:       v.MemUsed,
+			MemCache:      v.MemCache,
 			DiskTotal:     v.DiskTotal,
 			DiskUsed:      v.DiskUsed,
 		}
@@ -183,12 +184,12 @@ func (r *ClusterResourceProviderImpl) getBuildLogsFromEdge(ctx context.Context, 
 				Offset:     &offset,
 				Limit:      &limit,
 				Level:      logToEdgeLevel(level),
-				Start:      utils.ToPtr(start.UnixMilli()),
-				End:        utils.ToPtr(end.UnixMilli()),
+				Start:      new(start.UnixMilli()),
+				End:        new(end.UnixMilli()),
 				Direction:  direction,
 
 				// TODO: remove this once the API spec is not required to have orchestratorID (https://linear.app/e2b/issue/ENG-3352)
-				OrchestratorID: utils.ToPtr("unused"),
+				OrchestratorID: new("unused"),
 			},
 		)
 		if err != nil {

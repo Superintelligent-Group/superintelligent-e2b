@@ -86,6 +86,25 @@ func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Dest
 			return
 		}
 
+		var stillTransitioningErr *SandboxStillTransitioningError
+		if errors.As(err, &stillTransitioningErr) {
+			logger.L().Warn(ctx, "sandbox still transitioning",
+				zap.String("host", r.Host),
+				logger.WithSandboxID(stillTransitioningErr.SandboxId))
+
+			err := template.
+				NewSandboxStillTransitioningError(stillTransitioningErr.SandboxId, r.Host).
+				HandleError(w, r)
+			if err != nil {
+				logger.L().Error(ctx, "failed to handle sandbox still transitioning error", zap.Error(err), logger.WithSandboxID(stillTransitioningErr.SandboxId))
+				http.Error(w, "Failed to handle sandbox still transitioning error", http.StatusInternalServerError)
+
+				return
+			}
+
+			return
+		}
+
 		var resourceExhaustedErr *SandboxResourceExhaustedError
 		if errors.As(err, &resourceExhaustedErr) {
 			logger.L().Warn(ctx, "team sandbox limit reached",
@@ -149,7 +168,7 @@ func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Dest
 		// Connection limiting
 		if connLimitConfig != nil {
 			maxLimit := connLimitConfig.GetMaxLimit(ctx)
-			count, acquired := connLimitConfig.Limiter.TryAcquire(d.SandboxId, maxLimit)
+			count, acquired := connLimitConfig.Limiter.TryAcquire(d.ConnectionKey, maxLimit)
 			if !acquired {
 				logger.L().Warn(ctx, "sandbox too many incoming connections",
 					zap.String("host", r.Host),
@@ -175,7 +194,7 @@ func handler(p *pool.ProxyPool, getDestination func(r *http.Request) (*pool.Dest
 
 			start := time.Now()
 			defer func() {
-				connLimitConfig.Limiter.Release(d.SandboxId)
+				connLimitConfig.Limiter.Release(d.ConnectionKey)
 				if connLimitConfig.OnConnectionReleased != nil {
 					connLimitConfig.OnConnectionReleased(ctx, time.Since(start).Milliseconds())
 				}

@@ -1,3 +1,5 @@
+//go:build linux
+
 package layer
 
 import (
@@ -6,6 +8,9 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/proxy"
@@ -16,8 +21,10 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/sandboxtools"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/storage/cache"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/layer")
@@ -33,7 +40,9 @@ type LayerExecutor struct {
 	templateStorage storage.StorageProvider
 	buildStorage    storage.StorageProvider
 	index           cache.Index
-	uploadTracker   *UploadTracker
+	uploads         *sandbox.Uploads
+	compressConfig  storage.CompressConfig
+	ff              *featureflags.Client
 }
 
 func NewLayerExecutor(
@@ -45,7 +54,9 @@ func NewLayerExecutor(
 	templateStorage storage.StorageProvider,
 	buildStorage storage.StorageProvider,
 	index cache.Index,
-	uploadTracker *UploadTracker,
+	uploads *sandbox.Uploads,
+	compressConfig storage.CompressConfig,
+	ff *featureflags.Client,
 ) *LayerExecutor {
 	return &LayerExecutor{
 		BuildContext: buildContext,
@@ -58,7 +69,9 @@ func NewLayerExecutor(
 		templateStorage: templateStorage,
 		buildStorage:    buildStorage,
 		index:           index,
-		uploadTracker:   uploadTracker,
+		uploads:         uploads,
+		compressConfig:  compressConfig,
+		ff:              ff,
 	}
 }
 
@@ -140,6 +153,7 @@ func (lb *LayerExecutor) BuildLayer(
 		sbx,
 		cmd.Hash,
 		meta,
+		cmd.BuildOrigin,
 	)
 	if err != nil {
 		return metadata.Template{}, fmt.Errorf("pause and upload: %w", err)
@@ -226,6 +240,7 @@ func (lb *LayerExecutor) updateEnvdInSandbox(
 	// Step 4: Wait for envd to initialize
 	err = sbx.WaitForEnvd(
 		ctx,
+		sandbox.StartTypeCreate,
 		waitEnvdTimeout,
 	)
 	if err != nil {
@@ -241,31 +256,48 @@ func (lb *LayerExecutor) PauseAndUpload(
 	sbx *sandbox.Sandbox,
 	hash string,
 	meta metadata.Template,
+	buildOrigin storage.ObjectOrigin,
 ) (e error) {
 	ctx, childSpan := tracer.Start(ctx, "pause-and-upload")
 	defer childSpan.End()
-
-	userLogger.Debug(ctx, fmt.Sprintf("Processing layer: %s", meta.Template.BuildID))
 
 	// snapshot is automatically cleared by the templateCache eviction
 	snapshot, err := sbx.Pause(
 		ctx,
 		meta,
+		sandbox.SnapshotUseCaseBuild,
 	)
 	if err != nil {
 		return fmt.Errorf("error processing vm: %w", err)
 	}
 
+	return lb.UploadSnapshot(ctx, userLogger, snapshot, hash, meta, buildOrigin)
+}
+
+// UploadSnapshot caches and uploads a snapshot produced without a running VM.
+func (lb *LayerExecutor) UploadSnapshot(
+	ctx context.Context,
+	userLogger logger.Logger,
+	snapshot *sandbox.Snapshot,
+	hash string,
+	meta metadata.Template,
+	buildOrigin storage.ObjectOrigin,
+) error {
+	userLogger.Debug(ctx, fmt.Sprintf("Adding layer to cache: %s", meta.Template.BuildID))
+
 	// Add snapshot to template cache so it can be used immediately
-	err = lb.templateCache.AddSnapshot(
+	err := lb.templateCache.AddSnapshot(
 		context.WithoutCancel(ctx),
 		meta.Template.BuildID,
-		snapshot.MemfileDiffHeader,
+		snapshot.MemorySnapshot.DiffHeader,
 		snapshot.RootfsDiffHeader,
 		snapshot.Snapfile,
 		snapshot.Metafile,
-		snapshot.MemfileDiff,
+		snapshot.MemorySnapshot.Diff,
 		snapshot.RootfsDiff,
+		snapshot.MemorySnapshot.ProvisionalDiffHeader,
+		snapshot.MemorySnapshot.ProvisionalDiff,
+		snapshot.MemorySnapshot.ProvisionalSwapDone,
 	)
 	if err != nil {
 		err = errors.Join(err, snapshot.Close(context.WithoutCancel(ctx)))
@@ -274,44 +306,56 @@ func (lb *LayerExecutor) PauseAndUpload(
 	}
 
 	// Upload snapshot async, it's added to the template cache immediately
-	userLogger.Debug(ctx, fmt.Sprintf("Saving: %s", meta.Template.BuildID))
+	userLogger.Debug(ctx, fmt.Sprintf("Uploading layer: %s", meta.Template.BuildID))
 
-	// Register this upload and get functions to signal completion and wait for previous uploads
-	completeUpload, waitForPreviousUploads := lb.uploadTracker.StartUpload()
+	objectMetadata := lb.BuildContext.Config.ObjectMetadata(buildOrigin)
 
-	lb.UploadErrGroup.Go(func() error {
+	upload, err := sandbox.NewUpload(ctx, lb.uploads, snapshot, lb.templateStorage, lb.compressConfig, lb.ff, storage.UseCaseBuild, objectMetadata)
+	if err != nil {
+		return fmt.Errorf("register upload: %w", err)
+	}
+
+	lb.UploadErrGroup.Go(func() (uploadErr error) {
 		ctx := context.WithoutCancel(ctx)
-		ctx, span := tracer.Start(ctx, "upload snapshot")
-		defer span.End()
+		ctx, span := tracer.Start(ctx, "upload snapshot", trace.WithAttributes(
+			telemetry.WithTemplateID(lb.Config.TemplateID),
+			telemetry.WithBuildID(lb.Template.BuildID),
+			telemetry.WithTeamID(lb.Config.TeamID),
+			attribute.String("layer.build_id", meta.Template.BuildID),
+			attribute.String("layer.hash", hash),
+		))
+		defer func() {
+			if uploadErr != nil {
+				span.RecordError(uploadErr)
+				span.SetStatus(codes.Error, uploadErr.Error())
+				lb.logger.Error(ctx, "template layer snapshot upload failed",
+					logger.WithTemplateID(lb.Config.TemplateID),
+					logger.WithBuildID(lb.Template.BuildID),
+					logger.WithTeamID(lb.Config.TeamID),
+					zap.String("layer_build_id", meta.Template.BuildID),
+					zap.String("layer_hash", hash),
+					zap.Error(uploadErr),
+				)
+			}
 
-		// Always signal completion to unblock waiting goroutines, even on error.
-		// This prevents deadlocks when an earlier layer fails - later layers can
-		// still unblock and the errgroup can properly collect all errors.
-		defer completeUpload()
+			span.End()
+		}()
 
-		err := snapshot.Upload(
-			ctx,
-			lb.templateStorage,
-			storage.TemplateFiles{BuildID: meta.Template.BuildID},
-		)
-		if err != nil {
+		// Signal even on error so child layers waiting on this build can abort.
+		defer func() { upload.Finish(ctx, uploadErr) }()
+
+		if err := upload.Run(ctx); err != nil {
 			return fmt.Errorf("error uploading snapshot: %w", err)
 		}
 
-		// Wait for all previous layer uploads to complete before saving the cache entry.
-		// This prevents race conditions where another build hits this cache entry
-		// before its dependencies (previous layers) are available in storage.
-		err = waitForPreviousUploads(ctx)
-		if err != nil {
-			return fmt.Errorf("error waiting for previous uploads: %w", err)
-		}
-
-		err = lb.index.SaveLayerMeta(ctx, hash, cache.LayerMetadata{
+		// Publish the recipe hash only after every artifact has been uploaded. A
+		// cache lookup can then resolve the hash to this build ID without observing
+		// a snapshot whose header, metadata, or data is still missing.
+		if err := lb.index.SaveLayerMeta(ctx, hash, cache.LayerMetadata{
 			Template: cache.Template{
 				BuildID: meta.Template.BuildID,
 			},
-		})
-		if err != nil {
+		}); err != nil {
 			// Since the data should be basically identical, this is safe to skip.
 			if !errors.Is(err, storage.ErrObjectRateLimited) {
 				return fmt.Errorf("error saving UUID to hash mapping: %w", err)

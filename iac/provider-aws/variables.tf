@@ -39,6 +39,47 @@ variable "api_cluster_size" {
   default = 1
 }
 
+variable "api_internal_grpc_port" {
+  type    = number
+  default = 5009
+}
+
+variable "api_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "api_db_migrator_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "client_proxy_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "orchestrator_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "template_manager_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
+variable "s3_use_path_style" {
+  type        = bool
+  default     = false
+  description = "When true, use path-style S3 addressing (https://host/bucket/key). When false (default), use virtual-host-style (https://bucket.host/key). Set to true for S3-compatible backends (MinIO, Ceph, etc.) that don't support virtual-host addressing."
+}
+
 variable "api_server_machine_type" {
   type    = string
   default = "t3.xlarge"
@@ -179,9 +220,10 @@ variable "orchestrator_proxy_port" {
   default = 5007
 }
 
-variable "allow_sandbox_internet" {
-  type    = bool
-  default = true
+variable "allow_sandbox_internal_cidrs" {
+  type        = string
+  description = "Comma-separated CIDRs to allow through the sandbox firewall deny list (e.g. 10.0.0.1/32,10.0.0.2/32)"
+  default     = ""
 }
 
 variable "envd_timeout" {
@@ -215,9 +257,10 @@ variable "control_server_cluster_size" {
   default = 3
 }
 
-variable "additional_traefik_arguments" {
-  type    = list(string)
-  default = []
+variable "traefik_config_files" {
+  type        = map(string)
+  description = "Map of filename => content for additional Traefik dynamic configuration files"
+  default     = {}
 }
 
 variable "db_max_open_connections" {
@@ -249,4 +292,28 @@ variable "hosted_zone_name" {
   description = "Explicit Route53 hosted zone name to use instead of the derived registrable root."
   type        = string
   default     = ""
+}
+
+variable "enable_otel_router_logs" {
+  type        = bool
+  default     = false
+  description = "Enable teeing non-internal customer logs from Vector to otel-router."
+}
+
+variable "otel_router_http_port" {
+  type        = number
+  default     = 4321
+  description = "Local otel-router Vector-compatible logs port used by Vector when otel-router log teeing is enabled."
+}
+
+variable "enable_otel_router_metrics" {
+  type        = bool
+  default     = false
+  description = "Enable teeing external customer metrics from otel-collector to otel-router."
+}
+
+variable "otel_router_grpc_port" {
+  type        = number
+  default     = 4320
+  description = "Local otel-router OTLP gRPC port used by otel-collector when otel-router metric teeing is enabled."
 }

@@ -14,6 +14,14 @@ output "nomad_acl_token_secret" {
   value = google_secret_manager_secret_version.nomad_acl_token.secret_data
 }
 
+output "api_admin_token_secret_name" {
+  value = google_secret_manager_secret_version.api_admin_token_value.secret
+}
+
+output "dashboard_api_admin_token_secret_name" {
+  value = google_secret_manager_secret_version.dashboard_api_admin_token_value.secret
+}
+
 output "grafana_api_key_secret_name" {
   value = google_secret_manager_secret.grafana_api_key.name
 }
@@ -58,8 +66,12 @@ output "posthog_api_key_secret_name" {
   value = google_secret_manager_secret_version.posthog_api_key.secret
 }
 
-output "supabase_jwt_secret_name" {
-  value = google_secret_manager_secret_version.supabase_jwt_secrets.secret
+output "ory_project_api_key_secret_name" {
+  value = local.ory_project_api_key_secret_id
+}
+
+output "ory_project_api_key_secret_exists" {
+  value = local.ory_project_api_key_secret_exists
 }
 
 output "postgres_connection_string_secret_name" {
@@ -72,6 +84,10 @@ output "loki_bucket_name" {
 
 output "envs_docker_context_bucket_name" {
   value = google_storage_bucket.envs_docker_context.name
+}
+
+output "argocd_apps_bucket_name" {
+  value = google_storage_bucket.argocd_apps.name
 }
 
 output "cluster_setup_bucket_name" {
@@ -89,6 +105,10 @@ output "fc_kernels_bucket_name" {
 
 output "fc_versions_bucket_name" {
   value = google_storage_bucket.fc_versions_bucket.name
+}
+
+output "fc_busybox_bucket_name" {
+  value = google_storage_bucket.fc_busybox_bucket.name
 }
 
 output "fc_template_bucket_name" {

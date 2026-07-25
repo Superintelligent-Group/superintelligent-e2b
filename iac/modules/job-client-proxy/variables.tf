@@ -25,10 +25,6 @@ variable "node_pool" {
   type = string
 }
 
-variable "environment" {
-  type = string
-}
-
 variable "proxy_port" {
   type    = number
   default = 3002
@@ -39,45 +35,22 @@ variable "health_port" {
   default = 3001
 }
 
-variable "redis_url" {
-  type      = string
-  sensitive = true
-}
-
-variable "redis_cluster_url" {
-  type      = string
-  sensitive = true
-}
-
-variable "redis_tls_ca_base64" {
-  type      = string
-  sensitive = true
-}
-
-variable "redis_pool_size" {
-  type    = number
-  default = 40
-}
-
 variable "image" {
   type = string
 }
 
-variable "api_grpc_address" {
-  type    = string
-  default = ""
+variable "exposure_type" {
+  type        = string
+  default     = "public"
+  description = "Exposure type: public, private, or both"
+  validation {
+    condition     = contains(["public", "private", "both"], var.exposure_type)
+    error_message = "Must be: public, private, or both"
+  }
 }
 
-variable "otel_collector_grpc_endpoint" {
-  type = string
-}
-
-variable "logs_collector_address" {
-  type = string
-}
-
-variable "launch_darkly_api_key" {
-  type      = string
-  default   = ""
+variable "job_env_vars" {
+  type      = map(string)
+  default   = {}
   sensitive = true
 }

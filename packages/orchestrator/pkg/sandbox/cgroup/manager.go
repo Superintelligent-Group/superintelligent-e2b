@@ -2,14 +2,18 @@ package cgroup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
@@ -24,6 +28,9 @@ const (
 	// NoCgroupFD is a sentinel value indicating that no cgroup file descriptor
 	// is available (e.g. cgroup accounting is disabled or the FD has been released).
 	NoCgroupFD = -1
+
+	cgroupKillTimeout      = 2 * time.Second
+	cgroupKillPollInterval = 100 * time.Millisecond
 )
 
 // Stats contains resource usage statistics from a cgroup
@@ -33,7 +40,7 @@ type Stats struct {
 	CPUSystemUsec uint64 // microseconds
 
 	MemoryUsageBytes uint64 // bytes
-	MemoryPeakBytes  uint64 // bytes, lifetime peak
+	MemoryPeakBytes  uint64 // bytes, reset after each GetStats() call
 }
 
 // CgroupHandle represents a created cgroup for a sandbox.
@@ -42,8 +49,9 @@ type Stats struct {
 // Lifecycle: Create → GetFD → cmd.Start() → ReleaseCgroupFD → GetStats (repeatedly) → Remove
 //
 // The caller MUST call ReleaseCgroupFD() right after cmd.Start() (regardless of
-// whether Start succeeded or failed). Remove() closes the memory.peak FD and
-// deletes the cgroup directory — it does not release the cgroup directory FD.
+// whether Start succeeded or failed). Remove() closes the memory.peak FD,
+// closes the cgroup directory FD as a safety net if ReleaseCgroupFD() was not
+// called, and deletes the cgroup directory.
 type CgroupHandle struct {
 	cgroupName     string
 	path           string
@@ -51,6 +59,7 @@ type CgroupHandle struct {
 	memoryPeakFile *os.File // Open FD to memory.peak for per-FD reset (nil after Remove or if not available)
 	manager        *managerImpl
 	removed        bool
+	noop           bool // true for handles created by NoopManager (no real cgroup backing)
 }
 
 // GetFD returns the file descriptor for use with SysProcAttr.CgroupFD.
@@ -68,8 +77,8 @@ func (h *CgroupHandle) GetFD() int {
 // Call this after cmd.Start() — the kernel has already placed the process in
 // the cgroup atomically during clone, so the directory FD is no longer needed.
 //
-// The memory.peak FD is intentionally kept open for the lifetime of stats
-// collection. It will be needed for per-FD reset when kernel 6.12+ is available.
+// The memory.peak FD is intentionally kept open because the per-FD reset
+// mechanism requires the same FD for the lifetime of stats collection.
 // That FD is closed later by Remove().
 //
 // Safe to call multiple times.
@@ -84,14 +93,101 @@ func (h *CgroupHandle) ReleaseCgroupFD() error {
 	return err
 }
 
-// GetStats retrieves current resource usage statistics for this cgroup
-// Returns error if cgroup has been removed or stats cannot be read
+// GetStats retrieves current resource usage statistics for this cgroup.
+// Returns (nil, nil) for noop handles (no real cgroup backing).
+// Returns error if the handle is nil (unexpected) or stats cannot be read.
 func (h *CgroupHandle) GetStats(ctx context.Context) (*Stats, error) {
 	if h == nil {
-		return nil, fmt.Errorf("cgroup handle is nil")
+		return nil, errors.New("cgroup handle is nil")
+	}
+
+	if h.noop {
+		return nil, nil
 	}
 
 	return h.manager.getStatsForPath(ctx, h.path, h.memoryPeakFile)
+}
+
+// Kill terminates all processes currently in this cgroup.
+// Safe to call multiple times. Returns nil if the cgroup is already empty or gone.
+func (h *CgroupHandle) Kill(ctx context.Context) error {
+	if h == nil || h.noop || h.removed {
+		return nil
+	}
+
+	return h.kill(ctx)
+}
+
+func (h *CgroupHandle) kill(ctx context.Context) error {
+	if h == nil || h.noop {
+		return nil
+	}
+
+	populated, err := h.populated()
+	if err != nil {
+		return err
+	}
+	if !populated {
+		return nil
+	}
+
+	if err := os.WriteFile(filepath.Join(h.path, "cgroup.kill"), []byte("1"), 0); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+
+		return fmt.Errorf("failed to write cgroup.kill: %w", err)
+	}
+
+	events, err := os.Open(filepath.Join(h.path, "cgroup.events"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to open cgroup.events: %w", err)
+	}
+	defer events.Close()
+
+	deadline := time.Now().Add(cgroupKillTimeout)
+
+	for {
+		populated, err := cgroupEventsPopulated(events)
+		if err != nil {
+			return err
+		}
+		if !populated {
+			return nil
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("cgroup %s still has processes after cgroup.kill", h.cgroupName)
+		}
+
+		pollTimeout := min(remaining, cgroupKillPollInterval)
+		pollTimeoutMillis := int(pollTimeout / time.Millisecond)
+		if pollTimeoutMillis == 0 {
+			pollTimeoutMillis = 1
+		}
+
+		fds := []unix.PollFd{{
+			Fd:     int32(events.Fd()),
+			Events: unix.POLLPRI | unix.POLLERR,
+		}}
+
+		_, err = unix.Poll(fds, pollTimeoutMillis)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+
+			return fmt.Errorf("failed to poll cgroup.events: %w", err)
+		}
+	}
 }
 
 // Remove closes all open FDs and deletes the cgroup directory.
@@ -99,7 +195,7 @@ func (h *CgroupHandle) GetStats(ctx context.Context) (*Stats, error) {
 // Safe to call multiple times. Returns error if removal fails
 // (but tolerates the cgroup having been auto-cleaned by the kernel).
 func (h *CgroupHandle) Remove(ctx context.Context) error {
-	if h == nil || h.removed {
+	if h == nil || h.noop || h.removed {
 		return nil
 	}
 
@@ -116,16 +212,49 @@ func (h *CgroupHandle) Remove(ctx context.Context) error {
 		h.memoryPeakFile = nil
 	}
 
-	// Remove the cgroup directory.
-	// The kernel automatically cleans up when all processes have exited,
-	// so ENOENT is expected and not an error.
-	if err := os.Remove(h.path); err != nil {
-		if !os.IsNotExist(err) {
+	// Try plain rmdir first. The kernel removes the directory once the
+	// last process exits, so the common path is a single rmdir.
+	rmErr := os.Remove(h.path)
+	if rmErr == nil || os.IsNotExist(rmErr) {
+		logger.L().Debug(ctx, "removed cgroup for sandbox",
+			zap.String("cgroup_name", h.cgroupName),
+			zap.String("path", h.path))
+
+		return nil
+	}
+
+	// rmdir failed (almost always EBUSY because something is still in the
+	// cgroup, e.g. a leaked firecracker). Log so the leak is visible, then
+	// fall back to cgroup.kill (cgroups v2, kernel 5.14+) and retry rmdir.
+	logger.L().Warn(ctx, "cgroup rmdir failed, falling back to cgroup.kill",
+		zap.String("cgroup_name", h.cgroupName),
+		zap.String("path", h.path),
+		zap.Error(rmErr))
+
+	if err := h.kill(ctx); err != nil {
+		logger.L().Warn(ctx, "failed to kill cgroup processes",
+			zap.String("cgroup_name", h.cgroupName),
+			zap.String("path", h.path),
+			zap.Error(err))
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := os.Remove(h.path)
+		if err == nil || os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
 			return fmt.Errorf("failed to remove cgroup: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 
-	logger.L().Debug(ctx, "removed cgroup for sandbox",
+	logger.L().Debug(ctx, "removed cgroup for sandbox after cgroup.kill",
 		zap.String("cgroup_name", h.cgroupName),
 		zap.String("path", h.path))
 
@@ -150,6 +279,58 @@ func (h *CgroupHandle) CgroupName() string {
 	return h.cgroupName
 }
 
+func (h *CgroupHandle) populated() (bool, error) {
+	data, err := os.ReadFile(filepath.Join(h.path, "cgroup.events"))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read cgroup.events: %w", err)
+	}
+
+	return parseCgroupEventsPopulated(data)
+}
+
+func cgroupEventsPopulated(file *os.File) (bool, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("failed to seek cgroup.events: %w", err)
+	}
+
+	data, err := io.ReadAll(file)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read cgroup.events: %w", err)
+	}
+
+	return parseCgroupEventsPopulated(data)
+}
+
+func parseCgroupEventsPopulated(data []byte) (bool, error) {
+	for line := range strings.SplitSeq(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "populated" {
+			continue
+		}
+
+		switch fields[1] {
+		case "0":
+			return false, nil
+		case "1":
+			return true, nil
+		default:
+			return false, fmt.Errorf("invalid populated value in cgroup.events: %q", fields[1])
+		}
+	}
+
+	return false, errors.New("missing populated value in cgroup.events")
+}
+
 // Manager handles initialization and creation of cgroups
 // Individual cgroup operations are performed through CgroupHandle
 type Manager interface {
@@ -161,6 +342,11 @@ type Manager interface {
 	// The handle provides access to the cgroup's FD, stats, and cleanup
 	// Returns error if cgroup creation fails
 	Create(ctx context.Context, cgroupName string) (*CgroupHandle, error)
+
+	// Destroy kills any remaining processes in an already-created sandbox
+	// cgroup and removes it. Intended for reclaiming cgroups leaked by
+	// sandboxes that did not shut down cleanly.
+	Destroy(ctx context.Context, cgroupName string) error
 }
 
 type managerImpl struct{}
@@ -205,12 +391,12 @@ func (m *managerImpl) Create(ctx context.Context, cgroupName string) (*CgroupHan
 		return nil, fmt.Errorf("failed to open cgroup directory: %w", err)
 	}
 
-	// TODO: Change to os.O_RDWR when per-FD peak reset is re-enabled.
+	// O_RDWR FD must stay open for per-FD peak reset across GetStats() calls
 	memPeakPath := filepath.Join(cgroupPath, "memory.peak")
-	memoryPeakFile, peakErr := os.OpenFile(memPeakPath, os.O_RDONLY, 0)
+	memoryPeakFile, peakErr := os.OpenFile(memPeakPath, os.O_RDWR, 0)
 	if peakErr != nil {
 		// Not fatal — memory.peak may not exist on older kernels
-		logger.L().Debug(ctx, "failed to open memory.peak",
+		logger.L().Warn(ctx, "failed to open memory.peak for reset",
 			zap.String("cgroup_name", cgroupName),
 			zap.String("path", memPeakPath),
 			zap.Error(peakErr))
@@ -228,9 +414,47 @@ func (m *managerImpl) Create(ctx context.Context, cgroupName string) (*CgroupHan
 	logger.L().Debug(ctx, "created cgroup for sandbox",
 		zap.String("cgroup_name", cgroupName),
 		zap.String("path", cgroupPath),
-		zap.Int("fd", handle.GetFD()))
+		zap.Int("fd", handle.GetFD()),
+		zap.Bool("peak_reset_available", memoryPeakFile != nil))
 
 	return handle, nil
+}
+
+// Destroy kills any remaining processes in an existing sandbox cgroup and
+// removes it.
+func (m *managerImpl) Destroy(ctx context.Context, cgroupName string) error {
+	handle, err := m.openExisting(ctx, cgroupName)
+	if err != nil {
+		return err
+	}
+
+	// Remove kills any remaining processes and deletes the cgroup.
+	return handle.Remove(ctx)
+}
+
+// openExisting returns a handle for an already-created sandbox cgroup, intended
+// for teardown of leaked cgroups. It deliberately does not open memory.peak
+// (unlike Create), since callers only Kill/Remove the cgroup and never read peak
+// memory.
+func (m *managerImpl) openExisting(ctx context.Context, cgroupName string) (*CgroupHandle, error) {
+	cgroupPath := m.cgroupPath(cgroupName)
+	info, err := os.Stat(cgroupPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat cgroup directory: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("cgroup path is not a directory: %s", cgroupPath)
+	}
+
+	logger.L().Debug(ctx, "opened existing cgroup for sandbox",
+		zap.String("cgroup_name", cgroupName),
+		zap.String("path", cgroupPath))
+
+	return &CgroupHandle{
+		cgroupName: cgroupName,
+		path:       cgroupPath,
+		manager:    m,
+	}, nil
 }
 
 func (m *managerImpl) getStatsForPath(ctx context.Context, cgroupPath string, memoryPeakFile *os.File) (*Stats, error) {
@@ -270,9 +494,9 @@ func (m *managerImpl) getStatsForPath(ctx context.Context, cgroupPath string, me
 	stats.MemoryUsageBytes, _ = strconv.ParseUint(strings.TrimSpace(string(memData)), 10, 64)
 
 	if memoryPeakFile != nil {
-		peakBytes, err := m.readMemoryPeak(memoryPeakFile)
+		peakBytes, err := m.readAndResetMemoryPeak(ctx, memoryPeakFile)
 		if err != nil {
-			logger.L().Debug(ctx, "failed to read memory.peak", zap.Error(err))
+			logger.L().Warn(ctx, "failed to read memory.peak", zap.Error(err))
 		} else {
 			stats.MemoryPeakBytes = peakBytes
 		}
@@ -281,12 +505,13 @@ func (m *managerImpl) getStatsForPath(ctx context.Context, cgroupPath string, me
 	return stats, nil
 }
 
-// readMemoryPeak reads the current peak memory value from the persistent FD.
-// Read requires file position 0 (seq_file), so we seek before reading.
-//
-// TODO: When per-FD peak reset is available-enabled, this function
-// should also write to the FD to reset the peak for the next interval.
-func (m *managerImpl) readMemoryPeak(memoryPeakFile *os.File) (uint64, error) {
+// readAndResetMemoryPeak reads the current peak memory value and resets it for the next interval.
+// It uses the persistent FD kept open in CgroupHandle for per-FD reset tracking.
+// The cgroups v2 kernel interface works as follows:
+//   - Read requires file position 0 (seq_file), so we seek before reading.
+//   - Write resets the per-FD peak to current memory usage. The kernel ignores
+//     both the written content and the file offset, so no seek before write is needed.
+func (m *managerImpl) readAndResetMemoryPeak(ctx context.Context, memoryPeakFile *os.File) (uint64, error) {
 	if _, err := memoryPeakFile.Seek(0, io.SeekStart); err != nil {
 		return 0, fmt.Errorf("failed to seek memory.peak for read: %w", err)
 	}
@@ -297,9 +522,15 @@ func (m *managerImpl) readMemoryPeak(memoryPeakFile *os.File) (uint64, error) {
 		return 0, fmt.Errorf("failed to read memory.peak: %w", err)
 	}
 
-	peakBytes, _ := strconv.ParseUint(strings.TrimSpace(string(buf[:n])), 10, 64)
+	peakBytes, parseErr := strconv.ParseUint(strings.TrimSpace(string(buf[:n])), 10, 64)
+	if parseErr != nil {
+		return 0, fmt.Errorf("failed to parse memory.peak value %q: %w", strings.TrimSpace(string(buf[:n])), parseErr)
+	}
 
-	// TODO:The write for Per-FD peak reset introduced in kernel 6.12 belongs here.
+	// Reset per-FD peak for next interval
+	if _, err := memoryPeakFile.WriteString("0"); err != nil {
+		logger.L().Warn(ctx, "failed to reset memory.peak, interval peak semantics degraded", zap.Error(err))
+	}
 
 	return peakBytes, nil
 }
@@ -307,4 +538,32 @@ func (m *managerImpl) readMemoryPeak(memoryPeakFile *os.File) (uint64, error) {
 // cgroupPath returns the filesystem path for a sandbox's cgroup
 func (m *managerImpl) cgroupPath(cgroupName string) string {
 	return filepath.Join(RootCgroupPath, cgroupName)
+}
+
+func IsSandboxCgroupName(name string) bool {
+	return strings.HasPrefix(name, "sbx-") && len(name) > len("sbx-")
+}
+
+func ListSandboxCgroups(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("failed to read cgroup root: %w", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !IsSandboxCgroupName(entry.Name()) {
+			continue
+		}
+
+		names = append(names, entry.Name())
+	}
+
+	slices.Sort(names)
+
+	return names, nil
 }

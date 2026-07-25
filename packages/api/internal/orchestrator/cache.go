@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -93,10 +94,17 @@ func (o *Orchestrator) syncNodes(ctx context.Context, store *sandbox.Store, skip
 			// cluster and local nodes needs to by synced differently,
 			// because each of them is taken from different source pool
 			var err error
-			if n.IsNomadManaged() {
-				err = o.syncNode(ctx, n, nomadNodes, store)
-			} else {
+			switch {
+			case !n.IsNomadManaged():
 				err = o.syncClusterNode(ctx, n, store)
+			case skipSyncingWithNomad:
+				// In local mode there is no Nomad discovery list to validate
+				// membership against, so sync the statically-connected node
+				// directly instead of evicting it every cycle. node.Sync still
+				// marks the node unhealthy if the orchestrator is unreachable.
+				n.Sync(ctx, store)
+			default:
+				err = o.syncNode(ctx, n, nomadNodes, store)
 			}
 			if err != nil {
 				logger.L().Error(ctx, "Error syncing node", zap.Error(err))
@@ -168,7 +176,7 @@ func (o *Orchestrator) syncClusterNode(ctx context.Context, node *nodemanager.No
 
 	cluster, clusterFound := o.clusters.GetClusterById(node.ClusterID)
 	if !clusterFound {
-		return fmt.Errorf("cluster not found")
+		return errors.New("cluster not found")
 	}
 
 	// We want to find not just node, but explicitly node with expected service instance ID

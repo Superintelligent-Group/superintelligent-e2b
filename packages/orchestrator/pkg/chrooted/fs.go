@@ -1,7 +1,9 @@
+//go:build linux
+
 package chrooted
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,7 +63,9 @@ func (fs *Chrooted) Stat(filename string) (info os.FileInfo, err error) {
 
 func (fs *Chrooted) GetEntry(filename string) (info filesystem.EntryInfo, err error) {
 	err = fs.act(func() error {
-		info, err = filesystem.GetEntryFromPath(filename)
+		// includeMetadata=false: the orchestrator EntryInfo proto has no
+		// metadata field, so skip the extra xattr syscalls.
+		info, err = filesystem.GetEntryFromPath(filename, false)
 
 		return err
 	})
@@ -180,7 +184,7 @@ func (fs *Chrooted) Readlink(link string) (target string, err error) {
 }
 
 func (fs *Chrooted) Chroot(_ string) (*Chrooted, error) {
-	return nil, fmt.Errorf("chroot not supported")
+	return nil, errors.New("chroot not supported")
 }
 
 func (fs *Chrooted) Root() string {

@@ -1,11 +1,12 @@
+//go:build linux
+
 package server
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"time"
-
-	"github.com/pkg/errors"
 
 	template_manager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
 )
@@ -23,7 +24,7 @@ func (s *ServerStore) TemplateBuildStatus(ctx context.Context, in *template_mana
 
 	buildInfo, err := s.buildCache.Get(in.GetBuildID())
 	if err != nil {
-		return nil, errors.Wrap(err, "error while getting build info, maybe already expired")
+		return nil, fmt.Errorf("error while getting build info, maybe already expired: %w", err)
 	}
 
 	limit := maxLogEntriesPerRequest

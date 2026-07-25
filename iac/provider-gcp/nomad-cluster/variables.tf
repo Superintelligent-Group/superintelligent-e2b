@@ -80,6 +80,13 @@ variable "api_port" {
   })
 }
 
+variable "extra_api_instance_groups" {
+  description = "Additional instance-group self-links to attach to the api LB backend (e.g. GKE-managed MIGs whose nodes run the api pod with hostPort = api_port.port)."
+  type        = list(string)
+  default     = []
+  nullable    = false
+}
+
 variable "ingress_port" {
   type = object({
     name        = string
@@ -224,6 +231,11 @@ variable "fc_versions_bucket_name" {
   type = string
 }
 
+variable "fc_busybox_bucket_name" {
+  type        = string
+  description = "The name of the bucket to store the busybox binary"
+}
+
 variable "consul_acl_token_secret" {
   type = string
 }
@@ -268,17 +280,6 @@ variable "clickhouse_health_port" {
     port = number
     path = string
   })
-}
-
-variable "additional_api_services" {
-  description = "Additional path rules to add to the load balancer routing."
-  type = list(object({
-    paths      = list(string)
-    service_id = string
-
-    api_node_group_port_name = string
-    api_node_group_port      = number
-  }))
 }
 
 variable "filestore_cache_enabled" {
@@ -364,6 +365,16 @@ variable "clickhouse_boot_disk_type" {
   type        = string
 }
 
+variable "clickhouse_stateful_disk_type" {
+  description = "The GCE disk type for the ClickHouse stateful data disk (e.g. pd-ssd, hyperdisk-balanced)."
+  type        = string
+}
+
+variable "clickhouse_stateful_disk_size_gb" {
+  description = "The GCE disk size (in GB) for the ClickHouse stateful data disk."
+  type        = number
+}
+
 variable "loki_boot_disk_type" {
   description = "The GCE boot disk type for the Loki machines."
   type        = string
@@ -379,5 +390,8 @@ variable "persistent_volume_types" {
 }
 
 variable "additional_api_paths_handled_by_ingress" {
-  type = list(string)
+  type = list(object({
+    paths       = list(string)
+    timeout_sec = optional(number)
+  }))
 }

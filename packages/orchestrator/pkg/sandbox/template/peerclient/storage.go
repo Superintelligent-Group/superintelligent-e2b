@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,25 +16,10 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
-	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 var (
 	tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/peerclient")
-	meter  = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/peerclient")
-
-	peerReadTimerFactory = utils.Must(telemetry.NewTimerFactory(meter,
-		"orchestrator.storage.peer.read",
-		"Duration of peer orchestrator reads",
-		"Total bytes read from peer orchestrator",
-		"Total peer orchestrator reads",
-	))
-
-	attrOpWriteTo     = attribute.String("operation", "WriteTo")
-	attrOpExists      = attribute.String("operation", "Exists")
-	attrOpSize        = attribute.String("operation", "Size")
-	attrOpReadAt      = attribute.String("operation", "ReadAt")
-	attrOpRangeReader = attribute.String("operation", "OpenRangeReader")
 
 	attrResolveRedisError = attribute.String("peer_resolve", "redis_error")
 	attrResolveNoPeer     = attribute.String("peer_resolve", "no_peer")
@@ -47,6 +31,19 @@ var (
 	attrPeerHitTrue  = attribute.Bool("peer_hit", true)
 	attrPeerHitFalse = attribute.Bool("peer_hit", false)
 )
+
+// PeerRouted marks a Seekable that resolveProvider actually routed through a
+// peer at open time. Callers that need to distinguish "the routing provider
+// gave me a peer wrapper" from "the routing provider fell through to base"
+// type-assert against this marker; presence is the signal — the method body
+// is intentionally empty.
+type PeerRouted interface {
+	IsPeerRouted()
+}
+
+func (*peerSeekable) IsPeerRouted() {}
+
+var _ PeerRouted = (*peerSeekable)(nil)
 
 var _ storage.StorageProvider = (*routingProvider)(nil)
 
@@ -81,16 +78,16 @@ func (p *routingProvider) resolveProvider(ctx context.Context, buildID string) s
 	return newPeerStorageProvider(p.base, res.client, res.uploaded)
 }
 
-func (p *routingProvider) OpenBlob(ctx context.Context, path string, objType storage.ObjectType) (storage.Blob, error) {
-	buildID, _ := storage.ParseStoragePath(path)
+func (p *routingProvider) OpenBlob(ctx context.Context, path string) (storage.Blob, error) {
+	buildID, _ := storage.SplitPath(path)
 
-	return p.resolveProvider(ctx, buildID).OpenBlob(ctx, path, objType)
+	return p.resolveProvider(ctx, buildID).OpenBlob(ctx, path)
 }
 
-func (p *routingProvider) OpenSeekable(ctx context.Context, path string, objType storage.SeekableObjectType) (storage.Seekable, error) {
-	buildID, _ := storage.ParseStoragePath(path)
+func (p *routingProvider) OpenSeekable(ctx context.Context, path string) (storage.Seekable, error) {
+	buildID, _ := storage.SplitPath(path)
 
-	return p.resolveProvider(ctx, buildID).OpenSeekable(ctx, path, objType)
+	return p.resolveProvider(ctx, buildID).OpenSeekable(ctx, path)
 }
 
 func (p *routingProvider) DeleteObjectsWithPrefix(ctx context.Context, prefix string) error {
@@ -128,32 +125,43 @@ func newPeerStorageProvider(
 	}
 }
 
-func (p *peerStorageProvider) OpenBlob(_ context.Context, path string, objType storage.ObjectType) (storage.Blob, error) {
-	buildID, fileName := storage.ParseStoragePath(path)
+func (p *peerStorageProvider) OpenBlob(_ context.Context, path string) (storage.Blob, error) {
+	buildID, t := storage.SplitPath(path)
 
-	return &peerBlob{peerHandle: peerHandle[storage.Blob]{
-		client:   p.peerClient,
-		buildID:  buildID,
-		fileName: fileName,
-		uploaded: p.uploaded,
-		openFn: func(ctx context.Context) (storage.Blob, error) {
-			return p.base.OpenBlob(ctx, path, objType)
+	return &peerBlob{
+		peerHandle: peerHandle{
+			client:   p.peerClient,
+			buildID:  buildID,
+			name:     t,
+			uploaded: p.uploaded,
 		},
-	}}, nil
+		openBase: func(ctx context.Context) (storage.Blob, error) {
+			return p.base.OpenBlob(ctx, path)
+		},
+	}, nil
 }
 
-func (p *peerStorageProvider) OpenSeekable(_ context.Context, path string, objType storage.SeekableObjectType) (storage.Seekable, error) {
-	buildID, fileName := storage.ParseStoragePath(path)
+func (p *peerStorageProvider) OpenSeekable(_ context.Context, path string) (storage.Seekable, error) {
+	// Strip any compression suffix so peerSeekable holds the basic name. The
+	// base fallthrough path composes the actual storage path from
+	// (buildID, name, ct) per-call. Peer routing usually engages only
+	// pre-finalization (basic name in, no-op strip), but the Redis peer-key
+	// TTL outlives the upload by ~2 min: a fresh orchestrator can resolve a
+	// stale entry for a finalized V4/Zstd build, in which case StorageDiff
+	// hands us "buildID/memfile.zstd" — without stripping, getBase would
+	// double-suffix to "memfile.zstd.zstd" on fallthrough.
+	buildID, t := storage.SplitPath(path)
+	t = storage.StripCompression(t)
 
-	return &peerSeekable{peerHandle: peerHandle[storage.Seekable]{
-		client:   p.peerClient,
-		buildID:  buildID,
-		fileName: fileName,
-		uploaded: p.uploaded,
-		openFn: func(ctx context.Context) (storage.Seekable, error) {
-			return p.base.OpenSeekable(ctx, path, objType)
+	return &peerSeekable{
+		peerHandle: peerHandle{
+			client:   p.peerClient,
+			buildID:  buildID,
+			name:     t,
+			uploaded: p.uploaded,
 		},
-	}}, nil
+		basePersistence: p.base,
+	}, nil
 }
 
 func (p *peerStorageProvider) DeleteObjectsWithPrefix(ctx context.Context, prefix string) error {
@@ -183,40 +191,16 @@ func checkPeerAvailability(avail *orchestrator.PeerAvailability, uploaded *atomi
 	return true
 }
 
-type peerHandle[Base any] struct {
+// peerHandle holds the peer-side identity shared by peerBlob and peerSeekable.
+// fileName is the basic (uncompressed) name — peer fetches always use it.
+type peerHandle struct {
 	client   orchestrator.ChunkServiceClient
 	buildID  string
-	fileName string
+	name     string
 	uploaded *atomic.Bool
-
-	mu     sync.Mutex
-	base   Base
-	loaded bool
-	openFn func(ctx context.Context) (Base, error)
 }
 
-func (h *peerHandle[Base]) getOrOpenBase(ctx context.Context) (Base, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.loaded {
-		return h.base, nil
-	}
-
-	b, err := h.openFn(ctx)
-	if err != nil {
-		var zero Base
-
-		return zero, err
-	}
-
-	h.base = b
-	h.loaded = true
-
-	return b, nil
-}
-
-// peerAttempt is the result of a peer read attempt, used with withPeerFallback.
+// peerAttempt is the result of a peer read attempt.
 // hit=true means the peer had data (value is populated); when hit=true and the
 // caller also returns a non-nil error the helper records a partial failure.
 type peerAttempt[T any] struct {
@@ -225,72 +209,61 @@ type peerAttempt[T any] struct {
 	hit   bool
 }
 
-func withPeerFallback[Base, T any](
+// tryPeer attempts a peer read if the peer is still authoritative for this
+// build. It records peer telemetry and returns the attempt; the caller
+// inspects res.hit to decide whether to fall through to base. tryPeer never
+// opens base.
+func tryPeer[T any](
 	ctx context.Context,
-	h *peerHandle[Base],
+	h *peerHandle,
 	spanName string,
-	opAttr attribute.KeyValue,
 	peerFn func(ctx context.Context) (peerAttempt[T], error),
-	useBase func(ctx context.Context, base Base) (T, error),
-) (T, error) {
+) (peerAttempt[T], error) {
 	ctx, span := tracer.Start(ctx, spanName, trace.WithAttributes(
-		attribute.String("file_name", h.fileName),
+		attribute.String("file_name", h.name),
 	))
 	defer span.End()
 
-	if !h.uploaded.Load() {
-		timer := peerReadTimerFactory.Begin(opAttr)
+	if h.uploaded.Load() {
+		span.SetAttributes(attrPeerHitFalse)
 
-		res, err := peerFn(ctx)
-		if res.hit {
-			if err != nil {
-				span.RecordError(err)
-				timer.Failure(ctx, res.bytes)
+		return peerAttempt[T]{}, nil
+	}
 
-				return res.value, err
-			}
-
-			span.SetAttributes(attrPeerHitTrue)
-			timer.Success(ctx, res.bytes)
-
-			return res.value, nil
-		}
-
+	res, err := peerFn(ctx)
+	if res.hit {
 		if err != nil {
 			span.RecordError(err)
+
+			return res, err
 		}
 
-		timer.Failure(ctx, 0)
+		span.SetAttributes(attrPeerHitTrue)
+
+		return res, nil
+	}
+
+	if err != nil {
+		span.RecordError(err)
 	}
 
 	span.SetAttributes(attrPeerHitFalse)
 
-	base, err := h.getOrOpenBase(ctx)
-	if err != nil {
-		span.RecordError(err)
-
-		var zero T
-
-		return zero, err
-	}
-
-	result, err := useBase(ctx, base)
-	if err != nil {
-		span.RecordError(err)
-	}
-
-	return result, err
+	return peerAttempt[T]{}, nil
 }
 
-var _ io.ReadCloser = (*peerStreamReader)(nil)
+var _ storage.RangeReader = (*peerStreamReader)(nil)
 
-// peerStreamReader wraps a gRPC streaming recv function as an io.ReadCloser.
+// peerStreamReader wraps a gRPC streaming recv function as a storage.RangeReader.
 // cancel is called on Close to signal the server to terminate the stream.
 type peerStreamReader struct {
 	recv    func() ([]byte, error)
 	current *bytes.Reader
 	done    bool
 	cancel  context.CancelFunc
+
+	bytes int64
+	read  time.Duration
 }
 
 func newPeerStreamReader(recv func() ([]byte, error), cancel context.CancelFunc) *peerStreamReader {
@@ -300,7 +273,13 @@ func newPeerStreamReader(recv func() ([]byte, error), cancel context.CancelFunc)
 	}
 }
 
-func (r *peerStreamReader) Read(p []byte) (int, error) {
+func (r *peerStreamReader) Read(p []byte) (n int, err error) {
+	t0 := time.Now()
+	defer func() {
+		r.read += time.Since(t0)
+		r.bytes += int64(n)
+	}()
+
 	for {
 		if r.current != nil && r.current.Len() > 0 {
 			return r.current.Read(p)
@@ -312,11 +291,12 @@ func (r *peerStreamReader) Read(p []byte) (int, error) {
 
 		// gRPC Recv returns (nil, io.EOF) separately from the last data message,
 		// so no data is lost here.
-		data, err := r.recv()
+		var data []byte
+		data, err = r.recv()
 		if errors.Is(err, io.EOF) {
 			r.done = true
 
-			return 0, io.EOF
+			continue
 		}
 		if err != nil {
 			return 0, fmt.Errorf("failed to receive chunk from peer: %w", err)
@@ -326,8 +306,12 @@ func (r *peerStreamReader) Read(p []byte) (int, error) {
 	}
 }
 
-func (r *peerStreamReader) Close() error {
+func (r *peerStreamReader) Close(context.Context) (*storage.ReadStats, error) {
 	r.cancel()
 
-	return nil
+	return &storage.ReadStats{
+		StoredBytes:    r.bytes,
+		DeliveredBytes: r.bytes,
+		Read:           r.read,
+	}, nil
 }

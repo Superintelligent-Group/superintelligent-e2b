@@ -6,14 +6,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	nomadapi "github.com/hashicorp/nomad/api"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
+	"github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	clickhouse "github.com/e2b-dev/infra/packages/clickhouse/pkg"
 	"github.com/e2b-dev/infra/packages/db/client"
 	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
@@ -46,9 +47,11 @@ func NewPool(
 	ctx context.Context,
 	tel *telemetry.Client,
 	db *client.Client,
-	nomad *nomadapi.Client,
+	localDiscovery discovery.Discovery,
 	queryMetricsProvider clickhouse.Clickhouse,
 	queryLogsProvider *loki.LokiQueryProvider,
+	sandboxLogsReader ClickhouseLogsReader,
+	featureFlags *featureflags.Client,
 	config cfg.Config,
 ) (*Pool, error) {
 	clusters := smap.New[*Cluster]()
@@ -68,9 +71,11 @@ func NewPool(
 				tel:                  tel,
 				clusters:             clusters,
 				local:                localCluster,
-				nomad:                nomad,
+				localDiscovery:       localDiscovery,
 				queryLogsProvider:    queryLogsProvider,
 				queryMetricsProvider: queryMetricsProvider,
+				sandboxLogsReader:    sandboxLogsReader,
+				featureFlags:         featureFlags,
 			},
 		),
 	}
@@ -111,9 +116,11 @@ type clustersSyncStore struct {
 	tel                  *telemetry.Client
 	clusters             *smap.Map[*Cluster]
 	local                *queries.Cluster
-	nomad                *nomadapi.Client
+	localDiscovery       discovery.Discovery
 	queryMetricsProvider clickhouse.Clickhouse
 	queryLogsProvider    *loki.LokiQueryProvider
+	sandboxLogsReader    ClickhouseLogsReader
+	featureFlags         *featureflags.Client
 	config               cfg.Config
 }
 
@@ -171,7 +178,7 @@ func (d clustersSyncStore) PoolInsert(ctx context.Context, cluster queries.Clust
 
 	// Local cluster
 	if cluster.ID == consts.LocalClusterID {
-		c = newLocalCluster(context.WithoutCancel(ctx), d.tel, d.nomad, d.queryMetricsProvider, d.queryLogsProvider, d.config)
+		c = newLocalCluster(context.WithoutCancel(ctx), d.tel, d.localDiscovery, d.queryMetricsProvider, d.queryLogsProvider, d.sandboxLogsReader, d.featureFlags, d.config)
 		d.clusters.Insert(clusterID, c)
 		logger.L().Info(ctx, "Local cluster initialized successfully", logger.WithClusterID(cluster.ID))
 
@@ -179,7 +186,21 @@ func (d clustersSyncStore) PoolInsert(ctx context.Context, cluster queries.Clust
 	}
 
 	// Remote cluster
-	c, err = newRemoteCluster(context.WithoutCancel(ctx), d.tel, cluster.Endpoint, cluster.EndpointTls, cluster.Token, cluster.ID, cluster.SandboxProxyDomain)
+	authOrgID := ""
+	if cluster.AuthOrgID != nil {
+		authOrgID = *cluster.AuthOrgID
+	}
+
+	c, err = newRemoteCluster(
+		context.WithoutCancel(ctx),
+		d.tel,
+		cluster.Endpoint,
+		cluster.EndpointTls,
+		cluster.Token,
+		cluster.ID,
+		cluster.SandboxProxyDomain,
+		authOrgID,
+	)
 	if err != nil {
 		logger.L().Error(ctx, "Initializing remote cluster failed", zap.Error(err), logger.WithClusterID(cluster.ID))
 

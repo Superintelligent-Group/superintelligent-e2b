@@ -11,9 +11,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/e2b-dev/infra/packages/db/pkg/auth"
-	"github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
+	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
+	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
+)
+
+const (
+	defaultOidcIssuer  = "http://localhost:4444/"
+	defaultOidcSubject = "local-dev-user"
 )
 
 var (
@@ -39,7 +44,17 @@ func run(ctx context.Context) error {
 		connectionString = "postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable"
 	}
 
-	authDb, err := authdb.NewClient(ctx, connectionString, connectionString)
+	oidcIssuer := os.Getenv("OIDC_ISSUER")
+	if oidcIssuer == "" {
+		oidcIssuer = defaultOidcIssuer
+	}
+
+	oidcSubject := os.Getenv("OIDC_SUBJECT")
+	if oidcSubject == "" {
+		oidcSubject = defaultOidcSubject
+	}
+
+	authDb, err := authdb.NewClient(ctx, connectionString)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -58,6 +73,10 @@ func run(ctx context.Context) error {
 
 	if err = ensureUserIsOnTeam(ctx, authDb, teamID); err != nil {
 		return fmt.Errorf("failed to ensure user is on team: %w", err)
+	}
+
+	if err = upsertUserIdentity(ctx, authDb, oidcIssuer, oidcSubject); err != nil {
+		return fmt.Errorf("failed to upsert user identity: %w", err)
 	}
 
 	// create user token
@@ -84,7 +103,7 @@ func upsertTeamAPIKey(ctx context.Context, db *authdb.Client, teamID uuid.UUID, 
 		return fmt.Errorf("failed to create token hash: %w", err)
 	}
 
-	if _, err = db.Write.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
+	if _, err = db.CreateTeamAPIKey(ctx, authqueries.CreateTeamAPIKeyParams{
 		TeamID:           teamID,
 		CreatedBy:        &userID,
 		ApiKeyHash:       tokenHash,
@@ -95,6 +114,18 @@ func upsertTeamAPIKey(ctx context.Context, db *authdb.Client, teamID uuid.UUID, 
 		Name:             "local dev seed token",
 	}); ignoreConstraints(err) != nil {
 		return fmt.Errorf("failed to create team api key: %w", err)
+	}
+
+	return nil
+}
+
+func upsertUserIdentity(ctx context.Context, db *authdb.Client, oidcIssuer, oidcSubject string) error {
+	if _, err := db.UpsertPublicIdentity(ctx, authqueries.UpsertPublicIdentityParams{
+		OidcIss: oidcIssuer,
+		OidcSub: oidcSubject,
+		UserID:  userID,
+	}); err != nil {
+		return fmt.Errorf("failed to upsert user identity: %w", err)
 	}
 
 	return nil
@@ -125,7 +156,7 @@ func upsertUserToken(ctx context.Context, db *authdb.Client, tokenPrefix, token 
 		return fmt.Errorf("failed to create token hash: %w", err)
 	}
 
-	if _, err = db.Write.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
+	if _, err = db.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
 		ID:                    tokenID,
 		UserID:                userID,
 		AccessTokenHash:       tokenHash,
@@ -181,6 +212,11 @@ ON CONFLICT (id) DO UPDATE SET
 		return fmt.Errorf("failed to upsert user: %w", err)
 	}
 
+	err = db.UpsertPublicUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to upsert public user: %w", err)
+	}
+
 	return nil
 }
 
@@ -189,12 +225,12 @@ func createTokenHash(prefix, accessToken string) (string, keys.MaskedIdentifier,
 	tokenWithoutPrefix := strings.TrimPrefix(accessToken, prefix)
 	accessTokenBytes, err := hex.DecodeString(tokenWithoutPrefix)
 	if err != nil {
-		return "", keys.MaskedIdentifier{}, fmt.Errorf("failed to hex decode string")
+		return "", keys.MaskedIdentifier{}, errors.New("failed to hex decode string")
 	}
 	accessTokenHash := hasher.Hash(accessTokenBytes)
 	accessTokenMask, err := keys.MaskKey(prefix, tokenWithoutPrefix)
 	if err != nil {
-		return "", keys.MaskedIdentifier{}, fmt.Errorf("failed to mask key")
+		return "", keys.MaskedIdentifier{}, errors.New("failed to mask key")
 	}
 
 	return accessTokenHash, accessTokenMask, nil
