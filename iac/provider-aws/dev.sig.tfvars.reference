@@ -1,0 +1,92 @@
+# =============================================================================
+# E2B Self-Hosted — Dev Environment Configuration
+# =============================================================================
+
+aws_region = "us-east-1"
+prefix     = "e2b"
+environment = "dev"
+
+# -----------------------------------------------------------------------------
+# Networking
+# -----------------------------------------------------------------------------
+vpc_cidr             = "10.10.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b"]
+public_subnet_cidrs  = ["10.10.1.0/24", "10.10.2.0/24"]
+private_subnet_cidrs = ["10.10.10.0/24", "10.10.11.0/24"]
+single_nat_gateway   = true  # Save ~$66/month in dev
+
+# -----------------------------------------------------------------------------
+# Domain & TLS
+# -----------------------------------------------------------------------------
+domain_name         = "e2b.superintelligent.group"
+acm_certificate_arn = "arn:aws:acm:us-east-1:319933937176:certificate/abc81869-a727-4255-a14d-c778c73453c9"
+
+# DNS — using Cloudflare (leave Route53 disabled)
+create_route53_record = false
+
+# -----------------------------------------------------------------------------
+# S3 Buckets (already exist from prior setup)
+# -----------------------------------------------------------------------------
+template_bucket_name = "e2b-dev-templates-319933937176"
+snapshot_bucket_name = "e2b-dev-snapshots-319933937176"
+build_bucket_name    = "e2b-dev-builds-319933937176"
+log_bucket_name      = "e2b-dev-logs-319933937176"
+
+# -----------------------------------------------------------------------------
+# Control Plane (Nomad server + API)
+# -----------------------------------------------------------------------------
+control_plane_ami_id           = "ami-04eaa218f1349d88b"  # Ubuntu 24.04 (2026-03-21)
+control_plane_instance_type    = "c6a.large"              # 2 vCPU, 4 GB — adequate for dev
+control_plane_min_size         = 1
+control_plane_desired_capacity = 1   # Single node for dev (saves ~$44/month)
+control_plane_max_size         = 3
+
+# Nomad/Consul bootstrap — single-node for dev
+nomad_server_count  = 1
+consul_server_count = 1
+
+# -----------------------------------------------------------------------------
+# Workers (Firecracker sandbox hosts)
+# -----------------------------------------------------------------------------
+worker_ami_id              = "ami-04eaa218f1349d88b"  # Ubuntu 24.04 (2026-03-21)
+worker_instance_type       = "c8i.2xlarge"            # 8 vCPU, 16 GB — ~50 concurrent sandboxes
+worker_enable_nested_virt  = true                     # Required for Firecracker KVM on virtual instances
+worker_min_size            = 0                        # Scale-to-zero when idle
+worker_desired_capacity    = 0                        # Start at zero, scale up on demand
+worker_max_size            = 3
+worker_root_volume_size    = 200                      # GB — templates, snapshots, Firecracker images
+
+# -----------------------------------------------------------------------------
+# Storage
+# -----------------------------------------------------------------------------
+root_volume_size          = 50   # GB for control plane
+enable_bucket_versioning  = true
+
+# -----------------------------------------------------------------------------
+# Data Layer
+# -----------------------------------------------------------------------------
+create_rds             = true
+rds_instance_class     = "db.t4g.micro"   # Smallest for dev ($12/month)
+rds_allocated_storage  = 20
+rds_multi_az           = false
+rds_performance_insights = false          # Save cost in dev
+
+create_elasticache     = true
+redis_node_type        = "cache.t4g.micro"  # Smallest for dev ($12/month)
+redis_num_cache_clusters = 1                # Single node, no replication in dev
+redis_transit_encryption = true
+redis_auth_enabled       = true
+
+# -----------------------------------------------------------------------------
+# Secrets (will be set post-deploy via AWS console/CLI)
+# -----------------------------------------------------------------------------
+create_secrets = true
+
+# -----------------------------------------------------------------------------
+# Tags
+# -----------------------------------------------------------------------------
+tags = {
+  Project     = "superintelligent-e2b"
+  Environment = "dev"
+  ManagedBy   = "terraform"
+}

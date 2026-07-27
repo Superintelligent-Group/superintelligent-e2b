@@ -8,6 +8,24 @@
 .last_used_env
 .tfplan.*
 *.tfvars
+
+# --- SIG: deployment config is TRACKED, credentials are NOT -------------------
+# Upstream ignores every .env and .tfvars because upstream's may carry secrets.
+# Ours do not: they hold CIDRs, bucket names, AMI ids, instance types, cluster
+# sizes and a public ACM ARN — nothing credential-bearing. Ignoring them made
+# the entire CommonQuant deployment config exist on exactly one laptop, with no
+# history, no review and no recovery path. That is a worse failure than the one
+# the blanket ignore was guarding against.
+#
+# The invariant, enforced by scripts/config-preflight.sh (run it in CI and
+# before apply): credentials live in AWS Secrets Manager and are referenced by
+# id from these files, never inlined. The preflight fails closed if a
+# secret-shaped value appears in anything tracked here.
+#
+# Named per account so which cloud a file describes is never ambiguous.
+!.env.dev
+!iac/provider-aws/dev.cq.tfvars
+!iac/provider-aws/dev.sig.tfvars.reference
 terraform.tfstate
 terraform.tfstate.backup
 **/.tfplan.*
