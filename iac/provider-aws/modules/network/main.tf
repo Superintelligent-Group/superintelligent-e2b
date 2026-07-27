@@ -127,6 +127,49 @@ module "vpc_endpoints" {
       tags = {
         Name = "${var.prefix}ec2-vpc-endpoint"
       }
+    },
+
+    # SUP-644: ECS/Nomad task image pulls and log shipping were still routing
+    # through NAT — the same class of leak as the vpc-dev S3 gap (SIG's product
+    # repo, same issue). ECR needs BOTH api and dkr; Logs covers CloudWatch Logs
+    # driver traffic.
+    ecr_api = {
+      service      = "ecr.api"
+      service_type = "Interface"
+      subnet_ids = [
+        local.default_private_subnet_ids[0],
+        local.default_private_subnet_ids[1],
+        local.default_private_subnet_ids[2],
+      ],
+      tags = {
+        Name = "${var.prefix}ecr-api-vpc-endpoint"
+      }
+    },
+
+    ecr_dkr = {
+      service      = "ecr.dkr"
+      service_type = "Interface"
+      subnet_ids = [
+        local.default_private_subnet_ids[0],
+        local.default_private_subnet_ids[1],
+        local.default_private_subnet_ids[2],
+      ],
+      tags = {
+        Name = "${var.prefix}ecr-dkr-vpc-endpoint"
+      }
+    },
+
+    logs = {
+      service      = "logs"
+      service_type = "Interface"
+      subnet_ids = [
+        local.default_private_subnet_ids[0],
+        local.default_private_subnet_ids[1],
+        local.default_private_subnet_ids[2],
+      ],
+      tags = {
+        Name = "${var.prefix}logs-vpc-endpoint"
+      }
     }
   }
 }
