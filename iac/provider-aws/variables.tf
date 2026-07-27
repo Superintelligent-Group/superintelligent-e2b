@@ -180,8 +180,13 @@ variable "client_cluster_size" {
 }
 
 variable "client_server_machine_type" {
-  type    = string
-  default = "m8i.4xlarge"
+  type = string
+  # 7th-gen Intel, not 8th. Nested virt (Firecracker/KVM without bare metal) is
+  # supported on C7i/M7i/R7i as well as C8i/M8i/R8i; measured us-east-1
+  # 2026-07-27, no 8i type sits on the on-demand cost/capability Pareto frontier.
+  # m7i.2xlarge is $0.4032/h vs m8i.4xlarge's $0.8467/h. Raise deliberately if a
+  # deployment genuinely needs 16 vCPU per client node rather than inheriting it.
+  default = "m7i.2xlarge"
 }
 
 variable "client_server_nested_virtualization" {
@@ -237,8 +242,11 @@ variable "build_cluster_size" {
 }
 
 variable "build_server_machine_type" {
-  type    = string
-  default = "m8i.2xlarge"
+  type = string
+  # Same generation correction as client_server_machine_type: identical 8 vCPU /
+  # 32 GiB shape, $0.4032/h vs $0.4234/h, and on the Pareto frontier rather than
+  # dominated by it.
+  default = "m7i.2xlarge"
 }
 
 variable "build_server_nested_virtualization" {

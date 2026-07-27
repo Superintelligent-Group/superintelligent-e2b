@@ -17,9 +17,22 @@ module "auto_scaling" {
 
   idle_timeout_minutes = 30
 
-  # Client nodes need nested virtualization for Firecracker — only c8i/m8i families support it
-  client_spot_instance_types = ["c8i.2xlarge", "m8i.2xlarge", "c8i-flex.2xlarge", "m8i-flex.2xlarge"]
-  api_spot_instance_types    = ["t3.large", "t3a.large", "m6i.large"]
+  # Client nodes need nested virtualization for Firecracker. That is supported on
+  # Intel 7th AND 8th gen — C7i/M7i/R7i and C8i/M8i/R8i, plus flex variants — not
+  # only c8i/m8i as this previously claimed. Widening the list matters twice over:
+  # capacity-optimized has more pools to choose from (fewer interruptions), and
+  # every 7i type is cheaper than its 8i counterpart at the same shape.
+  #
+  # r7i leads because sandbox hosts are memory-bound — each Firecracker microVM
+  # reserves RAM — and r7i.2xlarge buys 64 GiB for ~the same spot price as
+  # m8i.2xlarge's 32 GiB ($0.1875 vs $0.1854, us-east-1 2026-07-27). Ordered
+  # best-value first; capacity-optimized still picks on availability, not order.
+  client_spot_instance_types = [
+    "r7i.2xlarge", "m7i.2xlarge", "m7i-flex.2xlarge",
+    "c7i.2xlarge", "c7i-flex.2xlarge",
+    "m8i.2xlarge", "c8i.2xlarge",
+  ]
+  api_spot_instance_types = ["t3.large", "t3a.large", "m6i.large", "m7i-flex.large"]
 
   # Nomad/Consul tokens for job re-evaluation after scale-up
   nomad_addr             = "https://nomad.${var.domain_name}"
