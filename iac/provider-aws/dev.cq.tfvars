@@ -5,8 +5,16 @@
 # E2B Self-Hosted — Dev Environment Configuration
 # =============================================================================
 
-aws_region  = "us-east-1"
-prefix      = "e2b"
+aws_region = "us-east-1"
+# SUP-676: was "e2b" (no trailing dash) -- didn't match what's actually
+# deployed ("e2b-vpc", "e2b-api-node", etc). Confirmed via a full targeted
+# plan: with the dash restored, live infra matches config exactly (no
+# phantom replacements of IAM roles/security groups/ALB target groups/the
+# cluster secret). Drift predates this repo's git history (both this file's
+# first commit and dev.sig.tfvars.reference already lacked the dash) --
+# whatever created the live resources used a different value that was never
+# reconciled back into tracked config.
+prefix      = "e2b-"
 environment = "dev"
 
 # -----------------------------------------------------------------------------
