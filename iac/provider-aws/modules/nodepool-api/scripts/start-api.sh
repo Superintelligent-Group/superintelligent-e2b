@@ -21,6 +21,7 @@ export GOMAXPROCS=$(nproc)
 POSTGRES_EBS_VOLUME_ID="${POSTGRES_EBS_VOLUME_ID}"
 POSTGRES_MOUNT_POINT="/opt/e2b-postgres-data"
 EBS_DEVICE="/dev/xvdf"
+EBS_ATTACHED=false
 
 if [ -n "$POSTGRES_EBS_VOLUME_ID" ]; then
     echo "Attaching EBS volume $POSTGRES_EBS_VOLUME_ID..."
@@ -30,7 +31,9 @@ if [ -n "$POSTGRES_EBS_VOLUME_ID" ]; then
     INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
     AWS_REGION=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
 
-    # Wait for volume to be available (may still be attached to a terminated instance)
+    # Wait for volume to be available (may still be attached/detaching from a
+    # just-terminated instance -- AWS's own detach can lag well past the
+    # terminate call, especially under frequent scale-to-zero churn).
     for i in $(seq 1 30); do
         VOL_STATE=$(aws ec2 describe-volumes --volume-ids "$POSTGRES_EBS_VOLUME_ID" \
             --region "$AWS_REGION" --query 'Volumes[0].State' --output text 2>/dev/null || echo "unknown")
@@ -48,41 +51,60 @@ if [ -n "$POSTGRES_EBS_VOLUME_ID" ]; then
         sleep 5
     done
 
-    # Attach the volume
-    aws ec2 attach-volume \
-        --volume-id "$POSTGRES_EBS_VOLUME_ID" \
-        --instance-id "$INSTANCE_ID" \
-        --device "$EBS_DEVICE" \
-        --region "$AWS_REGION" 2>&1 || echo "WARN: attach-volume failed (may already be attached)"
-
-    # Wait for the device to appear
-    for i in $(seq 1 30); do
-        if [ -b "$EBS_DEVICE" ] || [ -b "/dev/nvme1n1" ]; then
-            break
-        fi
-        echo "Waiting for block device... attempt $i/30"
-        sleep 2
+    # Attach the volume, retrying: a single one-shot attempt right after the
+    # state-wait loop above races AWS's own detach-completion bookkeeping --
+    # the volume can report "available" and still reject an immediate attach
+    # (VolumeInUse/IncorrectState) for a few more seconds.
+    for i in $(seq 1 12); do
+        ATTACH_ERR=$(aws ec2 attach-volume \
+            --volume-id "$POSTGRES_EBS_VOLUME_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --device "$EBS_DEVICE" \
+            --region "$AWS_REGION" 2>&1) && { EBS_ATTACHED=true; break; }
+        echo "attach-volume attempt $i/12 failed, retrying: $ATTACH_ERR"
+        sleep 5
     done
 
-    # On Nitro instances, /dev/xvdf may appear as /dev/nvme1n1
-    ACTUAL_DEVICE="$EBS_DEVICE"
-    if [ -b "/dev/nvme1n1" ] && [ ! -b "$EBS_DEVICE" ]; then
-        ACTUAL_DEVICE="/dev/nvme1n1"
+    if [ "$EBS_ATTACHED" = true ]; then
+        # Wait for the device to appear
+        for i in $(seq 1 30); do
+            if [ -b "$EBS_DEVICE" ] || [ -b "/dev/nvme1n1" ]; then
+                break
+            fi
+            echo "Waiting for block device... attempt $i/30"
+            sleep 2
+        done
+
+        # On Nitro instances, /dev/xvdf may appear as /dev/nvme1n1
+        ACTUAL_DEVICE="$EBS_DEVICE"
+        if [ -b "/dev/nvme1n1" ] && [ ! -b "$EBS_DEVICE" ]; then
+            ACTUAL_DEVICE="/dev/nvme1n1"
+        fi
     fi
 
-    # Format if no filesystem exists
-    if ! blkid "$ACTUAL_DEVICE" >/dev/null 2>&1; then
-        echo "Formatting $ACTUAL_DEVICE with ext4..."
-        mkfs.ext4 -L e2b-pgdata "$ACTUAL_DEVICE"
+    # Only format/mount if the device really showed up. Falling through to
+    # mkfs on a device that never appeared used to hard-crash this script
+    # under `set -e` -- which killed Nomad client startup below along with
+    # it, taking the whole node pool down for what should be a soft,
+    # ephemeral-storage-for-this-boot degradation, not a missing node.
+    if [ "$EBS_ATTACHED" = true ] && [ -b "$ACTUAL_DEVICE" ]; then
+        # Format if no filesystem exists
+        if ! blkid "$ACTUAL_DEVICE" >/dev/null 2>&1; then
+            echo "Formatting $ACTUAL_DEVICE with ext4..."
+            mkfs.ext4 -L e2b-pgdata "$ACTUAL_DEVICE"
+        fi
+
+        # Mount
+        mkdir -p "$POSTGRES_MOUNT_POINT"
+        mount "$ACTUAL_DEVICE" "$POSTGRES_MOUNT_POINT"
+        echo "Mounted $ACTUAL_DEVICE at $POSTGRES_MOUNT_POINT"
+
+        # Ensure postgres user (UID 70 in alpine) can write
+        chown -R 70:70 "$POSTGRES_MOUNT_POINT" 2>/dev/null || true
+    else
+        echo "WARN: EBS volume never attached/appeared as a block device -- falling back to ephemeral storage for this boot"
+        mkdir -p "$POSTGRES_MOUNT_POINT"
     fi
-
-    # Mount
-    mkdir -p "$POSTGRES_MOUNT_POINT"
-    mount "$ACTUAL_DEVICE" "$POSTGRES_MOUNT_POINT"
-    echo "Mounted $ACTUAL_DEVICE at $POSTGRES_MOUNT_POINT"
-
-    # Ensure postgres user (UID 70 in alpine) can write
-    chown -R 70:70 "$POSTGRES_MOUNT_POINT" 2>/dev/null || true
 else
     echo "No POSTGRES_EBS_VOLUME_ID configured, using ephemeral storage"
     mkdir -p "$POSTGRES_MOUNT_POINT"
