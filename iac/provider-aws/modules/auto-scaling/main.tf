@@ -23,8 +23,8 @@ resource "aws_iam_role" "scaler" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "lambda.amazonaws.com" }
     }]
   })
@@ -116,7 +116,7 @@ resource "aws_lambda_function" "wake" {
   handler          = "cluster_scaler.wake_handler"
   runtime          = "python3.12"
   role             = aws_iam_role.scaler.arn
-  timeout          = 600  # 10 min — includes waiting for instances to boot
+  timeout          = 600 # 10 min — includes waiting for instances to boot
   memory_size      = 128
 
   environment {
@@ -147,7 +147,7 @@ resource "aws_lambda_function" "shutdown" {
 
 resource "aws_lambda_function_url" "wake" {
   function_name      = aws_lambda_function.wake.function_name
-  authorization_type = "NONE"  # Swarm worker calls this — secured by obscurity + idempotency
+  authorization_type = "NONE" # Swarm worker calls this — secured by obscurity + idempotency
 }
 
 # --- EventBridge: Periodic Shutdown Check ---
