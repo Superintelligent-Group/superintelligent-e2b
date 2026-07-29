@@ -246,6 +246,22 @@ module "cluster" {
   vpc_private_subnets = module.init.vpc_private_subnet_ids
   vpc_public_subnets  = module.init.vpc_public_subnet_ids
 
+  # SUP-676: hardcoded rather than module.init.vpc_peering_subnet_ids -- a
+  # reference into module.init pulls its ENTIRE resource set into any
+  # -target plan (Terraform doesn't do fine-grained per-output dependency
+  # tracking across a module boundary), which on this stack's current state
+  # sweeps in a large, unrelated, pre-existing prefix-tag drift (dev.cq.tfvars's
+  # `prefix` lost its trailing "-" at some point after the original apply)
+  # that forces replacement of the cluster security groups, IAM roles, ALB
+  # target groups, and the Nomad secrets -- not something to trigger as a
+  # side effect of a subnet rewire. These are the 3 subnets created by
+  # module.init.module.network.aws_subnet.peering (us-east-1a/b/c).
+  vpc_peering_subnet_ids = [
+    "subnet-0d29881f5d97af604", # us-east-1a
+    "subnet-0d8f9d41b533e67dd", # us-east-1b
+    "subnet-09daef3751e6c01ab", # us-east-1c
+  ]
+
   custom_environments_repository_name = module.init.custom_environments_repository_name
 
   setup_bucket_name                 = module.init.setup_bucket_name

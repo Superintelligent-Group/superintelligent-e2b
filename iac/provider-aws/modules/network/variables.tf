@@ -39,3 +39,26 @@ variable "use_instance_connect" {
   default     = true
   description = "Whether to deploy AWS EC2 Instance Connect Endpoint for SSH access to EC2 instances"
 }
+
+# SUP-676: the product's own app stack (RDS/Redis) lives in a separate VPC
+# ("vpc-dev") that happens to share this VPC's exact primary CIDR
+# (10.0.0.0/16) -- AWS refuses to peer VPCs whose CIDRs fully overlap. AWS
+# does allow peering when at least one pair of the two VPCs' associated CIDR
+# blocks is non-overlapping, so we associate a second, disjoint block here
+# and carve the node pools' cross-VPC-reachable subnets from it. The
+# existing 10.0.0.0/16 subnets/route table are untouched.
+variable "vpc_peering_cidr" {
+  type        = string
+  default     = "10.1.0.0/16"
+  description = "Secondary CIDR block associated with this VPC solely to enable peering with vpc-dev (whose primary CIDR overlaps this VPC's primary CIDR)"
+}
+
+variable "vpc_peering_subnets" {
+  type = map(string)
+  default = {
+    "us-east-1a" = "10.1.11.0/24"
+    "us-east-1b" = "10.1.12.0/24"
+    "us-east-1c" = "10.1.13.0/24"
+  }
+  description = "AZ -> CIDR for the peering-only subnets carved from vpc_peering_cidr"
+}

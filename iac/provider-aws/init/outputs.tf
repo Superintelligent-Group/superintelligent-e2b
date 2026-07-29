@@ -93,3 +93,11 @@ output "vpc_elasticache_subnet_group_name" {
 output "vpc_instance_connect_security_group_id" {
   value = module.network.instance_connect_security_group_id
 }
+
+output "vpc_peering_subnet_ids" {
+  value = module.network.vpc_peering_subnet_ids
+}
+
+output "vpc_peering_route_table_id" {
+  value = module.network.vpc_peering_route_table_id
+}

@@ -14,6 +14,11 @@ variable "vpc_private_subnets" {
   type = list(string)
 }
 
+variable "vpc_peering_subnet_ids" {
+  type        = list(string)
+  description = "SUP-676: peering-only subnets (secondary CIDR) for the node pools that need to reach RDS/Redis in vpc-dev -- api, build, client. Not used by control_server/clickhouse, which don't need that reachability."
+}
+
 variable "vpc_public_subnets" {
   type = list(string)
 }
