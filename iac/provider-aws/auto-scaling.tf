@@ -17,11 +17,10 @@ module "auto_scaling" {
 
   idle_timeout_minutes = 30
 
-  # Client nodes need nested virtualization for Firecracker. That is supported on
-  # Intel 7th AND 8th gen — C7i/M7i/R7i and C8i/M8i/R8i, plus flex variants — not
-  # only c8i/m8i as this previously claimed. Widening the list matters twice over:
-  # capacity-optimized has more pools to choose from (fewer interruptions), and
-  # every 7i type is cheaper than its 8i counterpart at the same shape.
+  # Client nodes need nested virtualization for Firecracker. Keep the scale-up
+  # fleet on approved non-metal Intel 7th-gen 2xlarge shapes: they support nested
+  # virtualization, cost less than the same-size 8th-gen alternatives, and avoid
+  # the extreme hourly cost of bare-metal instances.
   #
   # r7i leads because sandbox hosts are memory-bound — each Firecracker microVM
   # reserves RAM — and r7i.2xlarge buys 64 GiB for ~the same spot price as
@@ -30,7 +29,6 @@ module "auto_scaling" {
   client_spot_instance_types = [
     "r7i.2xlarge", "m7i.2xlarge", "m7i-flex.2xlarge",
     "c7i.2xlarge", "c7i-flex.2xlarge",
-    "m8i.2xlarge", "c8i.2xlarge",
   ]
   api_spot_instance_types = ["t3.large", "t3a.large", "m6i.large", "m7i-flex.large"]
 

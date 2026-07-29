@@ -30,8 +30,22 @@ variable "idle_timeout_minutes" {
 
 variable "client_spot_instance_types" {
   type        = list(string)
-  default     = ["c8i.2xlarge", "m8i.2xlarge", "c8i-flex.2xlarge", "m8i-flex.2xlarge"]
-  description = "Instance types for spot fleet (client/build). Multiple types improve spot availability."
+  default     = ["r7i.2xlarge", "m7i.2xlarge", "m7i-flex.2xlarge", "c7i.2xlarge", "c7i-flex.2xlarge"]
+  description = "Approved non-metal Intel 7th-gen 2xlarge instance types for the client spot fleet."
+
+  validation {
+    condition = alltrue([
+      for instance_type in var.client_spot_instance_types :
+      contains([
+        "r7i.2xlarge",
+        "m7i.2xlarge",
+        "m7i-flex.2xlarge",
+        "c7i.2xlarge",
+        "c7i-flex.2xlarge",
+      ], instance_type)
+    ])
+    error_message = "Client spot types must be approved non-metal Intel 7th-gen 2xlarge instances (C7i, M7i, R7i, or supported flex variants)."
+  }
 }
 
 variable "api_spot_instance_types" {
