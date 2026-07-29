@@ -56,8 +56,24 @@ job "orchestrator-${latest_orchestrator_job_id}" {
     task "start" {
       driver = "raw_exec"
 
+      // SUP-676: was attempts=0 (no retries at all) -- unlike every sibling
+      // service job (api, redis, client-proxy), which all tolerate a few
+      // transient restarts. Confirmed live: on a cold cluster wake, this
+      // orchestrator dials Redis (a dependency on a different node pool)
+      // within ~1s of process start, sometimes before redis's own
+      // allocation has finished binding its port -- a real but transient
+      // race, not a persistent failure. With zero retries, that one bad
+      // roll of the dice permanently fails the allocation until someone
+      // manually forces a new Nomad evaluation. Matches client-proxy's
+      // bounded pattern (a few tries, then give up loudly) rather than
+      // api/redis's "retry forever" -- this manages live Firecracker VMs,
+      // so silently flapping forever on a REAL persistent failure is worse
+      // than surfacing it after a bounded number of tries.
       restart {
-        attempts = 0
+        attempts = 3
+        interval = "5m"
+        delay    = "15s"
+        mode     = "fail"
       }
 
       resources {
