@@ -64,6 +64,11 @@ variable "nomad_acl_token" {
   type = string
 }
 
+variable "nomad_acl_token_secret_arn" {
+  description = "ARN of the Secrets Manager secret holding the Nomad ACL token, for scoped instance-role read access (diagnostics only, not the token value itself)."
+  type        = string
+}
+
 variable "consul_acl_token" {
   type = string
 }

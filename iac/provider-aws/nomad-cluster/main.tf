@@ -219,6 +219,7 @@ module "control_server" {
   machine_type        = var.control_server_machine_type
 
   nomad_acl_token              = var.nomad_acl_token_secret
+  nomad_acl_token_secret_arn   = var.nomad_acl_token_secret_arn
   consul_acl_token             = var.consul_acl_token_secret
   consul_gossip_encryption_key = var.consul_gossip_encryption_key
 

@@ -50,6 +50,26 @@ resource "aws_iam_instance_profile" "control_server" {
   role = aws_iam_role.control_server.name
 }
 
+# SUP-638 diagnostics: the control server needs to read its own already-known
+# Nomad ACL token to run `nomad job status`/`nomad alloc logs` for real
+# troubleshooting. Scoped to this one secret ARN only — not a general
+# Secrets Manager grant.
+resource "aws_iam_role_policy" "control_server_nomad_token_read" {
+  name = "${var.prefix}control-server-nomad-token-read"
+  role = aws_iam_role.control_server.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.nomad_acl_token_secret_arn
+      }
+    ]
+  })
+}
+
 resource "aws_launch_template" "control_server" {
   name          = "${var.prefix}control-server-node"
   image_id      = data.aws_ami.control_server.id
