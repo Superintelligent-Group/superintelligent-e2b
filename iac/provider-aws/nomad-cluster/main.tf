@@ -242,7 +242,7 @@ module "api" {
 
   security_group_ids  = var.api_security_group_ids
   target_group_arns   = var.api_target_group_arns
-  vpc_private_subnets = var.vpc_peering_subnet_ids
+  vpc_private_subnets = var.vpc_private_subnets
 
   image_family_prefix = var.api_image_family_prefix
   cluster_size        = var.api_cluster_size
@@ -309,7 +309,7 @@ module "build" {
   setup_files_hash  = local.setup_files_hash
 
   security_group_ids  = var.build_security_group_ids
-  vpc_private_subnets = var.vpc_peering_subnet_ids
+  vpc_private_subnets = var.vpc_private_subnets
 
   image_family_prefix = var.build_image_family_prefix
   cluster_size        = var.build_cluster_size
@@ -354,7 +354,7 @@ module "client" {
   setup_files_hash  = local.setup_files_hash
 
   security_group_ids  = var.client_security_group_ids
-  vpc_private_subnets = var.vpc_peering_subnet_ids
+  vpc_private_subnets = var.vpc_private_subnets
 
   image_family_prefix = var.client_image_family_prefix
   cluster_size        = var.client_cluster_size

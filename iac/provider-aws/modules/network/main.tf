@@ -174,65 +174,6 @@ module "vpc_endpoints" {
   }
 }
 
-# The stable, already-created VPC (module.vpc's own aws_vpc.this) -- looked
-# up by id rather than referenced as module.vpc.vpc_id so that these new
-# resources don't pull module.vpc's entire resource set into any `-target`
-# plan/apply of this peering setup. (This VPC's config vs. state has an
-# unrelated, pre-existing tag-prefix drift -- dev.cq.tfvars's prefix lost
-# its trailing "-" at some point after the original apply -- that must not
-# get swept into this change.)
-data "aws_vpc" "self" {
-  id = "vpc-0b787fd9230a01e00"
-}
-
-data "aws_nat_gateway" "self" {
-  vpc_id = data.aws_vpc.self.id
-  state  = "available"
-}
-
-resource "aws_vpc_ipv4_cidr_block_association" "peering" {
-  vpc_id     = data.aws_vpc.self.id
-  cidr_block = var.vpc_peering_cidr
-}
-
-resource "aws_subnet" "peering" {
-  for_each = var.vpc_peering_subnets
-
-  vpc_id            = data.aws_vpc.self.id
-  cidr_block        = each.value
-  availability_zone = each.key
-
-  depends_on = [aws_vpc_ipv4_cidr_block_association.peering]
-
-  tags = {
-    Name = "${var.prefix}vpc-peering-${each.key}"
-  }
-}
-
-# Dedicated route table (not the shared private one, which already has a
-# "local" route claiming all of 10.0.0.0/16 -- adding a route for vpc-dev's
-# 10.0.0.0/16 there would collide with it). NAT egress is preserved so
-# these subnets keep general internet access (image pulls, package installs).
-resource "aws_route_table" "peering" {
-  vpc_id = data.aws_vpc.self.id
-
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = data.aws_nat_gateway.self.id
-  }
-
-  tags = {
-    Name = "${var.prefix}vpc-peering-rt"
-  }
-}
-
-resource "aws_route_table_association" "peering" {
-  for_each = aws_subnet.peering
-
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.peering.id
-}
-
 resource "aws_ec2_instance_connect_endpoint" "connect" {
   // Deploy only if enabled
   count = var.use_instance_connect ? 1 : 0

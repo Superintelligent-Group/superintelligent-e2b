@@ -157,12 +157,13 @@ resource "aws_secretsmanager_secret" "postgres_connection_string" {
 }
 
 resource "aws_secretsmanager_secret_version" "postgres_connection_string" {
-  secret_id     = aws_secretsmanager_secret.postgres_connection_string.id
-  secret_string = " "
+  secret_id = aws_secretsmanager_secret.postgres_connection_string.id
 
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
+  # SUP-676: computed directly from the RDS instance in rds.tf (both in this
+  # same module), rather than the previous manual-population placeholder --
+  # real value on the very first apply, no ignore_changes needed since it's
+  # now fully derived from other managed resources.
+  secret_string = var.create_rds ? "postgres://${aws_db_instance.postgres[0].username}:${random_password.postgres_master[0].result}@${aws_db_instance.postgres[0].address}:${aws_db_instance.postgres[0].port}/${aws_db_instance.postgres[0].db_name}?sslmode=require" : " "
 }
 
 data "aws_secretsmanager_secret_version" "postgres_connection_string" {

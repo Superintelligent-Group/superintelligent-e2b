@@ -24,6 +24,34 @@ variable "redis_managed" {
   default = false
 }
 
+# SUP-676: e2b's own dedicated Postgres, self-contained in e2b-vpc -- see
+# init/rds.tf. dev.cq.tfvars already declared these with real values,
+# previously wired to nothing.
+variable "create_rds" {
+  type    = bool
+  default = false
+}
+
+variable "rds_instance_class" {
+  type    = string
+  default = "db.t4g.micro"
+}
+
+variable "rds_allocated_storage" {
+  type    = number
+  default = 20
+}
+
+variable "rds_multi_az" {
+  type    = bool
+  default = false
+}
+
+variable "rds_performance_insights" {
+  type    = bool
+  default = false
+}
+
 variable "redis_instance_type" {
   type    = string
   default = "cache.t2.small"
