@@ -67,6 +67,15 @@ variable "api_cluster_size" {
   default = 1
 }
 
+# SUP-676: the api job's own Nomad instance count, independent of
+# api_cluster_size (node-pool/ASG capacity) -- matches the existing
+# ingress_count/client_proxy_count pattern. See nomad/variables.tf for why
+# this needs to be separate.
+variable "api_count" {
+  type    = number
+  default = 1
+}
+
 variable "api_internal_grpc_port" {
   type    = number
   default = 5009

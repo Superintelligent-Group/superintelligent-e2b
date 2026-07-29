@@ -35,9 +35,21 @@ variable "clickhouse_jobs_prefix" {
   type = string
 }
 
-# Cluster sizes
+# Cluster sizes -- api_cluster_size tracks node-pool capacity (used for
+# update_stanza/prevent_colocation decisions: is there enough spare capacity
+# to roll a canary or spread jobs across hosts). It is NOT the api job's own
+# instance count -- see api_count below, matching the independent
+# ingress_count/client_proxy_count pattern (a job with its own node-pool
+# capacity var and instance count coupled together sits permanently "dead"
+# whenever that pool is scaled to zero for cost savings, since scaling the
+# ASG back up doesn't retroactively bump a Terraform-managed job count).
 variable "api_cluster_size" {
   type = number
+}
+
+variable "api_count" {
+  type    = number
+  default = 1
 }
 
 # Ingress

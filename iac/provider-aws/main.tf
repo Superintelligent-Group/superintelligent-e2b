@@ -321,6 +321,7 @@ module "nomad" {
   clickhouse_jobs_prefix = local.clickhouse_jobs_prefix
 
   api_cluster_size            = var.api_cluster_size
+  api_count                   = var.api_count
   api_internal_grpc_port      = var.api_internal_grpc_port
   api_env_vars                = local.api_env_vars
   api_db_migrator_env_vars    = local.api_db_migrator_env_vars

@@ -112,7 +112,7 @@ module "api" {
   update_stanza      = var.api_cluster_size > 1
   node_pool          = var.api_node_pool
   prevent_colocation = var.api_cluster_size > 2
-  count_instances    = var.api_cluster_size
+  count_instances    = var.api_count
 
   memory_mb = var.api_memory_mb
   cpu_count = var.api_cpu_count
