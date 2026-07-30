@@ -39,6 +39,25 @@ fail() {
   exit 1
 }
 
+if make --no-print-directory -C "${provider_dir}" aws-account-guard \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=foo \
+  AWS_PROFILE=attacker \
+  AWS_ACCOUNT_ID=000000000000 \
+  AWS_ACCOUNT_ID_foo=000000000000 \
+  AWS_REGION=us-east-1 \
+  AWS_REGION_foo=us-east-1 \
+  TERRAFORM_STATE_BUCKET=attacker-state \
+  TF_STATE_BUCKET_foo=attacker-state \
+  TF_VAR_FILE=./dev.cq.tfvars \
+  TF=terraform \
+  >"${fixture_dir}/unsupported-target.log" 2>&1; then
+  fail 'caller-defined account target namespace was accepted'
+fi
+grep -q 'Unsupported SIG_AWS_ACCOUNT_TARGET: foo (expected cq or sig)' \
+  "${fixture_dir}/unsupported-target.log" ||
+  fail 'unsupported account target rejection was not explicit'
+
 if make "${common_args[@]}" aws-account-guard TF_VAR_FILE=/tmp/unreviewed.tfvars >"${fixture_dir}/var-file.log" 2>&1; then
   fail 'caller-controlled TF_VAR_FILE was accepted for CQ'
 fi

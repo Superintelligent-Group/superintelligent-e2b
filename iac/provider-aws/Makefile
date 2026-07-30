@@ -92,6 +92,10 @@ aws-account-guard:
 		printf "SIG_AWS_ACCOUNT_TARGET is required (cq or sig).\n" >&2; \
 		exit 1; \
 	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" != "cq" ] && [ "$(SIG_AWS_ACCOUNT_TARGET)" != "sig" ]; then \
+		printf "Unsupported SIG_AWS_ACCOUNT_TARGET: %s (expected cq or sig).\n" "$(SIG_AWS_ACCOUNT_TARGET)" >&2; \
+		exit 1; \
+	fi
 	@if [ -z "$(EXPECTED_AWS_ACCOUNT_ID)" ]; then \
 		printf "Unsupported SIG_AWS_ACCOUNT_TARGET: %s (expected cq or sig).\n" "$(SIG_AWS_ACCOUNT_TARGET)" >&2; \
 		exit 1; \
