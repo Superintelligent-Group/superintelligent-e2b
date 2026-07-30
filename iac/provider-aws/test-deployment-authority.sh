@@ -217,6 +217,43 @@ fi
 grep -q 'ECR destination is required for target cq' "${fixture_dir}/missing-ecr.log" ||
   fail 'empty ECR destination rejection was not explicit'
 
+# The destination must be one complete repository reference. Matching one word
+# cannot authorize additional Docker flags or a second cross-account tag.
+if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+  PROVIDER=aws \
+  "IMAGE_REGISTRY=014155356804.dkr.ecr.us-east-1.amazonaws.com/core/client-proxy --tag 319933937176.dkr.ecr.us-east-1.amazonaws.com/attacker" \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/multiple-ecr.log" 2>&1; then
+  fail 'multiple ECR destination words bypassed AWS account authority'
+fi
+grep -q 'ECR destination must be exactly one registry reference for target cq' \
+  "${fixture_dir}/multiple-ecr.log" ||
+  fail 'multiple ECR destination rejection was not explicit'
+
+injection_marker="${fixture_dir}/destination-injection-ran"
+if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+  PROVIDER=aws \
+  "IMAGE_REGISTRY=014155356804.dkr.ecr.us-east-1.amazonaws.com/core/client-proxy;touch${injection_marker}" \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/malformed-ecr.log" 2>&1; then
+  fail 'malformed ECR destination bypassed AWS account authority'
+fi
+grep -q 'destination is not a valid untagged ECR repository for target cq' \
+  "${fixture_dir}/malformed-ecr.log" ||
+  fail 'malformed ECR destination rejection was not explicit'
+[[ ! -e "${injection_marker}" ]] ||
+  fail 'ECR destination text was executed as shell source'
+
 # S3 writers bind the exact recipe prefix. A caller cannot replace either the
 # source variable or the claimed guard variable with the other account.
 if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
