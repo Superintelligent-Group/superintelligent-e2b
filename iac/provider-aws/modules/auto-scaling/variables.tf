@@ -34,7 +34,7 @@ variable "client_spot_instance_types" {
   description = "Approved non-metal Intel 7th-gen 2xlarge instance types for the client spot fleet."
 
   validation {
-    condition = alltrue([
+    condition = length(var.client_spot_instance_types) > 0 && alltrue([
       for instance_type in var.client_spot_instance_types :
       contains([
         "r7i.2xlarge",
@@ -44,7 +44,7 @@ variable "client_spot_instance_types" {
         "c7i-flex.2xlarge",
       ], instance_type)
     ])
-    error_message = "Client spot types must be approved non-metal Intel 7th-gen 2xlarge instances (C7i, M7i, R7i, or supported flex variants)."
+    error_message = "Client spot types must contain at least one approved non-metal Intel 7th-gen 2xlarge instance (C7i, M7i, R7i, or supported flex variants)."
   }
 }
 
