@@ -58,6 +58,18 @@ grep -q 'Unsupported SIG_AWS_ACCOUNT_TARGET: foo (expected cq or sig)' \
   "${fixture_dir}/unsupported-target.log" ||
   fail 'unsupported account target rejection was not explicit'
 
+if make "${common_args[@]}" aws-account-guard \
+  ENV=staging \
+  CANONICAL_CQ_ENV=staging \
+  CANONICAL_CQ_TF_VAR_FILE=./staging.cq.tfvars \
+  TF_VAR_FILE=./staging.cq.tfvars \
+  >"${fixture_dir}/cq-environment.log" 2>&1; then
+  fail 'caller-selected CQ environment and unreviewed tfvars were accepted'
+fi
+grep -q 'CQ target is bound to the reviewed dev environment; got ENV=staging' \
+  "${fixture_dir}/cq-environment.log" ||
+  fail 'CQ environment authority rejection was not explicit'
+
 if make "${common_args[@]}" aws-account-guard TF_VAR_FILE=/tmp/unreviewed.tfvars >"${fixture_dir}/var-file.log" 2>&1; then
   fail 'caller-controlled TF_VAR_FILE was accepted for CQ'
 fi

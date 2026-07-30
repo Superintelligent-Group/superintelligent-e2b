@@ -19,7 +19,8 @@ override TF_STATE_BUCKET_cq := commonquant-e2b-tfstate
 override TF_STATE_BUCKET_sig := superintelligent-group-terraform-state
 override EXPECTED_AWS_REGION := $(AWS_REGION_$(SIG_AWS_ACCOUNT_TARGET))
 override EXPECTED_TF_STATE_BUCKET := $(TF_STATE_BUCKET_$(SIG_AWS_ACCOUNT_TARGET))
-override CANONICAL_CQ_TF_VAR_FILE := ./${ENV}.cq.tfvars
+override CANONICAL_CQ_ENV := dev
+override CANONICAL_CQ_TF_VAR_FILE := ./dev.cq.tfvars
 REQUESTED_TF_VAR_FILE := $(TF_VAR_FILE)
 REQUESTED_TF_PLAN_FILE := $(TF_PLAN_FILE)
 DEFAULT_SIG_TF_VAR_FILE := ./.terraform.${ENV}.tfvars
@@ -28,7 +29,7 @@ override TF_VAR_FILE := $(CANONICAL_CQ_TF_VAR_FILE)
 else
 TF_VAR_FILE ?= $(DEFAULT_SIG_TF_VAR_FILE)
 endif
-override EXPECTED_TF_PLAN_FILE := .tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET}
+override EXPECTED_TF_PLAN_FILE := $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),.tfplan.dev.cq,.tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET})
 override TF_PLAN_FILE := $(EXPECTED_TF_PLAN_FILE)
 TF_VAR_FILE_ARG := $(if $(wildcard $(TF_VAR_FILE)),-var-file=$(TF_VAR_FILE))
 TERRAFORM_STATE_BUCKET ?= $(if $(EXPECTED_TF_STATE_BUCKET),$(EXPECTED_TF_STATE_BUCKET),$(AWS_ACCOUNT_ID)-terraform-state)
@@ -114,6 +115,10 @@ aws-account-guard:
 	fi
 	@if [ -n "$(EXPECTED_TF_STATE_BUCKET)" ] && [ "$(TERRAFORM_STATE_BUCKET)" != "$(EXPECTED_TF_STATE_BUCKET)" ]; then \
 		printf "Terraform state bucket %s does not match target %s (%s).\n" "$(TERRAFORM_STATE_BUCKET)" "$(SIG_AWS_ACCOUNT_TARGET)" "$(EXPECTED_TF_STATE_BUCKET)" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ "$(ENV)" != "$(CANONICAL_CQ_ENV)" ]; then \
+		printf "CQ target is bound to the reviewed %s environment; got ENV=%s.\n" "$(CANONICAL_CQ_ENV)" "$(ENV)" >&2; \
 		exit 1; \
 	fi
 	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ -n "$(REQUESTED_TF_VAR_FILE)" ] && [ "$(REQUESTED_TF_VAR_FILE)" != "$(CANONICAL_CQ_TF_VAR_FILE)" ]; then \
