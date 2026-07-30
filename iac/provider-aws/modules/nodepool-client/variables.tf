@@ -56,7 +56,7 @@ variable "cluster_size" {
 
 variable "machine_type" {
   type    = string
-  default = "m8i.4xlarge"
+  default = "m7i.2xlarge"
 }
 
 variable "node_pool_name" {

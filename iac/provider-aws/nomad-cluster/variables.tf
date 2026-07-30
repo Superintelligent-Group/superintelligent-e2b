@@ -184,7 +184,7 @@ variable "build_cluster_size" {
 
 variable "build_machine_type" {
   type    = string
-  default = "m8i.2xlarge"
+  default = "m7i.2xlarge"
 }
 
 variable "build_server_nested_virtualization" {

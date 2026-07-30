@@ -59,17 +59,6 @@ nomad_server_count  = 1
 consul_server_count = 1
 
 # -----------------------------------------------------------------------------
-# Workers (Firecracker sandbox hosts)
-# -----------------------------------------------------------------------------
-worker_ami_id             = "ami-04eaa218f1349d88b" # Ubuntu 24.04 (2026-03-21)
-worker_instance_type      = "c8i.2xlarge"           # 8 vCPU, 16 GB — ~50 concurrent sandboxes
-worker_enable_nested_virt = true                    # Required for Firecracker KVM on virtual instances
-worker_min_size           = 0                       # Scale-to-zero when idle
-worker_desired_capacity   = 0                       # Start at zero, scale up on demand
-worker_max_size           = 3
-worker_root_volume_size   = 200 # GB — templates, snapshots, Firecracker images
-
-# -----------------------------------------------------------------------------
 # Storage
 # -----------------------------------------------------------------------------
 root_volume_size         = 50 # GB for control plane
@@ -140,11 +129,10 @@ clickhouse_cluster_size     = 0
 # risks failed builds.
 #
 # Family choice. Nested virtualization (Firecracker/KVM inside EC2, no bare
-# metal) is supported on Intel 7th AND 8th gen — C7i/M7i/R7i and C8i/M8i/R8i,
-# plus flex variants. Not Graviton. Our previous comment said "only c8i/m8i",
-# which was wrong and cost us: measured us-east-1 2026-07-27, 8i appears exactly
-# ONCE on the spot Pareto frontier and NEVER on the on-demand frontier. Every
-# other non-dominated point is 7i. We were defaulting to the dominated generation.
+# metal) is supported on the approved Intel 7th-gen C7i/M7i/R7i families and
+# flex variants. Not Graviton. Measured us-east-1 2026-07-27, 8i appeared exactly
+# once on the spot Pareto frontier and never on the on-demand frontier. Keep the
+# active fleet and every fallback on the cheaper 7i generation.
 #
 #   8 vCPU tier      on-demand   spot     GiB
 #   c7i-flex.2xl      0.3392    0.1424    16
