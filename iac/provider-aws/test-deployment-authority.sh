@@ -51,6 +51,22 @@ fi
 grep -q 'TF_PLAN_FILE is derived from account authority' "${fixture_dir}/plan-file.log" ||
   fail 'TF_PLAN_FILE rejection was not explicit'
 
+if make "${common_args[@]}" aws-account-guard \
+  AWS_ACCOUNT_ID=000000000000 AWS_ACCOUNT_ID_cq=000000000000 EXPECTED_AWS_ACCOUNT_ID=000000000000 \
+  >"${fixture_dir}/constant-account.log" 2>&1; then
+  fail 'caller redefined the trusted CQ account constant'
+fi
+grep -q 'does not match target cq (014155356804)' "${fixture_dir}/constant-account.log" ||
+  fail 'CQ account authority constants were not immutable'
+
+if make "${common_args[@]}" aws-account-guard \
+  TF_PLAN_FILE=.tfplan.attacker EXPECTED_TF_PLAN_FILE=.tfplan.attacker \
+  >"${fixture_dir}/constant-plan.log" 2>&1; then
+  fail 'caller redefined the trusted plan path'
+fi
+grep -q 'use .tfplan.dev.cq' "${fixture_dir}/constant-plan.log" ||
+  fail 'target-bound plan authority was not immutable'
+
 dry_run_plan="$(make "${common_args[@]}" -n plan PREFIX=unreviewed-)"
 [[ "${dry_run_plan}" == *"-var-file=./dev.cq.tfvars"* ]] ||
   fail 'CQ did not select the canonical dev.cq.tfvars'
@@ -61,13 +77,53 @@ dry_run_apply="$(make "${common_args[@]}" -n apply)"
 [[ "${dry_run_apply}" == *".tfplan.dev.cq"* ]] ||
   fail 'apply did not use the CQ-bound plan path'
 
+dry_run_init="$(make "${common_args[@]}" -n init)"
+[[ "${dry_run_init}" == *"terraform apply -var-file=./dev.cq.tfvars -target=module.init"* ]] ||
+  fail 'init apply did not use the canonical CQ variables'
+
 if make "${common_args[@]}" aws-account-guard TF_VAR_prefix=unreviewed- >"${fixture_dir}/override.log" 2>&1; then
   fail 'ambient TF_VAR_prefix was accepted for CQ'
 fi
 grep -q 'CQ rejects ambient Terraform variable overrides: TF_VAR_prefix' "${fixture_dir}/override.log" ||
   fail 'ambient TF_VAR rejection was not explicit'
 
+for cli_var in TF_CLI_ARGS TF_CLI_ARGS_plan; do
+  if make "${common_args[@]}" aws-account-guard "${cli_var}=-destroy" >"${fixture_dir}/cli-args.log" 2>&1; then
+    fail "ambient ${cli_var} was accepted for CQ"
+  fi
+  grep -q "CQ rejects ambient Terraform CLI arguments: ${cli_var}" "${fixture_dir}/cli-args.log" ||
+    fail "ambient ${cli_var} rejection was not explicit"
+done
+
+grep -q '^bucket_prefix = "e2b-014155356804-"[[:space:]]*$' "${provider_dir}/dev.cq.tfvars" ||
+  fail 'canonical CQ tfvars omitted the required bucket_prefix'
+
 make "${common_args[@]}" aws-account-guard
+
+sig_args=(
+  --no-print-directory
+  -C "${provider_dir}"
+  ENV=dev
+  SIG_AWS_ACCOUNT_TARGET=sig
+  AWS_PROFILE=test-sig
+  AWS_ACCOUNT_ID=319933937176
+  AWS_REGION=us-east-1
+  TERRAFORM_STATE_BUCKET=superintelligent-group-terraform-state
+  TF=terraform
+  TF_VAR_FILE=./dev.sig.tfvars.reference
+)
+
+if make "${sig_args[@]}" aws-account-guard AWS_REGION=us-west-2 >"${fixture_dir}/sig-region.log" 2>&1; then
+  fail 'noncanonical SIG rollback region was accepted'
+fi
+grep -q 'does not match target sig (us-east-1)' "${fixture_dir}/sig-region.log" ||
+  fail 'SIG rollback region rejection was not explicit'
+
+if make "${sig_args[@]}" aws-account-guard TERRAFORM_STATE_BUCKET=unreviewed-state >"${fixture_dir}/sig-state.log" 2>&1; then
+  fail 'noncanonical SIG rollback state bucket was accepted'
+fi
+grep -q 'does not match target sig (superintelligent-group-terraform-state)' "${fixture_dir}/sig-state.log" ||
+  fail 'SIG rollback state-bucket rejection was not explicit'
 
 if grep -Fq '$(file <' "${provider_dir}/Makefile"; then
   fail 'Makefile still requires GNU Make 4 file-read syntax'

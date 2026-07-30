@@ -16,6 +16,9 @@ aws_region = "us-east-1"
 # reconciled back into tracked config.
 prefix      = "e2b-"
 environment = "dev"
+# Required by module.init bucket names; reviewed instead of synthesized through
+# a higher-precedence TF_VAR_bucket_prefix environment value.
+bucket_prefix = "e2b-014155356804-"
 
 # -----------------------------------------------------------------------------
 # Networking

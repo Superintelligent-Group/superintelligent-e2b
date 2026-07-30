@@ -8,14 +8,18 @@ SIG_AWS_ACCOUNT_TARGET ?=
 
 # Account selection is authority, not ambient convenience. The CQ deployment has
 # a tracked, reviewed configuration; selecting cq must therefore use that file.
-AWS_ACCOUNT_ID_cq := 014155356804
-AWS_ACCOUNT_ID_sig := 319933937176
-EXPECTED_AWS_ACCOUNT_ID := $(AWS_ACCOUNT_ID_$(SIG_AWS_ACCOUNT_TARGET))
-AWS_REGION_cq := us-east-1
-TF_STATE_BUCKET_cq := commonquant-e2b-tfstate
-EXPECTED_AWS_REGION := $(AWS_REGION_$(SIG_AWS_ACCOUNT_TARGET))
-EXPECTED_TF_STATE_BUCKET := $(TF_STATE_BUCKET_$(SIG_AWS_ACCOUNT_TARGET))
-CANONICAL_CQ_TF_VAR_FILE := ./${ENV}.cq.tfvars
+# `override` prevents command-line variables from redefining the trusted side of
+# each comparison performed by aws-account-guard.
+override AWS_ACCOUNT_ID_cq := 014155356804
+override AWS_ACCOUNT_ID_sig := 319933937176
+override EXPECTED_AWS_ACCOUNT_ID := $(AWS_ACCOUNT_ID_$(SIG_AWS_ACCOUNT_TARGET))
+override AWS_REGION_cq := us-east-1
+override AWS_REGION_sig := us-east-1
+override TF_STATE_BUCKET_cq := commonquant-e2b-tfstate
+override TF_STATE_BUCKET_sig := superintelligent-group-terraform-state
+override EXPECTED_AWS_REGION := $(AWS_REGION_$(SIG_AWS_ACCOUNT_TARGET))
+override EXPECTED_TF_STATE_BUCKET := $(TF_STATE_BUCKET_$(SIG_AWS_ACCOUNT_TARGET))
+override CANONICAL_CQ_TF_VAR_FILE := ./${ENV}.cq.tfvars
 REQUESTED_TF_VAR_FILE := $(TF_VAR_FILE)
 REQUESTED_TF_PLAN_FILE := $(TF_PLAN_FILE)
 DEFAULT_SIG_TF_VAR_FILE := ./.terraform.${ENV}.tfvars
@@ -24,10 +28,10 @@ override TF_VAR_FILE := $(CANONICAL_CQ_TF_VAR_FILE)
 else
 TF_VAR_FILE ?= $(DEFAULT_SIG_TF_VAR_FILE)
 endif
-EXPECTED_TF_PLAN_FILE := .tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET}
+override EXPECTED_TF_PLAN_FILE := .tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET}
 override TF_PLAN_FILE := $(EXPECTED_TF_PLAN_FILE)
 TF_VAR_FILE_ARG := $(if $(wildcard $(TF_VAR_FILE)),-var-file=$(TF_VAR_FILE))
-TERRAFORM_STATE_BUCKET ?= $(AWS_ACCOUNT_ID)-terraform-state
+TERRAFORM_STATE_BUCKET ?= $(if $(EXPECTED_TF_STATE_BUCKET),$(EXPECTED_TF_STATE_BUCKET),$(AWS_ACCOUNT_ID)-terraform-state)
 TEMPLATE_BUCKET_LOCATION ?= $(AWS_REGION)
 
 BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
@@ -80,6 +84,7 @@ legacy_tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION) \
 cq_tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION)
 tf_vars = $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),$(cq_tf_vars),$(legacy_tf_vars))
 CQ_TF_VAR_OVERRIDES := $(filter-out TF_VAR_FILE TF_VAR_FILE_ARG,$(filter TF_VAR_%,$(.VARIABLES)))
+CQ_TF_CLI_ARG_OVERRIDES := $(filter TF_CLI_ARGS%,$(.VARIABLES))
 
 .PHONY: aws-account-guard
 aws-account-guard:
@@ -127,6 +132,10 @@ aws-account-guard:
 		printf "CQ rejects ambient Terraform variable overrides: %s\n" "$(CQ_TF_VAR_OVERRIDES)" >&2; \
 		exit 1; \
 	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ -n "$(CQ_TF_CLI_ARG_OVERRIDES)" ]; then \
+		printf "CQ rejects ambient Terraform CLI arguments: %s\n" "$(CQ_TF_CLI_ARG_OVERRIDES)" >&2; \
+		exit 1; \
+	fi
 	@actual="$$(AWS_PROFILE="$(AWS_PROFILE)" AWS_REGION="$(AWS_REGION)" aws sts get-caller-identity --query Account --output text 2>/dev/null)" || { \
 		printf "Unable to resolve AWS caller identity for profile %s.\n" "$(AWS_PROFILE)" >&2; \
 		exit 1; \
@@ -159,7 +168,7 @@ init: aws-account-guard
 		aws s3api create-bucket --bucket $(TERRAFORM_STATE_BUCKET) --region $(TEMPLATE_BUCKET_LOCATION) --profile $(AWS_PROFILE) --create-bucket-configuration LocationConstraint=$(TEMPLATE_BUCKET_LOCATION) 2>/dev/null || true; \
 	fi
 	$(tf_vars) $(TF) init -upgrade -reconfigure -backend-config="bucket=${TERRAFORM_STATE_BUCKET}"
-	$(tf_vars) $(TF) apply -target=module.init -input=false -compact-warnings
+	$(tf_vars) $(TF) apply $(TF_VAR_FILE_ARG) -target=module.init -input=false -compact-warnings
 
 .PHONY: plan
 plan: aws-account-guard
