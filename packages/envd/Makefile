@@ -13,7 +13,9 @@ PROD_LDFLAGS=-ldflags "-X=main.commitSHA=$(BUILD) -s -w -buildid="
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
 override AWS_WRITE_S3_PREFIX = $(AWS_BUCKET_PREFIX)
+override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX
 override AWS_WRITE_S3_DESTINATION_REQUIRED := true
+unexport AWS_BUCKET_PREFIX
 ENVD_UPLOAD_MODE ?= latest
 
 # Architecture for builds. Defaults to amd64; override for ARM64 builds.

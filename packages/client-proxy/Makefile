@@ -21,7 +21,9 @@ else
 	IMAGE_REGISTRY := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/client-proxy
 endif
 override AWS_WRITE_DESTINATION = $(IMAGE_REGISTRY)
+override AWS_WRITE_DESTINATION_SOURCE := IMAGE_REGISTRY
 override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
+unexport IMAGE_REGISTRY
 
 # E2B-hosted registry that holds released, prebuilt client-proxy images.
 # Published to by the release-please workflow on tagging a release.

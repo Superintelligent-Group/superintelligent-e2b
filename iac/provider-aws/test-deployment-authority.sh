@@ -167,9 +167,8 @@ make "${common_args[@]}" aws-account-guard
 
 # Exercise the shared prerequisite itself with a deliberately wrong account.
 # Target wiring is checked structurally below, so no mutating recipe can run.
-if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
+if make --no-print-directory -C "${repo_root}" -f scripts/aws-account-authority.mk aws-write-account-guard \
   PROVIDER=aws \
-  AWS_BUCKET_PREFIX=e2b-014155356804- \
   ENV=dev \
   SIG_AWS_ACCOUNT_TARGET=cq \
   AWS_PROFILE=test-cq \
@@ -182,8 +181,21 @@ fi
 grep -q 'does not match target cq (014155356804)' "${fixture_dir}/shared-guard.log" ||
   fail 'shared AWS write guard did not delegate to canonical authority'
 
-# A caller cannot disguise an ECR destination as a GCP build, redirect the
-# shared include, or point valid CQ credentials at the SIG registry.
+# The package-owned canonical destination passes both the raw-origin gate and
+# the expanded syntax/account validator.
+make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+  PROVIDER=aws \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform
+
+# A caller cannot replace the package-owned ECR destination, disguise an ECR
+# write as GCP, or redirect the shared authority include. Direct values are
+# rejected by origin before their contents can be expanded by GNU Make.
 if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
   PROVIDER=gcp \
   IMAGE_REGISTRY=319933937176.dkr.ecr.us-east-1.amazonaws.com/attacker \
@@ -198,9 +210,9 @@ if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-a
   TF=terraform >"${fixture_dir}/disguised-ecr.log" 2>&1; then
   fail 'cross-account ECR destination bypassed AWS account authority'
 fi
-grep -q 'ECR destination 319933937176.* does not match target cq' \
+grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
   "${fixture_dir}/disguised-ecr.log" ||
-  fail 'cross-account ECR destination rejection was not explicit'
+  fail 'caller-owned ECR destination rejection was not explicit'
 
 if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
   PROVIDER=aws \
@@ -214,7 +226,8 @@ if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-a
   TF=terraform >"${fixture_dir}/missing-ecr.log" 2>&1; then
   fail 'empty ECR destination bypassed AWS account authority'
 fi
-grep -q 'ECR destination is required for target cq' "${fixture_dir}/missing-ecr.log" ||
+grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
+  "${fixture_dir}/missing-ecr.log" ||
   fail 'empty ECR destination rejection was not explicit'
 
 # The destination must be one complete repository reference. Matching one word
@@ -231,7 +244,7 @@ if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-a
   TF=terraform >"${fixture_dir}/multiple-ecr.log" 2>&1; then
   fail 'multiple ECR destination words bypassed AWS account authority'
 fi
-grep -q 'ECR destination must be exactly one registry reference for target cq' \
+grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
   "${fixture_dir}/multiple-ecr.log" ||
   fail 'multiple ECR destination rejection was not explicit'
 
@@ -248,11 +261,53 @@ if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-a
   TF=terraform >"${fixture_dir}/malformed-ecr.log" 2>&1; then
   fail 'malformed ECR destination bypassed AWS account authority'
 fi
-grep -q 'destination is not a valid untagged ECR repository for target cq' \
+grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
   "${fixture_dir}/malformed-ecr.log" ||
   fail 'malformed ECR destination rejection was not explicit'
 [[ ! -e "${injection_marker}" ]] ||
   fail 'ECR destination text was executed as shell source'
+
+# GNU Make function syntax is more dangerous than shell metacharacters: Make
+# evaluates $(shell ...) while expanding a recursive variable. The origin gate
+# must reject both command-line and environment-override values without ever
+# expanding their raw contents.
+make_function_marker="${fixture_dir}/make-function-injection-ran"
+make_function_destination='014155356804.dkr.ecr.us-east-1.amazonaws.com/core/client-proxy$(shell touch '"${make_function_marker}"')'
+if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+  PROVIDER=aws \
+  "IMAGE_REGISTRY=${make_function_destination}" \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/make-function-ecr.log" 2>&1; then
+  fail 'GNU Make function in a command-line ECR destination bypassed authority'
+fi
+grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
+  "${fixture_dir}/make-function-ecr.log" ||
+  fail 'command-line Make-function rejection was not explicit'
+[[ ! -e "${make_function_marker}" ]] ||
+  fail 'command-line ECR destination executed a GNU Make function'
+
+if env IMAGE_REGISTRY="${make_function_destination}" \
+  make -e --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+    PROVIDER=aws \
+    ENV=dev \
+    SIG_AWS_ACCOUNT_TARGET=cq \
+    AWS_PROFILE=test-cq \
+    AWS_ACCOUNT_ID=014155356804 \
+    AWS_REGION=us-east-1 \
+    TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+    TF=terraform >"${fixture_dir}/environment-function-ecr.log" 2>&1; then
+  fail 'GNU Make function in an environment ECR destination bypassed authority'
+fi
+grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is environment override' \
+  "${fixture_dir}/environment-function-ecr.log" ||
+  fail 'environment Make-function rejection was not explicit'
+[[ ! -e "${make_function_marker}" ]] ||
+  fail 'environment ECR destination executed a GNU Make function'
 
 # S3 writers bind the exact recipe prefix. A caller cannot replace either the
 # source variable or the claimed guard variable with the other account.
@@ -269,9 +324,9 @@ if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
   TF=terraform >"${fixture_dir}/cross-account-s3.log" 2>&1; then
   fail 'cross-account S3 bucket prefix bypassed AWS account authority'
 fi
-grep -q 'S3 bucket prefix e2b-319933937176- does not match target cq' \
+grep -q 'S3 bucket prefix source AWS_BUCKET_PREFIX must be Makefile-owned; origin is command line' \
   "${fixture_dir}/cross-account-s3.log" ||
-  fail 'cross-account S3 prefix rejection was not explicit'
+  fail 'caller-owned S3 prefix rejection was not explicit'
 
 if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
   PROVIDER=aws \
@@ -285,8 +340,51 @@ if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
   TF=terraform >"${fixture_dir}/missing-s3.log" 2>&1; then
   fail 'empty S3 bucket prefix bypassed AWS account authority'
 fi
-grep -q 'S3 bucket prefix is required for target cq' "${fixture_dir}/missing-s3.log" ||
+grep -q 'S3 bucket prefix source AWS_BUCKET_PREFIX must be Makefile-owned; origin is command line' \
+  "${fixture_dir}/missing-s3.log" ||
   fail 'empty S3 prefix rejection was not explicit'
+
+s3_make_function_marker="${fixture_dir}/s3-make-function-injection-ran"
+s3_make_function_prefix='e2b-014155356804-$(shell touch '"${s3_make_function_marker}"')'
+if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
+  PROVIDER=aws \
+  "AWS_BUCKET_PREFIX=${s3_make_function_prefix}" \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/make-function-s3.log" 2>&1; then
+  fail 'GNU Make function in a command-line S3 prefix bypassed authority'
+fi
+grep -q 'S3 bucket prefix source AWS_BUCKET_PREFIX must be Makefile-owned; origin is command line' \
+  "${fixture_dir}/make-function-s3.log" ||
+  fail 'command-line S3 Make-function rejection was not explicit'
+[[ ! -e "${s3_make_function_marker}" ]] ||
+  fail 'command-line S3 bucket prefix executed a GNU Make function'
+
+# Every guarded destination must name and unexport the source its writer later
+# expands. Otherwise a future package could accidentally restore the pre-guard
+# Make-function execution path.
+source_contracts=(
+  'Makefile|override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX|unexport AWS_BUCKET_PREFIX'
+  'packages/api/Makefile|override AWS_WRITE_DESTINATION_SOURCE := REGISTRY_PREFIX|unexport REGISTRY_PREFIX'
+  'packages/clickhouse/Makefile|override AWS_WRITE_DESTINATION_SOURCE := CLICKHOUSE_MIGRATOR_IMAGE|unexport CLICKHOUSE_MIGRATOR_IMAGE'
+  'packages/client-proxy/Makefile|override AWS_WRITE_DESTINATION_SOURCE := IMAGE_REGISTRY|unexport IMAGE_REGISTRY'
+  'packages/dashboard-api/Makefile|override AWS_WRITE_DESTINATION_SOURCE := IMAGE_REGISTRY|unexport IMAGE_REGISTRY'
+  'packages/docker-reverse-proxy/Makefile|override AWS_WRITE_DESTINATION_SOURCE := IMAGE_REGISTRY|unexport IMAGE_REGISTRY'
+  'packages/envd/Makefile|override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX|unexport AWS_BUCKET_PREFIX'
+  'packages/nomad-nodepool-apm/Makefile|override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX|unexport AWS_BUCKET_PREFIX'
+  'packages/orchestrator/Makefile|override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX|unexport AWS_BUCKET_PREFIX'
+)
+for contract in "${source_contracts[@]}"; do
+  IFS='|' read -r file source_binding unexport_binding <<<"${contract}"
+  grep -Fq "${source_binding}" "${repo_root}/${file}" ||
+    fail "AWS writer lacks an immutable source binding: ${file}"
+  grep -Fq "${unexport_binding}" "${repo_root}/${file}" ||
+    fail "AWS writer source is still exported before its origin gate: ${file}"
+done
 
 guarded_targets=(
   'Makefile|copy-public-builds: aws-write-account-guard'

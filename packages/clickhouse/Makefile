@@ -12,7 +12,9 @@ else
 	CLICKHOUSE_MIGRATOR_IMAGE ?= $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/clickhouse-migrator
 endif
 override AWS_WRITE_DESTINATION = $(CLICKHOUSE_MIGRATOR_IMAGE)
+override AWS_WRITE_DESTINATION_SOURCE := CLICKHOUSE_MIGRATOR_IMAGE
 override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
+unexport CLICKHOUSE_MIGRATOR_IMAGE
 
 # E2B-hosted registry that holds released, prebuilt clickhouse-migrator images.
 # Published to by the release-please workflow on tagging a release.
