@@ -35,6 +35,9 @@ jobs:
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive
 
+      - name: Verify AWS deployment authority
+        run: bash iac/provider-aws/test-deployment-authority.sh
+
       - name: Validate terraform
         working-directory: ./iac/provider-gcp
         run: |

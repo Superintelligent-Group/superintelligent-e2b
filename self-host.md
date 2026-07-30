@@ -140,7 +140,9 @@ Now, you should see the right quota options in `All Quotas` and be able to reque
 >
 > `SIG_AWS_ACCOUNT_TARGET=cq` automatically selects the tracked
 > `iac/provider-aws/dev.cq.tfvars`; values in `.env.dev` are bootstrap inputs,
-> not permission to replace that reviewed configuration. The `sig` target is
+> not permission to replace that reviewed configuration. For CQ, `TF_VAR_FILE`,
+> `TF_PLAN_FILE`, and ambient `TF_VAR_*` values cannot override the reviewed
+> file or the target-bound plan path. The `sig` target is
 > frozen rollback infrastructure and deliberately has no active default tfvars
 > file. An intentional SIG operation must provide an explicitly reviewed
 > `TF_VAR_FILE`, matching `AWS_ACCOUNT_ID`, region, state bucket, and SIG credentials.

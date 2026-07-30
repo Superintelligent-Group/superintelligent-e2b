@@ -1,4 +1,4 @@
-ENV ?= $(if $(wildcard ../../.last_used_env),$(strip $(file <../../.last_used_env)),not-set)
+ENV ?= $(shell cat ../../.last_used_env 2>/dev/null || echo not-set)
 ENV_FILE := ../../.env.${ENV}
 
 -include ${ENV_FILE}
@@ -15,8 +15,17 @@ AWS_REGION_cq := us-east-1
 TF_STATE_BUCKET_cq := commonquant-e2b-tfstate
 EXPECTED_AWS_REGION := $(AWS_REGION_$(SIG_AWS_ACCOUNT_TARGET))
 EXPECTED_TF_STATE_BUCKET := $(TF_STATE_BUCKET_$(SIG_AWS_ACCOUNT_TARGET))
-TF_VAR_FILE ?= $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),./${ENV}.cq.tfvars,./.terraform.${ENV}.tfvars)
-TF_PLAN_FILE ?= .tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET}
+CANONICAL_CQ_TF_VAR_FILE := ./${ENV}.cq.tfvars
+REQUESTED_TF_VAR_FILE := $(TF_VAR_FILE)
+REQUESTED_TF_PLAN_FILE := $(TF_PLAN_FILE)
+DEFAULT_SIG_TF_VAR_FILE := ./.terraform.${ENV}.tfvars
+ifeq ($(SIG_AWS_ACCOUNT_TARGET),cq)
+override TF_VAR_FILE := $(CANONICAL_CQ_TF_VAR_FILE)
+else
+TF_VAR_FILE ?= $(DEFAULT_SIG_TF_VAR_FILE)
+endif
+EXPECTED_TF_PLAN_FILE := .tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET}
+override TF_PLAN_FILE := $(EXPECTED_TF_PLAN_FILE)
 TF_VAR_FILE_ARG := $(if $(wildcard $(TF_VAR_FILE)),-var-file=$(TF_VAR_FILE))
 TERRAFORM_STATE_BUCKET ?= $(AWS_ACCOUNT_ID)-terraform-state
 TEMPLATE_BUCKET_LOCATION ?= $(AWS_REGION)
@@ -33,7 +42,7 @@ define tfvar
 $(if $(value $(strip $(1))), TF_VAR_$(strip $(2))=$($(strip $(1))))
 endef
 
-tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION) \
+legacy_tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION) \
 	TF_VAR_environment=$(TERRAFORM_ENVIRONMENT) \
 	$(call tfvar,PREFIX,prefix) \
 	$(call tfvar,DOMAIN_NAME,domain_name) \
@@ -64,6 +73,14 @@ tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION) \
 	$(call tfvar,AUTH_DB_MIN_IDLE_CONNECTIONS,auth_db_min_idle_connections) \
 	$(call tfvar,ALLOW_SANDBOX_INTERNAL_CIDRS,allow_sandbox_internal_cidrs)
 
+# CQ's reviewed tfvars are the complete Terraform configuration authority. Keep
+# AWS client selection explicit, but do not synthesize higher-precedence
+# TF_VAR_* values from .env.dev. Direct ambient TF_VAR_* values are rejected by
+# aws-account-guard below.
+cq_tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION)
+tf_vars = $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),$(cq_tf_vars),$(legacy_tf_vars))
+CQ_TF_VAR_OVERRIDES := $(filter-out TF_VAR_FILE TF_VAR_FILE_ARG,$(filter TF_VAR_%,$(.VARIABLES)))
+
 .PHONY: aws-account-guard
 aws-account-guard:
 	@if [ -z "$(SIG_AWS_ACCOUNT_TARGET)" ]; then \
@@ -90,6 +107,26 @@ aws-account-guard:
 		printf "Terraform state bucket %s does not match target %s (%s).\n" "$(TERRAFORM_STATE_BUCKET)" "$(SIG_AWS_ACCOUNT_TARGET)" "$(EXPECTED_TF_STATE_BUCKET)" >&2; \
 		exit 1; \
 	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ -n "$(REQUESTED_TF_VAR_FILE)" ] && [ "$(REQUESTED_TF_VAR_FILE)" != "$(CANONICAL_CQ_TF_VAR_FILE)" ]; then \
+		printf "CQ does not accept TF_VAR_FILE overrides; use %s.\n" "$(CANONICAL_CQ_TF_VAR_FILE)" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ "$(TF_VAR_FILE)" != "$(CANONICAL_CQ_TF_VAR_FILE)" ]; then \
+		printf "CQ requires canonical Terraform variables from %s, got %s.\n" "$(CANONICAL_CQ_TF_VAR_FILE)" "$(TF_VAR_FILE)" >&2; \
+		exit 1; \
+	fi
+	@if [ -n "$(REQUESTED_TF_PLAN_FILE)" ] && [ "$(REQUESTED_TF_PLAN_FILE)" != "$(EXPECTED_TF_PLAN_FILE)" ]; then \
+		printf "TF_PLAN_FILE is derived from account authority; use %s.\n" "$(EXPECTED_TF_PLAN_FILE)" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(TF_PLAN_FILE)" != "$(EXPECTED_TF_PLAN_FILE)" ]; then \
+		printf "Terraform plan path must be target-bound at %s, got %s.\n" "$(EXPECTED_TF_PLAN_FILE)" "$(TF_PLAN_FILE)" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ -n "$(CQ_TF_VAR_OVERRIDES)" ]; then \
+		printf "CQ rejects ambient Terraform variable overrides: %s\n" "$(CQ_TF_VAR_OVERRIDES)" >&2; \
+		exit 1; \
+	fi
 	@actual="$$(AWS_PROFILE="$(AWS_PROFILE)" AWS_REGION="$(AWS_REGION)" aws sts get-caller-identity --query Account --output text 2>/dev/null)" || { \
 		printf "Unable to resolve AWS caller identity for profile %s.\n" "$(AWS_PROFILE)" >&2; \
 		exit 1; \
@@ -100,7 +137,7 @@ aws-account-guard:
 	fi
 	@if [ ! -f "$(TF_VAR_FILE)" ]; then \
 		printf "Canonical Terraform variable file is missing: %s\n" "$(TF_VAR_FILE)" >&2; \
-		printf "Set TF_VAR_FILE explicitly only for an intentional reviewed rollback configuration.\n" >&2; \
+		printf "Only the frozen SIG rollback target accepts an explicit reviewed TF_VAR_FILE.\n" >&2; \
 		exit 1; \
 	fi
 
