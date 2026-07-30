@@ -40,6 +40,13 @@ exit 1
 EOF
 chmod +x "${fixture_dir}/bin/aws"
 
+cat >"${fixture_dir}/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+touch "${DOCKER_MARKER:?DOCKER_MARKER is required by the authority test}"
+EOF
+chmod +x "${fixture_dir}/bin/docker"
+
 common_args=(
   --no-print-directory
   -C "${provider_dir}"
@@ -101,6 +108,18 @@ if make "${common_args[@]}" aws-account-guard TF_PLAN_FILE=.tfplan.dev.sig >"${f
 fi
 grep -q 'TF_PLAN_FILE is derived from account authority' "${fixture_dir}/plan-file.log" ||
   fail 'TF_PLAN_FILE rejection was not explicit'
+
+plan_make_function_marker="${fixture_dir}/plan-make-function-injection-ran"
+plan_make_function_value='$(shell touch '"${plan_make_function_marker}"')'
+if make "${common_args[@]}" aws-account-guard \
+  "TF_PLAN_FILE=${plan_make_function_value}" >"${fixture_dir}/plan-make-function.log" 2>&1; then
+  fail 'GNU Make function in TF_PLAN_FILE bypassed authority'
+fi
+grep -q 'AWS authority input TF_PLAN_FILE contains GNU Make expansion syntax' \
+  "${fixture_dir}/plan-make-function.log" ||
+  fail 'raw TF_PLAN_FILE Make-function rejection was not explicit'
+[[ ! -e "${plan_make_function_marker}" ]] ||
+  fail 'TF_PLAN_FILE executed a GNU Make function before the account guard'
 
 if make "${common_args[@]}" aws-account-guard \
   AWS_ACCOUNT_ID=000000000000 AWS_ACCOUNT_ID_cq=000000000000 EXPECTED_AWS_ACCOUNT_ID=000000000000 \
@@ -285,7 +304,7 @@ if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-a
   TF=terraform >"${fixture_dir}/make-function-ecr.log" 2>&1; then
   fail 'GNU Make function in a command-line ECR destination bypassed authority'
 fi
-grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
+grep -q 'AWS authority input IMAGE_REGISTRY contains GNU Make expansion syntax' \
   "${fixture_dir}/make-function-ecr.log" ||
   fail 'command-line Make-function rejection was not explicit'
 [[ ! -e "${make_function_marker}" ]] ||
@@ -303,11 +322,93 @@ if env IMAGE_REGISTRY="${make_function_destination}" \
     TF=terraform >"${fixture_dir}/environment-function-ecr.log" 2>&1; then
   fail 'GNU Make function in an environment ECR destination bypassed authority'
 fi
-grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is environment override' \
+grep -q 'AWS authority input IMAGE_REGISTRY contains GNU Make expansion syntax' \
   "${fixture_dir}/environment-function-ecr.log" ||
   fail 'environment Make-function rejection was not explicit'
 [[ ! -e "${make_function_marker}" ]] ||
   fail 'environment ECR destination executed a GNU Make function'
+
+disk_image_env_marker="${fixture_dir}/disk-image-env-injection-ran"
+disk_image_env_value='dev$(shell touch '"${disk_image_env_marker}"')'
+if make --no-print-directory -C "${repo_root}/iac/provider-aws/nomad-cluster-disk-image" -n build \
+  "ENV=${disk_image_env_value}" \
+  PROVIDER=aws \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/disk-image-env-function.log" 2>&1; then
+  fail 'AWS disk-image Makefile expanded ENV before authority'
+fi
+grep -q 'AWS authority input ENV contains GNU Make expansion syntax' \
+  "${fixture_dir}/disk-image-env-function.log" ||
+  fail 'AWS disk-image raw ENV rejection was not explicit'
+[[ ! -e "${disk_image_env_marker}" ]] ||
+  fail 'AWS disk-image ENV executed before the authority guard'
+
+component_make_function_marker="${fixture_dir}/component-make-function-injection-ran"
+component_account_id='014155356804$(shell touch '"${component_make_function_marker}"')'
+if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+  PROVIDER=aws \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  "AWS_ACCOUNT_ID=${component_account_id}" \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/component-make-function.log" 2>&1; then
+  fail 'GNU Make function in an ECR destination component bypassed authority'
+fi
+grep -q 'AWS authority input AWS_ACCOUNT_ID contains GNU Make expansion syntax' \
+  "${fixture_dir}/component-make-function.log" ||
+  fail 'destination-component Make-function rejection was not explicit'
+[[ ! -e "${component_make_function_marker}" ]] ||
+  fail 'AWS_ACCOUNT_ID executed before registry destination validation'
+
+parallel_make_function_marker="${fixture_dir}/parallel-make-function-injection-ran"
+parallel_clickhouse_destination='014155356804.dkr.ecr.us-east-1.amazonaws.com/core/clickhouse-migrator$(shell touch '"${parallel_make_function_marker}"')'
+if make -j2 -n --no-print-directory -C "${repo_root}/packages/clickhouse" build-and-upload \
+  PROVIDER=aws \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform \
+  "CLICKHOUSE_MIGRATOR_IMAGE=${parallel_clickhouse_destination}" \
+  >"${fixture_dir}/parallel-make-function.log" 2>&1; then
+  fail 'parallel ClickHouse build expanded a caller-owned destination'
+fi
+grep -q 'AWS authority input CLICKHOUSE_MIGRATOR_IMAGE contains GNU Make expansion syntax' \
+  "${fixture_dir}/parallel-make-function.log" ||
+  fail 'parallel destination rejection was not explicit'
+[[ ! -e "${parallel_make_function_marker}" ]] ||
+  fail 'parallel build expanded its destination before the origin guard'
+grep -Fq 'build: aws-write-input-origin-guard' "${repo_root}/packages/clickhouse/Makefile" ||
+  fail 'ClickHouse build is not serialized behind the origin guard'
+
+parallel_build_marker="${fixture_dir}/parallel-build-ran"
+if DOCKER_MARKER="${parallel_build_marker}" \
+  make -j2 --no-print-directory -C "${repo_root}/packages/clickhouse" build-and-upload \
+    PROVIDER=aws \
+    ENV=dev \
+    SIG_AWS_ACCOUNT_TARGET=cq \
+    AWS_PROFILE=test-cq \
+    AWS_ACCOUNT_ID=014155356804 \
+    AWS_REGION=us-east-1 \
+    TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+    TF=terraform \
+    CLICKHOUSE_MIGRATOR_IMAGE=caller-owned.invalid/repository \
+    >"${fixture_dir}/parallel-build.log" 2>&1; then
+  fail 'parallel ClickHouse build accepted a caller-owned destination'
+fi
+grep -q 'ECR destination source CLICKHOUSE_MIGRATOR_IMAGE must be Makefile-owned' \
+  "${fixture_dir}/parallel-build.log" ||
+  fail 'parallel ClickHouse origin rejection was not explicit'
+[[ ! -e "${parallel_build_marker}" ]] ||
+  fail 'parallel ClickHouse build started before its origin guard completed'
 
 # S3 writers bind the exact recipe prefix. A caller cannot replace either the
 # source variable or the claimed guard variable with the other account.
@@ -358,7 +459,7 @@ if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
   TF=terraform >"${fixture_dir}/make-function-s3.log" 2>&1; then
   fail 'GNU Make function in a command-line S3 prefix bypassed authority'
 fi
-grep -q 'S3 bucket prefix source AWS_BUCKET_PREFIX must be Makefile-owned; origin is command line' \
+grep -q 'AWS authority input AWS_BUCKET_PREFIX contains GNU Make expansion syntax' \
   "${fixture_dir}/make-function-s3.log" ||
   fail 'command-line S3 Make-function rejection was not explicit'
 [[ ! -e "${s3_make_function_marker}" ]] ||

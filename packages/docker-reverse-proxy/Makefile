@@ -1,5 +1,8 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
 PREFIX := $(strip $(subst ",,$(PREFIX)))
 
 include ../../scripts/aws-account-authority.mk

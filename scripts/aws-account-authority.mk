@@ -1,3 +1,6 @@
+include $(dir $(lastword $(MAKEFILE_LIST)))make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
+
 # Shared fail-closed authority for every Make target that can mutate AWS.
 #
 # Include this file from root or nested Makefiles, then add

@@ -1,5 +1,8 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
 PREFIX := $(strip $(subst ",,$(PREFIX)))
 
 include ../../scripts/aws-account-authority.mk
@@ -56,7 +59,7 @@ migrate-local:
 	@echo "Done"
 
 .PHONY: build
-build:
+build: aws-write-input-origin-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	@docker build --platform linux/amd64 --tag "$(CLICKHOUSE_MIGRATOR_IMAGE)" --tag "$(CLICKHOUSE_MIGRATOR_IMAGE):$(COMMIT_SHA)" .
 

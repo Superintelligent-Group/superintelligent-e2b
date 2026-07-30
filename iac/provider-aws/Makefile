@@ -1,7 +1,10 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_terraform_inputs)
 ENV ?= $(shell cat ../../.last_used_env 2>/dev/null || echo not-set)
 ENV_FILE := ../../.env.${ENV}
 
 -include ${ENV_FILE}
+$(call aws_guard_terraform_inputs)
 
 TF ?= terraform
 SIG_AWS_ACCOUNT_TARGET ?=
@@ -22,8 +25,10 @@ override EXPECTED_TF_STATE_BUCKET := $(TF_STATE_BUCKET_$(SIG_AWS_ACCOUNT_TARGET)
 override CANONICAL_CQ_ENV := dev
 override CANONICAL_CQ_TF_VAR_FILE := ./dev.cq.tfvars
 override CANONICAL_SIG_TF_VAR_FILE := ./dev.sig.tfvars.reference
-REQUESTED_TF_VAR_FILE := $(TF_VAR_FILE)
-REQUESTED_TF_PLAN_FILE := $(TF_PLAN_FILE)
+override REQUESTED_TF_VAR_FILE_ORIGIN := $(origin TF_VAR_FILE)
+override REQUESTED_TF_PLAN_FILE_ORIGIN := $(origin TF_PLAN_FILE)
+override REQUESTED_TF_VAR_FILE := $(value TF_VAR_FILE)
+override REQUESTED_TF_PLAN_FILE := $(value TF_PLAN_FILE)
 ifeq ($(SIG_AWS_ACCOUNT_TARGET),cq)
 override TF_VAR_FILE := $(CANONICAL_CQ_TF_VAR_FILE)
 else ifeq ($(SIG_AWS_ACCOUNT_TARGET),sig)

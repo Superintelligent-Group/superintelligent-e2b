@@ -1,8 +1,11 @@
+include scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat .last_used_env || echo "not-set")
 ENV_FILE := .env.${ENV}
 PROVIDER ?= gcp
 
 -include ${ENV_FILE}
+$(call aws_guard_writer_inputs)
 
 include scripts/aws-account-authority.mk
 
