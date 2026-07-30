@@ -4,6 +4,8 @@ PROVIDER ?= gcp
 
 -include ${ENV_FILE}
 
+include scripts/aws-account-authority.mk
+
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
 
@@ -83,24 +85,24 @@ build-and-upload:build-and-upload/template-manager
 build-and-upload:build-and-upload/envd
 build-and-upload:build-and-upload/clickhouse-migrator
 build-and-upload:build-and-upload/nomad-nodepool-apm
-build-and-upload/clean-nfs-cache:
+build-and-upload/clean-nfs-cache: aws-write-account-guard
 	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
 	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/orchestrator build-and-upload/clean-nfs-cache
-build-and-upload/template-manager:
+build-and-upload/template-manager: aws-write-account-guard
 	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
 	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/orchestrator build-and-upload/template-manager
-build-and-upload/orchestrator:
+build-and-upload/orchestrator: aws-write-account-guard
 	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
 	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/orchestrator build-and-upload/orchestrator
-build-and-upload/clickhouse-migrator:
+build-and-upload/clickhouse-migrator: aws-write-account-guard
 	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
 	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/clickhouse build-and-upload
-build-and-upload/%:
+build-and-upload/%: aws-write-account-guard
 	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
 	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/$(notdir $@) build-and-upload
 
 .PHONY: copy-public-builds
-copy-public-builds:
+copy-public-builds: aws-write-account-guard
 ifeq ($(PROVIDER),aws)
 	mkdir -p ./.kernels
 	mkdir -p ./.firecrackers

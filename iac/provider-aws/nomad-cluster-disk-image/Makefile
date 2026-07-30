@@ -1,10 +1,12 @@
 ENV := $(shell cat ../../../.last_used_env || echo "not-set")
 -include ../../../.env.${ENV}
 
+include ../../../scripts/aws-account-authority.mk
+
 init:
 	packer init -upgrade .
 
-build:
+build: aws-write-account-guard
 	packer build \
 		$(if $(PACKER_CONSUL_VERSION),-var "consul_version=$(PACKER_CONSUL_VERSION)") \
 		$(if $(PACKER_NOMAD_VERSION),-var "nomad_version=$(PACKER_NOMAD_VERSION)") \

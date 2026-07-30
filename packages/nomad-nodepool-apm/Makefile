@@ -1,6 +1,8 @@
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
 
+include ../../scripts/aws-account-authority.mk
+
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
 
@@ -25,7 +27,7 @@ test:
 	go test -v ./...
 
 .PHONY: upload
-upload:
+upload: aws-write-account-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	chmod +x $(BINARY)
 	chmod +x $(TARGET_BINARY)

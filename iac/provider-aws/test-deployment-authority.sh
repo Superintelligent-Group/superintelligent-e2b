@@ -3,6 +3,7 @@
 set -euo pipefail
 
 provider_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${provider_dir}/../.." && pwd)"
 fixture_dir="$(mktemp -d)"
 implicit_tfvars="${provider_dir}/deployment-authority-test.auto.tfvars"
 
@@ -163,6 +164,69 @@ grep -q 'Terraform implicit variable files are forbidden' "${fixture_dir}/implic
 rm -f -- "${implicit_tfvars}"
 
 make "${common_args[@]}" aws-account-guard
+
+# Exercise the shared prerequisite itself with a deliberately wrong account.
+# Target wiring is checked structurally below, so no mutating recipe can run.
+if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
+  PROVIDER=aws \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=000000000000 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/shared-guard.log" 2>&1; then
+  fail 'shared AWS write guard accepted a mismatched account'
+fi
+grep -q 'does not match target cq (014155356804)' "${fixture_dir}/shared-guard.log" ||
+  fail 'shared AWS write guard did not delegate to canonical authority'
+
+# A caller cannot disguise an ECR destination as a GCP build to skip account
+# authority, or redirect the shared include to an attacker-controlled root.
+if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+  PROVIDER=gcp \
+  IMAGE_REGISTRY=000000000000.dkr.ecr.us-east-1.amazonaws.com/attacker \
+  AWS_ACCOUNT_AUTHORITY_ROOT=/tmp/attacker \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=000000000000 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/disguised-ecr.log" 2>&1; then
+  fail 'ECR destination disguised as GCP bypassed AWS account authority'
+fi
+grep -q 'does not match target cq (014155356804)' "${fixture_dir}/disguised-ecr.log" ||
+  fail 'disguised ECR destination did not use immutable canonical guard root'
+
+guarded_targets=(
+  'Makefile|copy-public-builds: aws-write-account-guard'
+  'packages/client-proxy/Makefile|build-and-upload: aws-write-account-guard'
+  'Makefile|build-and-upload/%: aws-write-account-guard'
+  'Makefile|build-and-upload/orchestrator: aws-write-account-guard'
+  'Makefile|build-and-upload/template-manager: aws-write-account-guard'
+  'Makefile|build-and-upload/clean-nfs-cache: aws-write-account-guard'
+  'Makefile|build-and-upload/clickhouse-migrator: aws-write-account-guard'
+  'packages/api/Makefile|build-and-upload: aws-write-account-guard'
+  'packages/dashboard-api/Makefile|build-and-upload: aws-write-account-guard'
+  'packages/docker-reverse-proxy/Makefile|build-and-upload: aws-write-account-guard'
+  'packages/clickhouse/Makefile|build-and-upload: aws-write-account-guard'
+  'packages/envd/Makefile|upload: aws-write-account-guard'
+  'packages/envd/Makefile|promote: aws-write-account-guard'
+  'packages/orchestrator/Makefile|upload/clean-nfs-cache: aws-write-account-guard'
+  'packages/orchestrator/Makefile|upload/orchestrator: aws-write-account-guard'
+  'packages/orchestrator/Makefile|upload/template-manager: aws-write-account-guard'
+  'packages/nomad-nodepool-apm/Makefile|upload: aws-write-account-guard'
+  'iac/provider-aws/nomad-cluster-disk-image/Makefile|build: aws-write-account-guard'
+)
+for contract in "${guarded_targets[@]}"; do
+  file="${contract%%|*}"
+  declaration="${contract#*|}"
+  grep -Fq "${declaration}" "${repo_root}/${file}" ||
+    fail "AWS write target lacks canonical guard: ${file} ${declaration}"
+done
+
+make --no-print-directory -f "${repo_root}/scripts/aws-account-authority.mk" PROVIDER=gcp aws-write-account-guard
 
 sig_args=(
   --no-print-directory

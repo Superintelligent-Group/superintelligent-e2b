@@ -127,6 +127,9 @@ Now, you should see the right quota options in `All Quotas` and be able to reque
 > Make target unless the operator names the account and the selected AWS profile
 > resolves to that exact account. Account selection also namespaces the saved
 > plan, so a CQ plan cannot later be applied to the SIG rollback account.
+> The same shared guard is a prerequisite of Packer AMI builds, S3 copies, and
+> package image/binary uploads, including when those package targets are called
+> directly. No AWS-writing Make target relies on ambient credentials alone.
 >
 > For the canonical CQ deployment:
 >
@@ -143,9 +146,9 @@ Now, you should see the right quota options in `All Quotas` and be able to reque
 > not permission to replace that reviewed configuration. For CQ, `TF_VAR_FILE`,
 > `TF_PLAN_FILE`, and ambient `TF_VAR_*` values cannot override the reviewed
 > file or the target-bound plan path. The `sig` target is
-> frozen rollback infrastructure and deliberately has no active default tfvars
-> file. An intentional SIG operation must provide an explicitly reviewed
-> `TF_VAR_FILE`, matching `AWS_ACCOUNT_ID`, region, state bucket, and SIG credentials.
+> frozen rollback infrastructure. An intentional SIG operation must explicitly
+> select the tracked `iac/provider-aws/dev.sig.tfvars.reference`, matching
+> `AWS_ACCOUNT_ID`, region, state bucket, and SIG credentials.
 > Omitting the target, using ambient credentials, selecting an unknown target,
 > or presenting a mismatched caller account stops before Terraform runs.
 3. Run `make provider-login` to authenticate with AWS ECR

@@ -1,6 +1,8 @@
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
 
+include ../../scripts/aws-account-authority.mk
+
 LOCAL_BUILD_TARGET ?= build-debug
 PREFIX := $(strip $(subst ",,$(PREFIX)))
 HOSTNAME := $(shell hostname 2> /dev/null || hostnamectl hostname 2> /dev/null)
@@ -13,6 +15,7 @@ ifeq ($(PROVIDER),aws)
 else
 	REGISTRY_PREFIX := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core
 endif
+override AWS_WRITE_DESTINATION = $(REGISTRY_PREFIX)
 
 .PHONY: generate
 generate:
@@ -72,7 +75,7 @@ profiler:
 	go tool pprof -http :9991 http://localhost:6060/debug/pprof/$(metric)?seconds=$(interval)\&timeout=120
 
 .PHONY: build-and-upload
-build-and-upload:
+build-and-upload: aws-write-account-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	$(eval EXPECTED_MIGRATION_TIMESTAMP := $(expectedMigration))
 	cd .. && REGISTRY_PREFIX=$(REGISTRY_PREFIX) \

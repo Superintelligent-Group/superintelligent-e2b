@@ -1,6 +1,8 @@
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
 
+include ../../scripts/aws-account-authority.mk
+
 # Always a fixed 7-char prefix so versioned upload names match `promote`,
 # which truncates ENVD_COMMIT_SHA to 7 chars (`git rev-parse --short` can
 # emit more than 7 when 7 is ambiguous).
@@ -23,7 +25,7 @@ BUILD_PLATFORM ?= linux/$(BUILD_ARCH)
 init:
 	brew install protobuf
 
-upload:
+upload: aws-write-account-guard
 	chmod +x bin/envd
 ifeq ($(PROVIDER),aws)
 ifeq ($(ENVD_UPLOAD_MODE),versioned)
@@ -40,7 +42,7 @@ endif
 endif
 
 .PHONY: promote
-promote:
+promote: aws-write-account-guard
 	$(if $(ENVD_COMMIT_SHA),,$(error ENVD_COMMIT_SHA is required))
 	$(eval ENVD_COMMIT_SHA_SHORT := $(shell printf '%.7s' "$(ENVD_COMMIT_SHA)"))
 ifeq ($(PROVIDER),aws)

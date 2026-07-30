@@ -2,11 +2,14 @@ ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
 PREFIX := $(strip $(subst ",,$(PREFIX)))
 
+include ../../scripts/aws-account-authority.mk
+
 ifeq ($(PROVIDER),aws)
 	IMAGE_REGISTRY := $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(PREFIX)core/docker-reverse-proxy
 else
 	IMAGE_REGISTRY := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/docker-reverse-proxy
 endif
+override AWS_WRITE_DESTINATION = $(IMAGE_REGISTRY)
 
 # E2B-hosted registry that holds released, prebuilt reverse-proxy images.
 # Published to by the release-please workflow on tagging a release.
@@ -40,7 +43,7 @@ build-debug:
 	CGO_ENABLED=1 go build -race -gcflags=all="-N -l" -o bin/docker-reverse-proxy .
 
 .PHONY: build-and-upload
-build-and-upload:
+build-and-upload: aws-write-account-guard
 ifeq ($(strip $(DOCKER_REVERSE_PROXY_VERSION)),)
 	# Existing flow: build from source and push to the client's own core repo.
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
