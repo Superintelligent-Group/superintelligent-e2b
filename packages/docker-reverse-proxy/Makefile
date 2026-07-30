@@ -10,6 +10,7 @@ else
 	IMAGE_REGISTRY := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/docker-reverse-proxy
 endif
 override AWS_WRITE_DESTINATION = $(IMAGE_REGISTRY)
+override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
 
 # E2B-hosted registry that holds released, prebuilt reverse-proxy images.
 # Published to by the release-please workflow on tagging a release.

@@ -5,6 +5,8 @@ include ../../scripts/aws-account-authority.mk
 
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
+override AWS_WRITE_S3_PREFIX = $(AWS_BUCKET_PREFIX)
+override AWS_WRITE_S3_DESTINATION_REQUIRED := true
 
 HOSTNAME := $(shell hostname 2> /dev/null || hostnamectl hostname 2> /dev/null)
 $(if $(HOSTNAME),,$(error Failed to determine hostname: both 'hostname' and 'hostnamectl' failed))

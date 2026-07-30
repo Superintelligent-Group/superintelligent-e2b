@@ -12,6 +12,7 @@ else
 	IMAGE_REGISTRY := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/dashboard-api
 endif
 override AWS_WRITE_DESTINATION = $(IMAGE_REGISTRY)
+override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
 
 HOSTNAME := $(shell hostname 2> /dev/null || hostnamectl hostname 2> /dev/null)
 $(if $(HOSTNAME),,$(error Failed to determine hostname: both 'hostname' and 'hostnamectl' failed))

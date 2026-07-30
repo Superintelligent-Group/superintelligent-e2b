@@ -169,6 +169,7 @@ make "${common_args[@]}" aws-account-guard
 # Target wiring is checked structurally below, so no mutating recipe can run.
 if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
   PROVIDER=aws \
+  AWS_BUCKET_PREFIX=e2b-014155356804- \
   ENV=dev \
   SIG_AWS_ACCOUNT_TARGET=cq \
   AWS_PROFILE=test-cq \
@@ -181,23 +182,74 @@ fi
 grep -q 'does not match target cq (014155356804)' "${fixture_dir}/shared-guard.log" ||
   fail 'shared AWS write guard did not delegate to canonical authority'
 
-# A caller cannot disguise an ECR destination as a GCP build to skip account
-# authority, or redirect the shared include to an attacker-controlled root.
+# A caller cannot disguise an ECR destination as a GCP build, redirect the
+# shared include, or point valid CQ credentials at the SIG registry.
 if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
   PROVIDER=gcp \
-  IMAGE_REGISTRY=000000000000.dkr.ecr.us-east-1.amazonaws.com/attacker \
+  IMAGE_REGISTRY=319933937176.dkr.ecr.us-east-1.amazonaws.com/attacker \
+  AWS_WRITE_DESTINATION=014155356804.dkr.ecr.us-east-1.amazonaws.com/claimed \
   AWS_ACCOUNT_AUTHORITY_ROOT=/tmp/attacker \
   ENV=dev \
   SIG_AWS_ACCOUNT_TARGET=cq \
   AWS_PROFILE=test-cq \
-  AWS_ACCOUNT_ID=000000000000 \
+  AWS_ACCOUNT_ID=014155356804 \
   AWS_REGION=us-east-1 \
   TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
   TF=terraform >"${fixture_dir}/disguised-ecr.log" 2>&1; then
-  fail 'ECR destination disguised as GCP bypassed AWS account authority'
+  fail 'cross-account ECR destination bypassed AWS account authority'
 fi
-grep -q 'does not match target cq (014155356804)' "${fixture_dir}/disguised-ecr.log" ||
-  fail 'disguised ECR destination did not use immutable canonical guard root'
+grep -q 'ECR destination 319933937176.* does not match target cq' \
+  "${fixture_dir}/disguised-ecr.log" ||
+  fail 'cross-account ECR destination rejection was not explicit'
+
+if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-account-guard \
+  PROVIDER=aws \
+  IMAGE_REGISTRY= \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/missing-ecr.log" 2>&1; then
+  fail 'empty ECR destination bypassed AWS account authority'
+fi
+grep -q 'ECR destination is required for target cq' "${fixture_dir}/missing-ecr.log" ||
+  fail 'empty ECR destination rejection was not explicit'
+
+# S3 writers bind the exact recipe prefix. A caller cannot replace either the
+# source variable or the claimed guard variable with the other account.
+if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
+  PROVIDER=aws \
+  AWS_BUCKET_PREFIX=e2b-319933937176- \
+  AWS_WRITE_S3_PREFIX=e2b-014155356804- \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/cross-account-s3.log" 2>&1; then
+  fail 'cross-account S3 bucket prefix bypassed AWS account authority'
+fi
+grep -q 'S3 bucket prefix e2b-319933937176- does not match target cq' \
+  "${fixture_dir}/cross-account-s3.log" ||
+  fail 'cross-account S3 prefix rejection was not explicit'
+
+if make --no-print-directory -C "${repo_root}" aws-write-account-guard \
+  PROVIDER=aws \
+  AWS_BUCKET_PREFIX= \
+  ENV=dev \
+  SIG_AWS_ACCOUNT_TARGET=cq \
+  AWS_PROFILE=test-cq \
+  AWS_ACCOUNT_ID=014155356804 \
+  AWS_REGION=us-east-1 \
+  TERRAFORM_STATE_BUCKET=commonquant-e2b-tfstate \
+  TF=terraform >"${fixture_dir}/missing-s3.log" 2>&1; then
+  fail 'empty S3 bucket prefix bypassed AWS account authority'
+fi
+grep -q 'S3 bucket prefix is required for target cq' "${fixture_dir}/missing-s3.log" ||
+  fail 'empty S3 prefix rejection was not explicit'
 
 guarded_targets=(
   'Makefile|copy-public-builds: aws-write-account-guard'

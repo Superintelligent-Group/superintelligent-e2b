@@ -16,6 +16,7 @@ else
 	REGISTRY_PREFIX := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core
 endif
 override AWS_WRITE_DESTINATION = $(REGISTRY_PREFIX)
+override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
 
 .PHONY: generate
 generate:

@@ -127,6 +127,9 @@ Now, you should see the right quota options in `All Quotas` and be able to reque
 > Make target unless the operator names the account and the selected AWS profile
 > resolves to that exact account. Account selection also namespaces the saved
 > plan, so a CQ plan cannot later be applied to the SIG rollback account.
+> The guard also binds private-ECR registry account IDs and S3 bucket prefixes
+> to the selected account. Valid credentials cannot be paired with an
+> overridden cross-account destination.
 > The same shared guard is a prerequisite of Packer AMI builds, S3 copies, and
 > package image/binary uploads, including when those package targets are called
 > directly. No AWS-writing Make target relies on ambient credentials alone.
