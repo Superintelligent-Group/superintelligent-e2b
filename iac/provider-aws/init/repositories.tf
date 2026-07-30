@@ -16,6 +16,16 @@ resource "aws_ecr_repository" "db_migrator" {
   force_delete         = var.allow_force_destroy
 }
 
+resource "aws_ecr_repository" "admin_postgres" {
+  name                 = "${var.prefix}core/admin-postgres"
+  image_tag_mutability = "IMMUTABLE"
+  force_delete         = var.allow_force_destroy
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
 resource "aws_ecr_repository" "api" {
   name                 = "${var.prefix}core/api"
   image_tag_mutability = "MUTABLE"

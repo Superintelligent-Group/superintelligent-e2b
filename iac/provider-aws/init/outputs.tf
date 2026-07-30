@@ -64,6 +64,10 @@ output "db_migrator_repository_name" {
   value = aws_ecr_repository.db_migrator.name
 }
 
+output "admin_postgres_repository_name" {
+  value = aws_ecr_repository.admin_postgres.name
+}
+
 // ---
 // Cloudflare
 // ---
