@@ -98,11 +98,17 @@ fi
 grep -q 'use .tfplan.dev.cq' "${fixture_dir}/constant-plan.log" ||
   fail 'target-bound plan authority was not immutable'
 
-dry_run_plan="$(make "${common_args[@]}" -n plan PREFIX=unreviewed-)"
+dry_run_plan="$(
+  make "${common_args[@]}" -n plan \
+    PREFIX=unreviewed- \
+    TF_VAR_FILE_ARG=-var-file=/tmp/unreviewed.tfvars \
+    cq_tf_vars=TF_VAR_prefix=unreviewed- \
+    tf_vars=TF_VAR_prefix=unreviewed-
+)"
 [[ "${dry_run_plan}" == *"-var-file=./dev.cq.tfvars"* ]] ||
   fail 'CQ did not select the canonical dev.cq.tfvars'
-[[ "${dry_run_plan}" != *"TF_VAR_prefix=unreviewed-"* ]] ||
-  fail 'environment-derived TF_VAR_prefix overrode reviewed CQ tfvars'
+[[ "${dry_run_plan}" != *"unreviewed"* ]] ||
+  fail 'caller-defined recipe fragments overrode reviewed CQ configuration'
 
 dry_run_apply="$(make "${common_args[@]}" -n apply)"
 [[ "${dry_run_apply}" == *".tfplan.dev.cq"* ]] ||

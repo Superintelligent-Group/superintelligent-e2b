@@ -31,7 +31,7 @@ TF_VAR_FILE ?= $(DEFAULT_SIG_TF_VAR_FILE)
 endif
 override EXPECTED_TF_PLAN_FILE := $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),.tfplan.dev.cq,.tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET})
 override TF_PLAN_FILE := $(EXPECTED_TF_PLAN_FILE)
-TF_VAR_FILE_ARG := $(if $(wildcard $(TF_VAR_FILE)),-var-file=$(TF_VAR_FILE))
+override TF_VAR_FILE_ARG := $(if $(wildcard $(TF_VAR_FILE)),-var-file=$(TF_VAR_FILE))
 TERRAFORM_STATE_BUCKET ?= $(if $(EXPECTED_TF_STATE_BUCKET),$(EXPECTED_TF_STATE_BUCKET),$(AWS_ACCOUNT_ID)-terraform-state)
 TEMPLATE_BUCKET_LOCATION ?= $(AWS_REGION)
 
@@ -82,8 +82,8 @@ legacy_tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION) \
 # AWS client selection explicit, but do not synthesize higher-precedence
 # TF_VAR_* values from .env.dev. Direct ambient TF_VAR_* values are rejected by
 # aws-account-guard below.
-cq_tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION)
-tf_vars = $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),$(cq_tf_vars),$(legacy_tf_vars))
+override cq_tf_vars := AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(AWS_REGION)
+override tf_vars = $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),$(cq_tf_vars),$(legacy_tf_vars))
 CQ_TF_VAR_OVERRIDES := $(filter-out TF_VAR_FILE TF_VAR_FILE_ARG,$(filter TF_VAR_%,$(.VARIABLES)))
 CQ_TF_CLI_ARG_OVERRIDES := $(filter TF_CLI_ARGS%,$(.VARIABLES))
 
