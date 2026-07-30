@@ -21,17 +21,22 @@ override EXPECTED_AWS_REGION := $(AWS_REGION_$(SIG_AWS_ACCOUNT_TARGET))
 override EXPECTED_TF_STATE_BUCKET := $(TF_STATE_BUCKET_$(SIG_AWS_ACCOUNT_TARGET))
 override CANONICAL_CQ_ENV := dev
 override CANONICAL_CQ_TF_VAR_FILE := ./dev.cq.tfvars
+override CANONICAL_SIG_TF_VAR_FILE := ./dev.sig.tfvars.reference
 REQUESTED_TF_VAR_FILE := $(TF_VAR_FILE)
 REQUESTED_TF_PLAN_FILE := $(TF_PLAN_FILE)
-DEFAULT_SIG_TF_VAR_FILE := ./.terraform.${ENV}.tfvars
 ifeq ($(SIG_AWS_ACCOUNT_TARGET),cq)
 override TF_VAR_FILE := $(CANONICAL_CQ_TF_VAR_FILE)
+else ifeq ($(SIG_AWS_ACCOUNT_TARGET),sig)
+override TF_VAR_FILE := $(CANONICAL_SIG_TF_VAR_FILE)
 else
-TF_VAR_FILE ?= $(DEFAULT_SIG_TF_VAR_FILE)
+TF_VAR_FILE ?=
 endif
 override EXPECTED_TF_PLAN_FILE := $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),.tfplan.dev.cq,.tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET})
 override TF_PLAN_FILE := $(EXPECTED_TF_PLAN_FILE)
 override TF_VAR_FILE_ARG := $(if $(wildcard $(TF_VAR_FILE)),-var-file=$(TF_VAR_FILE))
+# Terraform loads these names without a CLI argument. Rejecting them is the
+# only way the reviewed explicit file can remain the complete configuration.
+override IMPLICIT_TF_VAR_FILES := $(sort $(wildcard terraform.tfvars terraform.tfvars.json *.auto.tfvars *.auto.tfvars.json))
 TERRAFORM_STATE_BUCKET ?= $(if $(EXPECTED_TF_STATE_BUCKET),$(EXPECTED_TF_STATE_BUCKET),$(AWS_ACCOUNT_ID)-terraform-state)
 TEMPLATE_BUCKET_LOCATION ?= $(AWS_REGION)
 
@@ -127,6 +132,18 @@ aws-account-guard:
 	fi
 	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ "$(TF_VAR_FILE)" != "$(CANONICAL_CQ_TF_VAR_FILE)" ]; then \
 		printf "CQ requires canonical Terraform variables from %s, got %s.\n" "$(CANONICAL_CQ_TF_VAR_FILE)" "$(TF_VAR_FILE)" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "sig" ] && [ -z "$(REQUESTED_TF_VAR_FILE)" ]; then \
+		printf "SIG rollback requires explicit TF_VAR_FILE=%s.\n" "$(CANONICAL_SIG_TF_VAR_FILE)" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "sig" ] && [ "$(REQUESTED_TF_VAR_FILE)" != "$(CANONICAL_SIG_TF_VAR_FILE)" ]; then \
+		printf "SIG rollback requires the reviewed variable file %s.\n" "$(CANONICAL_SIG_TF_VAR_FILE)" >&2; \
+		exit 1; \
+	fi
+	@if [ -n "$(IMPLICIT_TF_VAR_FILES)" ]; then \
+		printf "Terraform implicit variable files are forbidden; remove: %s\n" "$(IMPLICIT_TF_VAR_FILES)" >&2; \
 		exit 1; \
 	fi
 	@if [ -n "$(REQUESTED_TF_PLAN_FILE)" ] && [ "$(REQUESTED_TF_PLAN_FILE)" != "$(EXPECTED_TF_PLAN_FILE)" ]; then \

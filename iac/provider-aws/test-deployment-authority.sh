@@ -4,7 +4,18 @@ set -euo pipefail
 
 provider_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fixture_dir="$(mktemp -d)"
-trap 'rm -rf "${fixture_dir}"' EXIT
+implicit_tfvars="${provider_dir}/deployment-authority-test.auto.tfvars"
+
+cleanup() {
+  rm -f -- "${implicit_tfvars}"
+  rm -rf -- "${fixture_dir}"
+}
+trap cleanup EXIT
+
+[[ ! -e "${implicit_tfvars}" ]] || {
+  printf 'deployment authority test fixture already exists: %s\n' "${implicit_tfvars}" >&2
+  exit 1
+}
 
 mkdir -p "${fixture_dir}/bin"
 
@@ -12,8 +23,16 @@ cat >"${fixture_dir}/bin/aws" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$*" == *"sts get-caller-identity"* ]]; then
-  printf '%s\n' '014155356804'
-  exit 0
+  case "${AWS_PROFILE:-}" in
+    test-cq)
+      printf '%s\n' '014155356804'
+      exit 0
+      ;;
+    test-sig)
+      printf '%s\n' '319933937176'
+      exit 0
+      ;;
+  esac
 fi
 printf 'unexpected fake aws invocation: %s\n' "$*" >&2
 exit 1
@@ -135,6 +154,14 @@ done
 grep -q '^bucket_prefix = "e2b-014155356804-"[[:space:]]*$' "${provider_dir}/dev.cq.tfvars" ||
   fail 'canonical CQ tfvars omitted the required bucket_prefix'
 
+: >"${implicit_tfvars}"
+if make "${common_args[@]}" aws-account-guard >"${fixture_dir}/implicit-tfvars.log" 2>&1; then
+  fail 'Terraform implicit variable file was accepted'
+fi
+grep -q 'Terraform implicit variable files are forbidden' "${fixture_dir}/implicit-tfvars.log" ||
+  fail 'implicit Terraform variable-file rejection was not explicit'
+rm -f -- "${implicit_tfvars}"
+
 make "${common_args[@]}" aws-account-guard
 
 sig_args=(
@@ -150,6 +177,21 @@ sig_args=(
   TF_VAR_FILE=./dev.sig.tfvars.reference
 )
 
+sig_args_without_var_file=("${sig_args[@]:0:${#sig_args[@]}-1}")
+if make "${sig_args_without_var_file[@]}" aws-account-guard >"${fixture_dir}/sig-var-required.log" 2>&1; then
+  fail 'SIG rollback accepted an implicit variable-file selection'
+fi
+grep -q 'SIG rollback requires explicit TF_VAR_FILE=./dev.sig.tfvars.reference' \
+  "${fixture_dir}/sig-var-required.log" ||
+  fail 'SIG explicit rollback-file rejection was not explicit'
+
+if make "${sig_args[@]}" aws-account-guard TF_VAR_FILE=./dev.cq.tfvars >"${fixture_dir}/sig-var-file.log" 2>&1; then
+  fail 'SIG rollback accepted a noncanonical variable file'
+fi
+grep -q 'SIG rollback requires the reviewed variable file ./dev.sig.tfvars.reference' \
+  "${fixture_dir}/sig-var-file.log" ||
+  fail 'SIG reviewed rollback-file rejection was not explicit'
+
 if make "${sig_args[@]}" aws-account-guard AWS_REGION=us-west-2 >"${fixture_dir}/sig-region.log" 2>&1; then
   fail 'noncanonical SIG rollback region was accepted'
 fi
@@ -161,6 +203,12 @@ if make "${sig_args[@]}" aws-account-guard TERRAFORM_STATE_BUCKET=unreviewed-sta
 fi
 grep -q 'does not match target sig (superintelligent-group-terraform-state)' "${fixture_dir}/sig-state.log" ||
   fail 'SIG rollback state-bucket rejection was not explicit'
+
+grep -q '^bucket_prefix = "e2b-319933937176-"[[:space:]]*$' \
+  "${provider_dir}/dev.sig.tfvars.reference" ||
+  fail 'canonical SIG rollback tfvars omitted the account-bound bucket_prefix'
+
+make "${sig_args[@]}" aws-account-guard
 
 if grep -Fq '$(file <' "${provider_dir}/Makefile"; then
   fail 'Makefile still requires GNU Make 4 file-read syntax'
