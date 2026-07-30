@@ -122,6 +122,30 @@ Now, you should see the right quota options in `All Quotas` and be able to reque
     - `DOMAIN_NAME` - your domain managed by Cloudflare
     - `TERRAFORM_ENVIRONMENT` - one of `prod`, `staging`, `dev`
 2. Run `make set-env ENV={prod,staging,dev}` to start using your env
+
+> **SIG account authority.** This fork fails closed before every AWS/Terraform
+> Make target unless the operator names the account and the selected AWS profile
+> resolves to that exact account. Account selection also namespaces the saved
+> plan, so a CQ plan cannot later be applied to the SIG rollback account.
+>
+> For the canonical CQ deployment:
+>
+> ```sh
+> export SIG_AWS_ACCOUNT_TARGET=cq
+> export AWS_PROFILE=commonquant-boot
+> make plan
+> # Review iac/provider-aws/.tfplan.dev.cq, then:
+> make apply
+> ```
+>
+> `SIG_AWS_ACCOUNT_TARGET=cq` automatically selects the tracked
+> `iac/provider-aws/dev.cq.tfvars`; values in `.env.dev` are bootstrap inputs,
+> not permission to replace that reviewed configuration. The `sig` target is
+> frozen rollback infrastructure and deliberately has no active default tfvars
+> file. An intentional SIG operation must provide an explicitly reviewed
+> `TF_VAR_FILE`, matching `AWS_ACCOUNT_ID`, region, state bucket, and SIG credentials.
+> Omitting the target, using ambient credentials, selecting an unknown target,
+> or presenting a mismatched caller account stops before Terraform runs.
 3. Run `make provider-login` to authenticate with AWS ECR
 4. Run `make init`. This creates:
     - S3 bucket for Terraform state
