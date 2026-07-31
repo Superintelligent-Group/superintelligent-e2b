@@ -1,8 +1,17 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
+
+include ../../scripts/aws-account-authority.mk
 
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
+override AWS_WRITE_S3_PREFIX = $(AWS_BUCKET_PREFIX)
+override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX
+override AWS_WRITE_S3_DESTINATION_REQUIRED := true
+unexport AWS_BUCKET_PREFIX
 
 HOSTNAME := $(shell hostname 2> /dev/null || hostnamectl hostname 2> /dev/null)
 $(if $(HOSTNAME),,$(error Failed to determine hostname: both 'hostname' and 'hostnamectl' failed))
@@ -88,7 +97,7 @@ run-local:
 	NODE_ID=$(HOSTNAME) ./bin/orchestrator
 
 .PHONY: upload/clean-nfs-cache
-upload/clean-nfs-cache:
+upload/clean-nfs-cache: aws-write-account-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	chmod +x ./bin/clean-nfs-cache
 ifeq ($(PROVIDER),aws)
@@ -100,7 +109,7 @@ else
 endif
 
 .PHONY: upload/orchestrator
-upload/orchestrator:
+upload/orchestrator: aws-write-account-guard
 	chmod +x ./bin/orchestrator
 ifeq ($(PROVIDER),aws)
 	aws s3 cp ./bin/orchestrator "s3://${AWS_BUCKET_PREFIX}fc-env-pipeline/orchestrator" --profile ${AWS_PROFILE} --cache-control "no-cache, max-age=0"
@@ -109,7 +118,7 @@ else
 endif
 
 .PHONY: upload/template-manager
-upload/template-manager:
+upload/template-manager: aws-write-account-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	chmod +x ./bin/orchestrator
 ifeq ($(PROVIDER),aws)

@@ -38,6 +38,7 @@ API_SPOT_INSTANCE_TYPES = json.loads(os.environ.get("API_SPOT_INSTANCE_TYPES", "
 NOMAD_TOKEN_SECRET = os.environ.get("NOMAD_TOKEN_SECRET_ID", "")
 CONSUL_TOKEN_SECRET = os.environ.get("CONSUL_TOKEN_SECRET_ID", "")
 NOMAD_ADDR = os.environ.get("NOMAD_ADDR", "")
+E2B_API_KEY_SECRET = os.environ.get("E2B_API_KEY_SECRET_ID", "e2b-dev/e2b-api-key")
 
 ACTIVITY_METRIC_NAMESPACE = "E2B/AutoScaling"
 ACTIVITY_METRIC_NAME = "LastActivityTimestamp"
@@ -232,278 +233,6 @@ def _wait_for_nomad_nodes(expected_pools, timeout_seconds=120):
     return False
 
 
-def _find_postgres_ip(timeout_seconds=120):
-    """Wait for the postgres job to have a running allocation and return its node IP."""
-    start = time.time()
-    while time.time() - start < timeout_seconds:
-        allocs = _nomad_request("GET", "/v1/job/postgres/allocations")
-        if allocs:
-            running = [a for a in allocs if a.get("ClientStatus") == "running"]
-            if running:
-                node_id = running[0]["NodeID"]
-                node = _nomad_request("GET", f"/v1/node/{node_id}")
-                if node:
-                    ip = node.get("Attributes", {}).get("unique.network.ip-address")
-                    if ip:
-                        print(f"Postgres running on node {node_id[:8]} at {ip}")
-                        return ip
-        time.sleep(10)
-    print("WARN: Timed out waiting for postgres to be running")
-    return None
-
-
-E2B_API_KEY_SECRET = os.environ.get("E2B_API_KEY_SECRET_ID", "e2b-dev/e2b-api-key")
-SEED_TEAM_ID = "a0000000-0000-0000-0000-000000000001"
-SEED_BUILD_ID = "04dba22b-6819-4c42-8b61-57a636181ce9"
-
-
-def _run_seed_sql(pg_ip, job_name, sql, timeout_seconds=90):
-    """Submit a Nomad batch job to run SQL against postgres. Returns True on success."""
-    consul_token = _get_secret(CONSUL_TOKEN_SECRET)
-    try:
-        _nomad_request("DELETE", f"/v1/job/{job_name}?purge=true")
-    except Exception:
-        pass
-
-    job_spec = {
-        "Job": {
-            "ID": job_name,
-            "Name": job_name,
-            "Type": "batch",
-            "Datacenters": ["us-east-1c"],
-            "NodePool": "api",
-            "ConsulToken": consul_token,
-            "TaskGroups": [{
-                "Name": "q",
-                "Count": 1,
-                "Tasks": [{
-                    "Name": "q",
-                    "Driver": "docker",
-                    "Config": {
-                        "image": "postgres:15-alpine",
-                        "command": "psql",
-                        "args": ["-h", pg_ip, "-p", "5432", "-U", "postgres",
-                                 "-d", "e2b", "-c", sql],
-                    },
-                    "Env": {"PGPASSWORD": "e2b-postgres-pw"},
-                    "Resources": {"CPU": 100, "MemoryMB": 128},
-                }],
-            }],
-        }
-    }
-
-    result = _nomad_request("POST", "/v1/jobs", job_spec)
-    if not result or "EvalID" not in result:
-        print(f"  WARN: Failed to submit {job_name}")
-        return False
-
-    start = time.time()
-    while time.time() - start < timeout_seconds:
-        time.sleep(5)
-        allocs = _nomad_request("GET", f"/v1/job/{job_name}/allocations")
-        if allocs:
-            status = allocs[0].get("ClientStatus")
-            if status == "complete":
-                return True
-            elif status == "failed":
-                return False
-    return False
-
-
-def _check_db_seeded(pg_ip):
-    """Check if the database already has seed data. Returns True if seeded."""
-    # Run a quick query to check if the team exists
-    ok = _run_seed_sql(
-        pg_ip, "db-check",
-        f"SELECT 1 FROM teams WHERE id = '{SEED_TEAM_ID}';",
-        timeout_seconds=60,
-    )
-    # Cleanup
-    try:
-        _nomad_request("DELETE", "/v1/job/db-check?purge=true")
-    except Exception:
-        pass
-    return ok
-
-
-def _seed_database(pg_ip):
-    """Seed the E2B database with team, API key, tier, and base template.
-
-    All statements are idempotent (ON CONFLICT DO NOTHING/UPDATE).
-    Postgres data persists on EBS across scale-to-zero cycles, so this
-    typically only runs once after initial deploy. The check-before-seed
-    pattern skips the full seed if data already exists (~60s faster).
-    """
-    # Fast path: check if DB already has seed data
-    if _check_db_seeded(pg_ip):
-        print("DB already seeded — skipping")
-        return True
-
-    import hashlib
-    import base64
-
-    print("DB empty — running full seed...")
-
-    e2b_key = _get_secret(E2B_API_KEY_SECRET)
-    if not e2b_key or not e2b_key.startswith("e2b_"):
-        print("WARN: E2B API key not found or invalid, skipping DB seed")
-        return False
-
-    # Compute API key hash: hex-decode key value (after prefix), SHA-256 raw bytes, base64 no padding
-    key_bytes = bytes.fromhex(e2b_key[4:])
-    h = hashlib.sha256(key_bytes).digest()
-    api_key_hash = "$sha256$" + base64.b64encode(h).decode().rstrip("=")
-
-    print(f"Seeding DB: key={e2b_key[:12]}... team={SEED_TEAM_ID[:8]}...")
-
-    seed_steps = [
-        ("db-seed-1", (
-            f"INSERT INTO tiers (id, name, concurrent_instances, max_length_hours, concurrent_template_builds) "
-            f"VALUES ('base_v1', 'Base tier', 100, 24, 20) ON CONFLICT (id) DO NOTHING; "
-            f"INSERT INTO teams (id, name, tier, email, created_at) VALUES "
-            f"('{SEED_TEAM_ID}', 'Default Team', 'base_v1', 'dev@superintelligent.group', NOW()) "
-            f"ON CONFLICT (id) DO NOTHING;"
-        )),
-        ("db-seed-2", (
-            f"INSERT INTO team_api_keys (api_key_hash, team_id, api_key_prefix, api_key_length, "
-            f"api_key_mask_prefix, api_key_mask_suffix, name, created_at) VALUES "
-            f"('{api_key_hash}', '{SEED_TEAM_ID}', '{e2b_key[:8]}', {len(e2b_key)}, "
-            f"'e2b_5', '{e2b_key[-4:]}', 'Default Key', NOW()) "
-            f"ON CONFLICT (api_key_hash) DO NOTHING;"
-        )),
-        ("db-seed-3", (
-            f"INSERT INTO envs (id, created_at, updated_at, public, team_id) "
-            f"VALUES ('base', NOW(), NOW(), true, '{SEED_TEAM_ID}') "
-            f"ON CONFLICT (id) DO UPDATE SET updated_at = NOW();"
-        )),
-        ("db-seed-4", (
-            f"INSERT INTO env_builds (id, created_at, updated_at, finished_at, status, dockerfile, "
-            f"start_cmd, vcpu, ram_mb, free_disk_size_mb, total_disk_size_mb, kernel_version, "
-            f"firecracker_version, envd_version, env_id) VALUES ('{SEED_BUILD_ID}', NOW(), NOW(), NOW(), 'uploaded', "
-            f"'FROM e2bdev/base', '', 2, 512, 512, 1024, 'vmlinux-6.1.158', "
-            f"'v1.12.1_a41d3fb', 'v0.1.1', 'base') ON CONFLICT (id) DO UPDATE SET envd_version = 'v0.1.1';"
-        )),
-        ("db-seed-5", (
-            f"INSERT INTO env_aliases (alias, is_renamable, env_id) "
-            f"VALUES ('base', true, 'base') ON CONFLICT DO NOTHING;"
-        )),
-        ("db-seed-6", (
-            f"INSERT INTO env_build_assignments (env_id, build_id, tag) "
-            f"VALUES ('base', '{SEED_BUILD_ID}', 'default') ON CONFLICT DO NOTHING;"
-        )),
-    ]
-
-    all_ok = True
-    for job_name, sql in seed_steps:
-        ok = _run_seed_sql(pg_ip, job_name, sql)
-        step_label = job_name.replace("db-seed-", "step ")
-        if ok:
-            print(f"  Seed {step_label}: OK")
-        else:
-            print(f"  Seed {step_label}: FAILED")
-            all_ok = False
-            break  # Later steps depend on earlier ones
-
-    # Cleanup batch jobs
-    for job_name, _ in seed_steps:
-        try:
-            _nomad_request("DELETE", f"/v1/job/{job_name}?purge=true")
-        except Exception:
-            pass
-
-    if all_ok:
-        print("DB seed complete")
-    return all_ok
-
-
-def _fix_api_connection_strings(postgres_ip):
-    """Update the API job's connection strings to point to the current postgres IP.
-
-    Spot instances get new IPs on every scale-up, so hardcoded connection
-    strings in the API job become stale after each scale-to-zero cycle.
-    """
-    consul_token = _get_secret(CONSUL_TOKEN_SECRET)
-    job = _nomad_request("GET", "/v1/job/api")
-    if not job:
-        print("WARN: Could not fetch API job")
-        return False
-
-    new_connstr = f"postgresql://postgres:e2b-postgres-pw@{postgres_ip}:5432/e2b?sslmode=disable"
-    changed = False
-
-    for tg in job.get("TaskGroups", []):
-        for task in tg.get("Tasks", []):
-            env = task.get("Env") or {}
-            for key in list(env.keys()):
-                if "CONNECTION_STRING" in key and "postgresql://" in str(env.get(key, "")):
-                    if env[key] != new_connstr:
-                        print(f"  Fixing {task['Name']}.{key}: ...@{postgres_ip}:5432")
-                        env[key] = new_connstr
-                        changed = True
-
-    if not changed:
-        print("API connection strings already correct")
-        return True
-
-    # Strip read-only fields and resubmit
-    for key in [
-        "Status", "StatusDescription", "Stable", "SubmitTime",
-        "Version", "CreateIndex", "ModifyIndex", "JobModifyIndex",
-    ]:
-        job.pop(key, None)
-
-    if consul_token:
-        job["ConsulToken"] = consul_token
-
-    result = _nomad_request("POST", "/v1/jobs", {"Job": job})
-    if result and "EvalID" in result:
-        print(f"Resubmitted API job with fixed connection strings → eval {result['EvalID'][:8]}")
-        return True
-    else:
-        print(f"WARN: Failed to resubmit API job: {result}")
-        return False
-
-
-def _fix_job_redis_urls(api_node_ip):
-    """Update REDIS_URL in jobs that hardcode the Redis IP or use Consul DNS.
-
-    Redis runs on the API node. Consul DNS (redis.service.consul) doesn't
-    resolve on client nodes because systemd-resolved isn't configured to
-    forward .consul domains. So we replace both stale IPs and Consul DNS
-    with the current API node IP.
-    """
-    consul_token = _get_secret(CONSUL_TOKEN_SECRET)
-    new_redis_url = f"{api_node_ip}:6379"
-
-    for job_name in ["orchestrator-dev", "api"]:
-        job = _nomad_request("GET", f"/v1/job/{job_name}")
-        if not job:
-            continue
-
-        changed = False
-        for tg in job.get("TaskGroups", []):
-            for task in tg.get("Tasks", []):
-                env = task.get("Env") or {}
-                if "REDIS_URL" in env and env["REDIS_URL"] != new_redis_url:
-                    print(f"  Fixing {job_name}/{task['Name']}.REDIS_URL: {env['REDIS_URL']} -> {new_redis_url}")
-                    env["REDIS_URL"] = new_redis_url
-                    changed = True
-
-        if changed:
-            for key in [
-                "Status", "StatusDescription", "Stable", "SubmitTime",
-                "Version", "CreateIndex", "ModifyIndex", "JobModifyIndex",
-            ]:
-                job.pop(key, None)
-            if consul_token:
-                job["ConsulToken"] = consul_token
-            result = _nomad_request("POST", "/v1/jobs", {"Job": job})
-            if result and "EvalID" in result:
-                print(f"  Resubmitted {job_name} with fixed REDIS_URL -> eval {result['EvalID'][:8]}")
-            else:
-                print(f"  WARN: Failed to resubmit {job_name}: {result}")
-
-
 def _resubmit_nomad_jobs():
     """Resubmit all Nomad jobs so dead/pending ones reschedule on new nodes.
 
@@ -522,7 +251,7 @@ def _resubmit_nomad_jobs():
         name = job_summary["Name"]
         status = job_summary["Status"]
 
-        # Skip the API job — it's handled separately by _fix_api_connection_strings
+        # Skip the API job: it does not need periodic resubmission in wake flow
         if name == "api":
             continue
 
@@ -549,7 +278,7 @@ def _resubmit_nomad_jobs():
         result = _nomad_request("POST", "/v1/jobs", {"Job": job})
         if result and "EvalID" in result:
             resubmitted.append(name)
-            print(f"Resubmitted job '{name}' (was {status}) → eval {result['EvalID'][:8]}")
+            print(f"Resubmitted job '{name}' (was {status}) -> eval {result['EvalID'][:8]}")
         else:
             print(f"WARN: Failed to resubmit job '{name}': {result}")
 
@@ -579,11 +308,10 @@ def _verify_api_health():
 
 
 def wake_handler(event, context):
-    """Scale up the cluster. Called by swarm worker before sandbox creation.
+    """Scale up the cluster for sandbox startup.
 
-    This handler is fully autonomous: it scales infrastructure, fixes stale
-    IPs from spot instance rotation, seeds the volatile database, and
-    verifies end-to-end API health — all without manual intervention.
+    This handler scales the relevant ASGs, waits for readiness and Nomad node
+    registration, resubmits dead/pending Nomad jobs, and verifies API health.
     """
 
     # Record activity FIRST — prevents the shutdown handler from racing us
@@ -594,14 +322,14 @@ def wake_handler(event, context):
     already_up = _is_asg_up(API_ASG) and _is_asg_up(CLIENT_ASG)
     if already_up:
         # ASGs are up, but is the API actually healthy?
-        # (postgres may have restarted, losing all data)
+        # (if API is unhealthy, continue with wake flow and final API check)
         if _verify_api_health():
             return {
                 "statusCode": 200,
                 "body": json.dumps({"status": "already_running"}),
             }
-        # API unhealthy — fall through to fix IPs and re-seed DB
-        print("ASGs up but API unhealthy — running fixup and re-seed")
+        # API unhealthy — continue with wake flow and final API verification
+        print("ASGs up but API unhealthy — continuing wake flow")
 
     if not already_up:
         print("Cluster not running — starting scale-up")
@@ -639,22 +367,6 @@ def wake_handler(event, context):
         _resubmit_nomad_jobs()
     else:
         client_ready = True
-
-    # Wait for postgres to be running, then fix jobs with stale IPs.
-    # Spot instances get new IPs each scale-up, so hardcoded connection
-    # strings and Redis URLs become stale after every scale-to-zero cycle.
-    # Both postgres and Redis run on the API node, so same IP for both.
-    pg_ip = _find_postgres_ip(timeout_seconds=180)
-    if pg_ip:
-        _fix_api_connection_strings(pg_ip)
-        _fix_job_redis_urls(pg_ip)
-
-        # Seed the database if needed. Postgres data persists on EBS across
-        # scale-to-zero cycles, so this check is fast (exits early if seeded).
-        # Only runs the full seed on first deploy or after volume wipe.
-        seed_ok = _seed_database(pg_ip)
-        if not seed_ok:
-            print("WARN: DB seed failed — API may not authenticate")
 
     # Wait a moment for API to pick up new DB state, then verify health
     time.sleep(5)

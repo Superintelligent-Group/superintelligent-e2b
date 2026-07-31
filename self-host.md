@@ -122,6 +122,38 @@ Now, you should see the right quota options in `All Quotas` and be able to reque
     - `DOMAIN_NAME` - your domain managed by Cloudflare
     - `TERRAFORM_ENVIRONMENT` - one of `prod`, `staging`, `dev`
 2. Run `make set-env ENV={prod,staging,dev}` to start using your env
+
+> **SIG account authority.** This fork fails closed before every AWS/Terraform
+> Make target unless the operator names the account and the selected AWS profile
+> resolves to that exact account. Account selection also namespaces the saved
+> plan, so a CQ plan cannot later be applied to the SIG rollback account.
+> The guard also binds private-ECR registry account IDs and S3 bucket prefixes
+> to the selected account. Valid credentials cannot be paired with an
+> overridden cross-account destination.
+> The same shared guard is a prerequisite of Packer AMI builds, S3 copies, and
+> package image/binary uploads, including when those package targets are called
+> directly. No AWS-writing Make target relies on ambient credentials alone.
+>
+> For the canonical CQ deployment:
+>
+> ```sh
+> export SIG_AWS_ACCOUNT_TARGET=cq
+> export AWS_PROFILE=commonquant-boot
+> make plan
+> # Review iac/provider-aws/.tfplan.dev.cq, then:
+> make apply
+> ```
+>
+> `SIG_AWS_ACCOUNT_TARGET=cq` automatically selects the tracked
+> `iac/provider-aws/dev.cq.tfvars`; values in `.env.dev` are bootstrap inputs,
+> not permission to replace that reviewed configuration. For CQ, `TF_VAR_FILE`,
+> `TF_PLAN_FILE`, and ambient `TF_VAR_*` values cannot override the reviewed
+> file or the target-bound plan path. The `sig` target is
+> frozen rollback infrastructure. An intentional SIG operation must explicitly
+> select the tracked `iac/provider-aws/dev.sig.tfvars.reference`, matching
+> `AWS_ACCOUNT_ID`, region, state bucket, and SIG credentials.
+> Omitting the target, using ambient credentials, selecting an unknown target,
+> or presenting a mismatched caller account stops before Terraform runs.
 3. Run `make provider-login` to authenticate with AWS ECR
 4. Run `make init`. This creates:
     - S3 bucket for Terraform state

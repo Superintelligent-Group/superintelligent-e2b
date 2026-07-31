@@ -5,6 +5,7 @@
 aws_region = "us-east-1"
 prefix     = "e2b"
 environment = "dev"
+bucket_prefix = "e2b-319933937176-"
 
 # -----------------------------------------------------------------------------
 # Networking

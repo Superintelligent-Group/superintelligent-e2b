@@ -1,5 +1,10 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
+
+include ../../scripts/aws-account-authority.mk
 
 # Always a fixed 7-char prefix so versioned upload names match `promote`,
 # which truncates ENVD_COMMIT_SHA to 7 chars (`git rev-parse --short` can
@@ -10,6 +15,10 @@ PROD_LDFLAGS=-ldflags "-X=main.commitSHA=$(BUILD) -s -w -buildid="
 
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
+override AWS_WRITE_S3_PREFIX = $(AWS_BUCKET_PREFIX)
+override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX
+override AWS_WRITE_S3_DESTINATION_REQUIRED := true
+unexport AWS_BUCKET_PREFIX
 ENVD_UPLOAD_MODE ?= latest
 
 # Architecture for builds. Defaults to amd64; override for ARM64 builds.
@@ -23,7 +32,7 @@ BUILD_PLATFORM ?= linux/$(BUILD_ARCH)
 init:
 	brew install protobuf
 
-upload:
+upload: aws-write-account-guard
 	chmod +x bin/envd
 ifeq ($(PROVIDER),aws)
 ifeq ($(ENVD_UPLOAD_MODE),versioned)
@@ -40,7 +49,7 @@ endif
 endif
 
 .PHONY: promote
-promote:
+promote: aws-write-account-guard
 	$(if $(ENVD_COMMIT_SHA),,$(error ENVD_COMMIT_SHA is required))
 	$(eval ENVD_COMMIT_SHA_SHORT := $(shell printf '%.7s' "$(ENVD_COMMIT_SHA)"))
 ifeq ($(PROVIDER),aws)

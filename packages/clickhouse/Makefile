@@ -1,6 +1,11 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
 PREFIX := $(strip $(subst ",,$(PREFIX)))
+
+include ../../scripts/aws-account-authority.mk
 
 CLICKHOUSE_HOST ?= clickhouse
 
@@ -9,6 +14,10 @@ ifeq ($(PROVIDER),aws)
 else
 	CLICKHOUSE_MIGRATOR_IMAGE ?= $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/clickhouse-migrator
 endif
+override AWS_WRITE_DESTINATION = $(CLICKHOUSE_MIGRATOR_IMAGE)
+override AWS_WRITE_DESTINATION_SOURCE := CLICKHOUSE_MIGRATOR_IMAGE
+override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
+unexport CLICKHOUSE_MIGRATOR_IMAGE
 
 # E2B-hosted registry that holds released, prebuilt clickhouse-migrator images.
 # Published to by the release-please workflow on tagging a release.
@@ -50,11 +59,12 @@ migrate-local:
 	@echo "Done"
 
 .PHONY: build
-build:
+build: aws-write-input-origin-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	@docker build --platform linux/amd64 --tag "$(CLICKHOUSE_MIGRATOR_IMAGE)" --tag "$(CLICKHOUSE_MIGRATOR_IMAGE):$(COMMIT_SHA)" .
 
 .PHONY: build-and-upload
+build-and-upload: aws-write-account-guard
 ifeq ($(strip $(CLICKHOUSE_MIGRATOR_VERSION)),)
 # Existing flow: build from source and push to the client's own core repo.
 build-and-upload:build

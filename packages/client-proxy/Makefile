@@ -1,5 +1,10 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
+
+include ../../scripts/aws-account-authority.mk
 
 LOCAL_BUILD_TARGET ?= build-debug
 PREFIX := $(strip $(subst ",,$(PREFIX)))
@@ -18,6 +23,10 @@ ifeq ($(PROVIDER),aws)
 else
 	IMAGE_REGISTRY := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/client-proxy
 endif
+override AWS_WRITE_DESTINATION = $(IMAGE_REGISTRY)
+override AWS_WRITE_DESTINATION_SOURCE := IMAGE_REGISTRY
+override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
+unexport IMAGE_REGISTRY
 
 # E2B-hosted registry that holds released, prebuilt client-proxy images.
 # Published to by the release-please workflow on tagging a release.
@@ -48,7 +57,7 @@ build-debug:
 	CGO_ENABLED=1 go build -race -gcflags=all="-N -l" -o bin/client-proxy -ldflags "-X=main.commitSHA=$(COMMIT_SHA)" .
 
 .PHONY: build-and-upload
-build-and-upload:
+build-and-upload: aws-write-account-guard
 ifeq ($(strip $(CLIENT_PROXY_VERSION)),)
 	# Existing flow: build from source and push to the client's own core repo.
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
