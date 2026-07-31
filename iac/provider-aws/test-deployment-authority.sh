@@ -121,6 +121,20 @@ grep -q 'AWS authority input TF_PLAN_FILE contains GNU Make expansion syntax' \
 [[ ! -e "${plan_make_function_marker}" ]] ||
   fail 'TF_PLAN_FILE executed a GNU Make function before the account guard'
 
+plan_shell_marker="${fixture_dir}/plan-shell-injection-ran"
+plan_shell_value='x" ]; then touch '"${plan_shell_marker}"'; exit 1; fi; #'
+if make "${common_args[@]}" aws-account-guard \
+  "TF_PLAN_FILE=${plan_shell_value}" >"${fixture_dir}/plan-shell-injection.log" 2>&1; then
+  fail 'shell syntax in TF_PLAN_FILE bypassed authority'
+fi
+grep -q 'AWS authority input TF_PLAN_FILE contains shell control syntax' \
+  "${fixture_dir}/plan-shell-injection.log" ||
+  fail 'raw TF_PLAN_FILE shell-syntax rejection was not explicit'
+[[ ! -e "${plan_shell_marker}" ]] ||
+  fail 'TF_PLAN_FILE escaped into the account-guard recipe'
+grep -Fq 'REQUESTED_TF_PLAN_FILE_PRESENT' "${provider_dir}/Makefile" ||
+  fail 'raw TF_PLAN_FILE is still interpolated instead of reduced to a trusted sentinel'
+
 if make "${common_args[@]}" aws-account-guard \
   AWS_ACCOUNT_ID=000000000000 AWS_ACCOUNT_ID_cq=000000000000 EXPECTED_AWS_ACCOUNT_ID=000000000000 \
   >"${fixture_dir}/constant-account.log" 2>&1; then
@@ -263,7 +277,7 @@ if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-a
   TF=terraform >"${fixture_dir}/multiple-ecr.log" 2>&1; then
   fail 'multiple ECR destination words bypassed AWS account authority'
 fi
-grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
+grep -q 'AWS authority input IMAGE_REGISTRY contains shell control syntax' \
   "${fixture_dir}/multiple-ecr.log" ||
   fail 'multiple ECR destination rejection was not explicit'
 
@@ -280,7 +294,7 @@ if make --no-print-directory -C "${repo_root}/packages/client-proxy" aws-write-a
   TF=terraform >"${fixture_dir}/malformed-ecr.log" 2>&1; then
   fail 'malformed ECR destination bypassed AWS account authority'
 fi
-grep -q 'ECR destination source IMAGE_REGISTRY must be Makefile-owned; origin is command line' \
+grep -q 'AWS authority input IMAGE_REGISTRY contains shell control syntax' \
   "${fixture_dir}/malformed-ecr.log" ||
   fail 'malformed ECR destination rejection was not explicit'
 [[ ! -e "${injection_marker}" ]] ||

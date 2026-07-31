@@ -27,8 +27,9 @@ override CANONICAL_CQ_TF_VAR_FILE := ./dev.cq.tfvars
 override CANONICAL_SIG_TF_VAR_FILE := ./dev.sig.tfvars.reference
 override REQUESTED_TF_VAR_FILE_ORIGIN := $(origin TF_VAR_FILE)
 override REQUESTED_TF_PLAN_FILE_ORIGIN := $(origin TF_PLAN_FILE)
-override REQUESTED_TF_VAR_FILE := $(value TF_VAR_FILE)
-override REQUESTED_TF_PLAN_FILE := $(value TF_PLAN_FILE)
+override REQUESTED_TF_VAR_FILE_PRESENT := $(if $(filter undefined,$(REQUESTED_TF_VAR_FILE_ORIGIN)),false,true)
+override REQUESTED_TF_PLAN_FILE_PRESENT := $(if $(filter undefined,$(REQUESTED_TF_PLAN_FILE_ORIGIN)),false,true)
+override REQUESTED_TF_VAR_FILE_IS_CANONICAL_SIG := $(if $(and $(filter 1,$(words $(value TF_VAR_FILE))),$(filter $(CANONICAL_SIG_TF_VAR_FILE),$(value TF_VAR_FILE))),true,false)
 ifeq ($(SIG_AWS_ACCOUNT_TARGET),cq)
 override TF_VAR_FILE := $(CANONICAL_CQ_TF_VAR_FILE)
 else ifeq ($(SIG_AWS_ACCOUNT_TARGET),sig)
@@ -131,7 +132,7 @@ aws-account-guard:
 		printf "CQ target is bound to the reviewed %s environment; got ENV=%s.\n" "$(CANONICAL_CQ_ENV)" "$(ENV)" >&2; \
 		exit 1; \
 	fi
-	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ -n "$(REQUESTED_TF_VAR_FILE)" ] && [ "$(REQUESTED_TF_VAR_FILE)" != "$(CANONICAL_CQ_TF_VAR_FILE)" ]; then \
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "cq" ] && [ "$(REQUESTED_TF_VAR_FILE_PRESENT)" = "true" ]; then \
 		printf "CQ does not accept TF_VAR_FILE overrides; use %s.\n" "$(CANONICAL_CQ_TF_VAR_FILE)" >&2; \
 		exit 1; \
 	fi
@@ -139,11 +140,11 @@ aws-account-guard:
 		printf "CQ requires canonical Terraform variables from %s, got %s.\n" "$(CANONICAL_CQ_TF_VAR_FILE)" "$(TF_VAR_FILE)" >&2; \
 		exit 1; \
 	fi
-	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "sig" ] && [ -z "$(REQUESTED_TF_VAR_FILE)" ]; then \
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "sig" ] && [ "$(REQUESTED_TF_VAR_FILE_PRESENT)" != "true" ]; then \
 		printf "SIG rollback requires explicit TF_VAR_FILE=%s.\n" "$(CANONICAL_SIG_TF_VAR_FILE)" >&2; \
 		exit 1; \
 	fi
-	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "sig" ] && [ "$(REQUESTED_TF_VAR_FILE)" != "$(CANONICAL_SIG_TF_VAR_FILE)" ]; then \
+	@if [ "$(SIG_AWS_ACCOUNT_TARGET)" = "sig" ] && [ "$(REQUESTED_TF_VAR_FILE_IS_CANONICAL_SIG)" != "true" ]; then \
 		printf "SIG rollback requires the reviewed variable file %s.\n" "$(CANONICAL_SIG_TF_VAR_FILE)" >&2; \
 		exit 1; \
 	fi
@@ -151,7 +152,7 @@ aws-account-guard:
 		printf "Terraform implicit variable files are forbidden; remove: %s\n" "$(IMPLICIT_TF_VAR_FILES)" >&2; \
 		exit 1; \
 	fi
-	@if [ -n "$(REQUESTED_TF_PLAN_FILE)" ] && [ "$(REQUESTED_TF_PLAN_FILE)" != "$(EXPECTED_TF_PLAN_FILE)" ]; then \
+	@if [ "$(REQUESTED_TF_PLAN_FILE_PRESENT)" = "true" ]; then \
 		printf "TF_PLAN_FILE is derived from account authority; use %s.\n" "$(EXPECTED_TF_PLAN_FILE)" >&2; \
 		exit 1; \
 	fi
