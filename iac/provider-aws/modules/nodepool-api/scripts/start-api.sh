@@ -150,13 +150,13 @@ mkdir -p /etc/systemd/resolved.conf.d/
 touch /etc/systemd/resolved.conf.d/consul.conf
 cat <<EOF >/etc/systemd/resolved.conf.d/consul.conf
 [Resolve]
-DNS=127.0.0.1:8600
+DNS=127.0.0.1#8600
 DNSSEC=false
 Domains=~consul
 DNSStubListener=yes
 DNSStubListenerExtra=172.17.0.1
 EOF
-systemctl restart systemd-resolved
+
 
 # These variables are passed in via Terraform template interpolation
 /opt/consul/bin/run-consul.sh --client \
@@ -166,6 +166,25 @@ systemctl restart systemd-resolved
     --enable-gossip-encryption \
     --gossip-encryption-key "${CONSUL_GOSSIP_ENCRYPTION_KEY}" \
     --dns-request-token "${CONSUL_DNS_REQUEST_TOKEN}" &
+
+# systemd-resolved must be restarted only after Consul's DNS listener exists.
+# Restarting it before the background Consul process is listening causes the
+# resolver to mark 127.0.0.1:8600 unreachable; API tasks then fail closed on
+# redis.service.consul even though the Consul catalog is healthy.
+echo "Waiting for Consul DNS to start on port 8600..."
+for i in {1..60}; do
+    if (echo >/dev/tcp/127.0.0.1/8600) 2>/dev/null; then
+        echo "Consul DNS is ready (attempt $i/60)"
+        break
+    fi
+    if [ "$i" -eq 60 ]; then
+        echo "ERROR: Consul DNS not responding after 60 seconds, exiting..."
+        exit 1
+    fi
+    sleep 1
+done
+systemctl restart systemd-resolved
+resolvectl flush-caches
 
 /opt/nomad/bin/run-nomad.sh --client --consul-token "${CONSUL_TOKEN}" --node-pool "${NODE_POOL}" &
 

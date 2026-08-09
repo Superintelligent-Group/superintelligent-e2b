@@ -2,6 +2,10 @@ variable "node_pool" {
   type = string
 }
 
+variable "domain_name" {
+  type = string
+}
+
 variable "update_stanza" {
   type = bool
 }

@@ -95,19 +95,18 @@ mkdir -p /etc/systemd/resolved.conf.d/
 touch /etc/systemd/resolved.conf.d/consul.conf
 cat <<EOF >/etc/systemd/resolved.conf.d/consul.conf
 [Resolve]
-DNS=127.0.0.1:8600
+DNS=127.0.0.1#8600
 DNSSEC=false
 Domains=~consul
 EOF
 
-# Expose systemd-resolved’s DNS stub on the Docker bridge so that
-# containers can resolve *.consul names.
+# Expose systemd-resolved DNS stub on the Docker bridge so containers can resolve *.consul names.
 #
 # Context
 # -----------------
-# systemd-resolved already forwards *.consul → 127.0.0.1:8600
+# systemd-resolved forwards *.consul to the local Consul DNS listener.
 # (configured in /etc/systemd/resolved.conf.d/consul.conf).
-# When the host’s /etc/resolv.conf contains only 127.0.0.53,
+# When the host resolv.conf contains only 127.0.0.53,
 # Docker copies /run/systemd/resolve/resolve.conf into every container.
 # 127.0.0.53 is bound only to the host loopback interface,
 # so DNS look-ups fail inside containers on the default bridge network.

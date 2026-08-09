@@ -135,7 +135,7 @@ locals {
     REDIS_POOL_SIZE     = "160"
     REDIS_CLUSTER_URL   = local.redis_cluster_url
     REDIS_TLS_CA_BASE64 = local.redis_tls_ca_base64
-    REDIS_URL           = local.redis_url
+
 
     LAUNCH_DARKLY_API_KEY = module.init.launch_darkly_api_key
     # This is here just because it is required in some part of our code which is transitively imported
@@ -176,20 +176,20 @@ locals {
     REDIS_POOL_SIZE              = "10"
     REDIS_CLUSTER_URL            = local.redis_cluster_url
     REDIS_TLS_CA_BASE64          = local.redis_tls_ca_base64
-    REDIS_URL                    = local.redis_url
-    GIN_MODE                     = "release"
-    CONSUL_TOKEN                 = module.init.cluster.consul_acl_token
-    DOMAIN_NAME                  = var.domain_name
-    SHARED_CHUNK_CACHE_PATH      = ""
-    ORCHESTRATOR_SERVICES        = "orchestrator"
-    PROVIDER                     = "aws"
-    BUILD_CACHE_BUCKET_NAME      = module.init.fc_template_build_cache_bucket_name
-    LAUNCH_DARKLY_API_KEY        = module.init.launch_darkly_api_key
-    ARTIFACTS_REGISTRY_PROVIDER  = "AWS_ECR"
-    STORAGE_PROVIDER             = "AWSBucket"
-    S3_USE_PATH_STYLE            = tostring(var.s3_use_path_style)
-    AWS_REGION                   = data.aws_region.current.id
-    AWS_DOCKER_REPOSITORY_NAME   = module.init.custom_environments_repository_name
+
+    GIN_MODE                    = "release"
+    CONSUL_TOKEN                = module.init.cluster.consul_acl_token
+    DOMAIN_NAME                 = var.domain_name
+    SHARED_CHUNK_CACHE_PATH     = ""
+    ORCHESTRATOR_SERVICES       = "orchestrator"
+    PROVIDER                    = "aws"
+    BUILD_CACHE_BUCKET_NAME     = module.init.fc_template_build_cache_bucket_name
+    LAUNCH_DARKLY_API_KEY       = module.init.launch_darkly_api_key
+    ARTIFACTS_REGISTRY_PROVIDER = "AWS_ECR"
+    STORAGE_PROVIDER            = "AWSBucket"
+    S3_USE_PATH_STYLE           = tostring(var.s3_use_path_style)
+    AWS_REGION                  = data.aws_region.current.id
+    AWS_DOCKER_REPOSITORY_NAME  = module.init.custom_environments_repository_name
   }, var.orchestrator_env_vars)
 
   template_manager_env_vars = merge({
