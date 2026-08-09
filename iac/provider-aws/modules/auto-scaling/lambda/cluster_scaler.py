@@ -13,6 +13,7 @@ EventBridge schedule.
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 import ssl
 import time
@@ -208,14 +209,14 @@ def _nomad_request(method, path, body=None):
 
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=30, context=_tls_ctx) as resp:
+        with urllib.request.urlopen(req, timeout=5, context=_tls_ctx) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
         print(f"WARN: Nomad API {method} {path} failed: {e}")
         return None
 
 
-def _wait_for_nomad_nodes(expected_pools, timeout_seconds=120):
+def _wait_for_nomad_nodes(expected_pools, timeout_seconds=30):
     """Wait for Nomad to register nodes in the expected pools."""
     start = time.time()
     while time.time() - start < timeout_seconds:
@@ -352,16 +353,19 @@ def wake_handler(event, context):
                 print(f"WARN: spot scaling failed for {asg_name}, falling back to on-demand: {e}")
                 _scale_asg(asg_name, 1, max_size=max_sz)
 
-        # Wait for API node to be healthy first (Nomad jobs need it)
-        api_ready = _wait_for_healthy(API_ASG, timeout_seconds=300)
+        # API and client boot independently; wait in parallel so one slow pool
+        # cannot consume the entire readiness budget before the other is checked.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            api_future = pool.submit(_wait_for_healthy, API_ASG, 300)
+            client_future = pool.submit(_wait_for_healthy, CLIENT_ASG, 300)
+            api_ready = api_future.result()
+            client_ready = client_future.result()
         print(f"API node healthy: {api_ready}")
-
-        # Wait for client to be healthy (that's what we need for sandboxes)
-        client_ready = _wait_for_healthy(CLIENT_ASG, timeout_seconds=300)
         print(f"Client node healthy: {client_ready}")
 
-        # Wait for Nomad to register the new nodes
-        _wait_for_nomad_nodes({"api", "default"}, timeout_seconds=120)
+        # Nomad registration is a short bounded readiness check; legacy
+        # Postgres-wait logic is intentionally absent from this path.
+        _wait_for_nomad_nodes({"api", "default"}, timeout_seconds=30)
 
         # Resubmit dead/pending Nomad jobs so they schedule on new nodes
         _resubmit_nomad_jobs()
