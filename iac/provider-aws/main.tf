@@ -135,7 +135,7 @@ locals {
     REDIS_POOL_SIZE     = "160"
     REDIS_CLUSTER_URL   = local.redis_cluster_url
     REDIS_TLS_CA_BASE64 = local.redis_tls_ca_base64
-    REDIS_URL           = local.redis_url
+
 
     LAUNCH_DARKLY_API_KEY = module.init.launch_darkly_api_key
     # This is here just because it is required in some part of our code which is transitively imported

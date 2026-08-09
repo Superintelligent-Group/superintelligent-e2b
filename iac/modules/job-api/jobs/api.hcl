@@ -157,6 +157,15 @@ job "api" {
         cpu        = ${cpu_count * 1000}
       }
 
+      # Resolve Redis through Nomad/Consul at allocation time instead of relying on
+      # the host stub resolver during node bootstrap. This keeps API startup
+      # deterministic while still following Redis replacements.
+      template {
+        data = "REDIS_URL=redis://{{ with service \"redis\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
+        destination = "local/redis.env"
+        env = true
+        change_mode = "restart"
+      }
       env {
         NODE_ID                        = "$${node.unique.id}"
         API_EDGE_GRPC_PORT             = "$${NOMAD_PORT_grpc_api}"
