@@ -173,7 +173,7 @@ EOF
 # redis.service.consul even though the Consul catalog is healthy.
 echo "Waiting for Consul DNS to start on port 8600..."
 for i in {1..60}; do
-    if nc -z 127.0.0.1 8600 2>/dev/null; then
+    if (echo >/dev/tcp/127.0.0.1/8600) 2>/dev/null; then
         echo "Consul DNS is ready (attempt $i/60)"
         break
     fi
