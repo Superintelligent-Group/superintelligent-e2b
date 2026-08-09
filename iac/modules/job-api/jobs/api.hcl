@@ -48,8 +48,7 @@ job "api" {
         "traefik.enable=true",
         "traefik.http.routers.api.entrypoints=web",
 
-        "traefik.http.routers.api.rule=HostRegexp(`api.{domain:.+}`)",
-        "traefik.http.routers.api.ruleSyntax=v2",
+        "traefik.http.routers.api.rule=Host(`api.${domain_name}`)",
         "traefik.http.routers.api.priority=500"
       ]
 
@@ -85,8 +84,7 @@ job "api" {
       tags = [
         "traefik.enable=true",
         "traefik.http.routers.grpc-api.entrypoints=web",
-        "traefik.http.routers.grpc-api.rule=HostRegexp(`grpc-api.{domain:.+}`)",
-        "traefik.http.routers.grpc-api.ruleSyntax=v2",
+        "traefik.http.routers.grpc-api.rule=Host(`grpc-api.${domain_name}`)",
         "traefik.http.routers.grpc-api.priority=500",
         "traefik.http.routers.grpc-api.service=grpc-api",
         "traefik.http.services.grpc-api.loadbalancer.server.scheme=h2c"

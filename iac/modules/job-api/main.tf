@@ -12,6 +12,7 @@ locals {
 
 resource "nomad_job" "api" {
   jobspec = templatefile("${path.module}/jobs/api.hcl", {
+    domain_name            = var.domain_name
     update_stanza      = var.update_stanza
     node_pool          = var.node_pool
     prevent_colocation = var.prevent_colocation
