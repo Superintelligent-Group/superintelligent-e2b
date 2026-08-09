@@ -82,6 +82,20 @@ job "client-proxy" {
     }
 %{ endif }
 
+
+    # Render the live Consul service address instead of relying on Consul DNS
+    # inside the host-networked container. The client-proxy Redis client
+    # expects host:port, and the rendered address follows Redis relocation.
+    template {
+      data = <<EOH
+{{- range service "redis" }}
+REDIS_URL={{ .Address }}:{{ .Port }}
+{{- end }}
+EOH
+      destination = "local/redis.env"
+      env         = true
+      change_mode = "restart"
+    }
     task "start" {
       driver = "docker"
       # If we need more than 30s we will need to update the max_kill_timeout in nomad
