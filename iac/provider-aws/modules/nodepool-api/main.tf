@@ -15,7 +15,9 @@ locals {
     RUN_CONSUL_FILE_HASH = var.setup_files_hash["run-consul"]
     RUN_NOMAD_FILE_HASH  = var.setup_files_hash["run-nomad"]
 
-    POSTGRES_EBS_VOLUME_ID = aws_ebs_volume.postgres_data.id
+    # RDS is the canonical database; do not attach the legacy single-AZ volume.
+    # Keeping this empty makes API nodes AZ-agnostic and avoids a bootstrap hard-fail.
+    POSTGRES_EBS_VOLUME_ID = ""
   })
 }
 
@@ -54,7 +56,7 @@ data "aws_iam_policy_document" "api_node_policy" {
 
 resource "aws_ebs_volume" "postgres_data" {
   availability_zone = var.postgres_ebs_az
-  size              = 10 # GB — plenty for E2B metadata (teams, templates, builds)
+  size              = 10 # GB - legacy volume retained until retirement is explicitly approved
   type              = "gp3"
 
   tags = {
