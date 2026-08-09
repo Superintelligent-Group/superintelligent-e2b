@@ -22,7 +22,8 @@ module "auto_scaling" {
   # accept the Terraform field but EC2 does not materialize CpuOptions for them.
   # Ordered best-value first; capacity-optimized still picks on availability.
   client_spot_instance_types = [
-    "r7i.2xlarge", "m7i.2xlarge", "c7i.2xlarge",
+    "r7i.2xlarge", "m7i.2xlarge", "m7i-flex.2xlarge",
+    "c7i.2xlarge", "c7i-flex.2xlarge",
   ]
   api_spot_instance_types = ["t3.large", "t3a.large", "m6i.large", "m7i-flex.large"]
 
