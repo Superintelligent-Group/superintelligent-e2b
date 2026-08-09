@@ -189,6 +189,10 @@ looks the sandbox up in the Redis routing catalog to find the owning node, and r
 that node's orchestrator proxy on :5007. If the sandbox is not in the catalog (paused), it calls
 the API's `ResumeSandbox` gRPC and retries — paused sandboxes wake transparently on traffic.
 
+On the Nomad deployment, the Redis endpoint is rendered into the task environment from the
+healthy Consul `redis` service (`local/redis.env`) and the task restarts when that service moves.
+This keeps the Go Redis client on a resolvable `host:port` endpoint without depending on Consul DNS
+inside the host-networked container.
 ### Dashboard API (`packages/dashboard-api`)
 
 A separate REST service (port 3010, spec `spec/openapi-dashboard.yml`) consumed by the web
