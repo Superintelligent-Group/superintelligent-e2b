@@ -17,18 +17,12 @@ module "auto_scaling" {
 
   idle_timeout_minutes = 30
 
-  # Client nodes need nested virtualization for Firecracker. Keep the scale-up
-  # fleet on approved non-metal Intel 7th-gen 2xlarge shapes: they support nested
-  # virtualization, cost less than the same-size 8th-gen alternatives, and avoid
-  # the extreme hourly cost of bare-metal instances.
-  #
-  # r7i leads because sandbox hosts are memory-bound — each Firecracker microVM
-  # reserves RAM — and r7i.2xlarge buys 64 GiB for ~the same spot price as
-  # m8i.2xlarge's 32 GiB ($0.1875 vs $0.1854, us-east-1 2026-07-27). Ordered
-  # best-value first; capacity-optimized still picks on availability, not order.
+  # Client nodes need nested virtualization for Firecracker. Use only the AWS-
+  # supported non-metal Intel 7th-generation families; 7th-generation shapes
+  # accept the Terraform field but EC2 does not materialize CpuOptions for them.
+  # Ordered best-value first; capacity-optimized still picks on availability.
   client_spot_instance_types = [
-    "r7i.2xlarge", "m7i.2xlarge", "m7i-flex.2xlarge",
-    "c7i.2xlarge", "c7i-flex.2xlarge",
+    "r7i.2xlarge", "m7i.2xlarge", "c7i.2xlarge",
   ]
   api_spot_instance_types = ["t3.large", "t3a.large", "m6i.large", "m7i-flex.large"]
 
