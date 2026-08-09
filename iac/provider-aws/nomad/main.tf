@@ -109,7 +109,7 @@ module "client_proxy" {
 module "api" {
   source = "../../modules/job-api"
 
-  domain_name        = var.domain_name
+  domain_name = var.domain_name
 
   update_stanza      = var.api_cluster_size > 1
   node_pool          = var.api_node_pool
