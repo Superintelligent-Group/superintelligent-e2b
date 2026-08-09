@@ -161,7 +161,7 @@ job "api" {
       # the host stub resolver during node bootstrap. This keeps API startup
       # deterministic while still following Redis replacements.
       template {
-        data = "REDIS_URL=redis://{{ with service \"redis\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
+        data = "REDIS_URL={{ with service \"redis\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
         destination = "local/redis.env"
         env = true
         change_mode = "restart"
