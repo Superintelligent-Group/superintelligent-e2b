@@ -59,6 +59,8 @@ module "ingress" {
 module "api" {
   source = "../../modules/job-api"
 
+  domain_name = var.domain_name
+
   update_stanza = var.api_machine_count > 1
   node_pool     = var.api_node_pool
   // We use colocation 2 here to ensure that there are at least 2 nodes for API to do rolling updates.
