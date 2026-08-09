@@ -379,14 +379,19 @@ def wake_handler(event, context):
 
     _record_activity()
 
+    ready = client_ready and api_healthy
     return {
-        "statusCode": 200 if client_ready else 202,
+        # Never advertise readiness when the public API/ALB is still returning
+        # errors. Callers may retry a 503 while scale-to-zero remains guarded.
+        "statusCode": 200 if ready else (503 if client_ready else 202),
         "body": json.dumps(
             {
-                "status": "ready" if client_ready else "starting",
+                "status": "ready" if ready else ("api_unhealthy" if client_ready else "starting"),
                 "message": "Cluster is ready"
-                if client_ready
-                else "Cluster is starting, may take a few more minutes",
+                if ready
+                else ("Worker is ready but the public API is unhealthy" if client_ready else "Cluster is starting, may take a few more minutes"),
+                "apiHealthy": api_healthy,
+                "clientReady": client_ready,
             }
         ),
     }
