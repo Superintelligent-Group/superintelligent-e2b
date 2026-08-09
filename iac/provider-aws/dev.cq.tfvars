@@ -150,6 +150,6 @@ clickhouse_cluster_size     = 0
 # for price, which is fine when capacity-optimized picks them opportunistically
 # and bad as the guaranteed fallback shape.
 # -----------------------------------------------------------------------------
-client_server_machine_type = "m7i.2xlarge" # was m8i.4xlarge default: $0.8467/h -> $0.4032/h (-52%)
+client_server_machine_type = "m7i.2xlarge" # supported non-metal nested virtualization shape
 api_server_machine_type    = "t3.large"    # was t3.xlarge default; matches api_spot_instance_types
-build_server_machine_type  = "m7i.2xlarge" # was m8i.2xlarge default: $0.4234/h -> $0.4032/h
+build_server_machine_type  = "m7i.2xlarge" # supported non-metal nested virtualization shape

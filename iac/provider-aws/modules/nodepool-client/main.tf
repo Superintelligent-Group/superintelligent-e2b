@@ -122,14 +122,21 @@ data "aws_ami" "client" {
   }
 }
 
+# The provider can normalize nested_virtualization in state even when an older
+# launch-template version was created without CpuOptions. Bump this explicit
+# schema token to force one declarative version update and make API readback
+# authoritative for both worker pools.
+resource "terraform_data" "nested_virtualization_reconciliation" {
+  input = var.nested_virtualization ? "nested-virtualization-v2-enabled" : "nested-virtualization-v2-disabled"
+}
 resource "aws_launch_template" "client" {
   name          = "${var.prefix}${var.name}-node"
+  description   = terraform_data.nested_virtualization_reconciliation.input
   image_id      = data.aws_ami.client.id
   instance_type = var.machine_type
   user_data     = base64encode(local.user_data)
 
   vpc_security_group_ids = var.security_group_ids
-
   metadata_options {
     http_tokens = "required"
   }

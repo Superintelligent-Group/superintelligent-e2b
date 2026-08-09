@@ -218,11 +218,10 @@ variable "client_cluster_size" {
 
 variable "client_server_machine_type" {
   type = string
-  # 7th-gen Intel, not 8th. Nested virt (Firecracker/KVM without bare metal) is
-  # supported on C7i/M7i/R7i as well as C8i/M8i/R8i; measured us-east-1
-  # 2026-07-27, no 8i type sits on the on-demand cost/capability Pareto frontier.
-  # m7i.2xlarge is $0.4032/h vs m8i.4xlarge's $0.8467/h. Raise deliberately if a
-  # deployment genuinely needs 16 vCPU per client node rather than inheriting it.
+  # EC2 nested virtualization is supported on 7th-generation Intel C7i/M7i/R7i
+  # families and flex variants (including non-metal 2xlarge shapes). Keep this explicit rather
+  # than inheriting an older default that silently ignores
+  # CpuOptions.NestedVirtualization.
   default = "m7i.2xlarge"
 }
 
@@ -280,9 +279,8 @@ variable "build_cluster_size" {
 
 variable "build_server_machine_type" {
   type = string
-  # Same generation correction as client_server_machine_type: identical 8 vCPU /
-  # 32 GiB shape, $0.4032/h vs $0.4234/h, and on the Pareto frontier rather than
-  # dominated by it.
+  # Match the client pool so every Firecracker-capable worker uses a supported
+  # non-metal nested-virtualization shape.
   default = "m7i.2xlarge"
 }
 
