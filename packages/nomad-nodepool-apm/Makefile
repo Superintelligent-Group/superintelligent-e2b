@@ -1,8 +1,17 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
+
+include ../../scripts/aws-account-authority.mk
 
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
+override AWS_WRITE_S3_PREFIX = $(AWS_BUCKET_PREFIX)
+override AWS_WRITE_S3_PREFIX_SOURCE := AWS_BUCKET_PREFIX
+override AWS_WRITE_S3_DESTINATION_REQUIRED := true
+unexport AWS_BUCKET_PREFIX
 
 PLUGIN_NAME := nomad-nodepool-apm
 TARGET_PLUGIN_NAME := nomad-deployment-aware-target
@@ -25,7 +34,7 @@ test:
 	go test -v ./...
 
 .PHONY: upload
-upload:
+upload: aws-write-account-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	chmod +x $(BINARY)
 	chmod +x $(TARGET_BINARY)

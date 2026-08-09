@@ -1,6 +1,11 @@
+include ../../scripts/make-raw-input-authority.mk
+$(call aws_guard_writer_inputs)
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+$(call aws_guard_writer_inputs)
 PREFIX := $(strip $(subst ",,$(PREFIX)))
+
+include ../../scripts/aws-account-authority.mk
 
 expectedMigration := $(shell ./../../scripts/get-latest-migration.sh)
 
@@ -9,6 +14,10 @@ ifeq ($(PROVIDER),aws)
 else
 	IMAGE_REGISTRY := $(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(PREFIX)core/dashboard-api
 endif
+override AWS_WRITE_DESTINATION = $(IMAGE_REGISTRY)
+override AWS_WRITE_DESTINATION_SOURCE := IMAGE_REGISTRY
+override AWS_WRITE_ECR_DESTINATION_REQUIRED := true
+unexport IMAGE_REGISTRY
 
 HOSTNAME := $(shell hostname 2> /dev/null || hostnamectl hostname 2> /dev/null)
 $(if $(HOSTNAME),,$(error Failed to determine hostname: both 'hostname' and 'hostnamectl' failed))
@@ -30,7 +39,7 @@ build-debug:
 	CGO_ENABLED=1 go build -race -gcflags=all="-N -l" -o bin/dashboard-api -ldflags "-X=main.commitSHA=$(COMMIT_SHA) -X=main.expectedMigrationTimestamp=$(EXPECTED_MIGRATION_TIMESTAMP)" .
 
 .PHONY: build-and-upload
-build-and-upload:
+build-and-upload: aws-write-account-guard
 	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	$(eval EXPECTED_MIGRATION_TIMESTAMP := $(expectedMigration))
 	@docker build --platform linux/amd64 --tag $(IMAGE_REGISTRY) --tag $(IMAGE_REGISTRY):$(COMMIT_SHA) --push --build-arg COMMIT_SHA="$(COMMIT_SHA)" --build-arg EXPECTED_MIGRATION_TIMESTAMP="$(EXPECTED_MIGRATION_TIMESTAMP)" -f ./Dockerfile ..

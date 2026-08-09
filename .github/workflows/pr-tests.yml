@@ -18,6 +18,9 @@ jobs:
   run-tests:
     name: Run unit test shards
     if: ${{ inputs.run-tests == true }}
+    # Bound each matrix shard so a lost/self-hosted runner cannot hold the
+    # required aggregate open for the platform's 24h job ceiling.
+    timeout-minutes: 45
     # Shards that only need Docker run on Blacksmith. The orchestrator shard
     # stays on infra-tests: it needs modprobe nbd and /dev/kvm (smoketest).
     runs-on: ${{ matrix.runner }}

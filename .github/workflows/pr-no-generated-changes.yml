@@ -28,9 +28,23 @@ jobs:
     if: ${{ inputs.run-check == true }}
     runs-on: ubuntu-24.04
     steps:
+      - name: Detect optional GitHub App credentials
+        id: app-credentials
+        if: ${{ inputs.commit == true }}
+        env:
+          APP_ID: ${{ secrets.app_id }}
+          APP_PRIVATE_KEY: ${{ secrets.app_secret }}
+        run: |
+          if [[ -n "$APP_ID" && -n "$APP_PRIVATE_KEY" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "GitHub App credentials are unavailable; generated-code validation will run without auto-commit."
+          fi
+
       - name: Generate GitHub App installation token
         id: app-token
-        if: ${{ inputs.commit == true }}
+        if: ${{ steps.app-credentials.outputs.available == 'true' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.app_id }}
@@ -38,14 +52,9 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v6
-        if: ${{ inputs.commit == true }}
         with:
-          ref: ${{ github.head_ref }}
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        if: ${{ inputs.commit == false }}
+          ref: ${{ inputs.commit == true && github.head_ref || github.sha }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
 
       - name: Parse .tool-versions
         uses: wistia/parse-tool-versions@v2.1.1
@@ -78,16 +87,20 @@ jobs:
         # shell injection in the inline script.
         env:
           HEAD_REF: ${{ github.head_ref }}
-          COMMIT: ${{ inputs.commit }}
+          COMMIT_REQUESTED: ${{ inputs.commit }}
+          CAN_COMMIT: ${{ steps.app-credentials.outputs.available == 'true' }}
         run: |
           if [[ -z $(git status --porcelain) ]]; then
             echo "✅ No changes detected."
             exit 0
           fi
 
-          if [[ "$COMMIT" != "true" ]]; then
+          if [[ "$CAN_COMMIT" != "true" ]]; then
             echo "❌ Generated files are not up to date. Please run 'make generate' and commit the changes."
             git status --short
+            if [[ "$COMMIT_REQUESTED" == "true" ]]; then
+              echo "Automatic commit was requested but the optional GitHub App credentials are not configured."
+            fi
             exit 1
           fi
 
