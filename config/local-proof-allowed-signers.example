@@ -1,0 +1,8 @@
+﻿# Local proof signer allowlist
+
+This directory is intentionally empty in the repository checkout. Before publishing a
+proof, copy this file to `config/local-proof-allowed-signers` and add the OpenSSH
+allowed-signers line for the operator key that is permitted to attest platform changes.
+
+The private key must stay outside the repository and is selected with
+`SIG_PROOF_SIGNING_KEY`. Publishing fails closed if either the key or allowlist is absent.

@@ -54,3 +54,6 @@ iac/provider-aws/.terraform-*/
 *.tfplan
 *.sig-backup
 **/bin/
+
+# Local proof receipts are regenerated per exact commit
+.sig/proofs/
