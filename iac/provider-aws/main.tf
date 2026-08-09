@@ -176,7 +176,7 @@ locals {
     REDIS_POOL_SIZE              = "10"
     REDIS_CLUSTER_URL            = local.redis_cluster_url
     REDIS_TLS_CA_BASE64          = local.redis_tls_ca_base64
-    REDIS_URL                    = local.redis_url
+
     GIN_MODE                     = "release"
     CONSUL_TOKEN                 = module.init.cluster.consul_acl_token
     DOMAIN_NAME                  = var.domain_name
