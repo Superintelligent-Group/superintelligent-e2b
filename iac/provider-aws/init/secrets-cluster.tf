@@ -39,6 +39,7 @@ locals {
 output "cluster" {
   sensitive = true
   value = {
+    secret_arn                   = aws_secretsmanager_secret.cluster.arn
     nomad_acl_token              = local.cluster_raw["NOMAD_ACL_TOKEN"]
     consul_acl_token             = local.cluster_raw["CONSUL_ACL_TOKEN"]
     consul_dns_request_token     = local.cluster_raw["CONSUL_DNS_REQUEST_TOKEN"]

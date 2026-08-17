@@ -293,7 +293,8 @@ module "clickhouse" {
 }
 
 module "build" {
-  source = "../modules/nodepool-client"
+  source             = "../modules/nodepool-client"
+  cluster_secret_arn = var.cluster_secret_arn
 
   name           = "orch-build"
   prefix         = var.prefix
@@ -318,9 +319,6 @@ module "build" {
   node_pool_name                    = var.build_node_pool_name
   node_labels                       = var.build_node_labels
   nested_virtualization             = var.build_server_nested_virtualization
-  consul_acl_token                  = var.consul_acl_token_secret
-  consul_gossip_encryption_key      = var.consul_gossip_encryption_key
-  consul_dns_request_token          = var.consul_dns_request_token_secret
   aws_ecr_account_repository_domain = local.aws_ecr_account_repository_domain
 
   fc_kernels_bucket_name      = var.fc_kernels_bucket_name
@@ -338,7 +336,8 @@ module "build" {
 }
 
 module "client" {
-  source = "../modules/nodepool-client"
+  source             = "../modules/nodepool-client"
+  cluster_secret_arn = var.cluster_secret_arn
 
   name           = "orch-client"
   prefix         = var.prefix
@@ -364,9 +363,6 @@ module "client" {
   node_labels                       = var.client_node_labels
   base_hugepages_percentage         = var.client_base_hugepages_percentage
   nested_virtualization             = var.client_server_nested_virtualization
-  consul_acl_token                  = var.consul_acl_token_secret
-  consul_gossip_encryption_key      = var.consul_gossip_encryption_key
-  consul_dns_request_token          = var.consul_dns_request_token_secret
   aws_ecr_account_repository_domain = local.aws_ecr_account_repository_domain
 
   fc_kernels_bucket_name      = var.fc_kernels_bucket_name

@@ -238,6 +238,7 @@ module "cluster" {
 
   nomad_acl_token_secret          = module.init.cluster.nomad_acl_token
   nomad_acl_token_secret_arn      = "arn:aws:secretsmanager:us-east-1:014155356804:secret:e2b-dev/nomad-acl-token-j8mc4t"
+  cluster_secret_arn              = module.init.cluster.secret_arn
   consul_acl_token_secret         = module.init.cluster.consul_acl_token
   consul_dns_request_token_secret = module.init.cluster.consul_dns_request_token
   consul_gossip_encryption_key    = module.init.cluster.consul_gossip_encryption_key

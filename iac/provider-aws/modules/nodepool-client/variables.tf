@@ -98,16 +98,9 @@ variable "boot_disk_size_gb" {
   description = "Root volume size in GB"
 }
 
-variable "consul_acl_token" {
-  type = string
-}
-
-variable "consul_gossip_encryption_key" {
-  type = string
-}
-
-variable "consul_dns_request_token" {
-  type = string
+variable "cluster_secret_arn" {
+  type        = string
+  description = "Secrets Manager ARN containing the Nomad/Consul bootstrap credentials."
 }
 
 variable "aws_ecr_account_repository_domain" {

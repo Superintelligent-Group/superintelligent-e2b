@@ -27,6 +27,11 @@ variable "nomad_acl_token_secret_arn" {
   type        = string
 }
 
+variable "cluster_secret_arn" {
+  description = "ARN of the Secrets Manager cluster bundle used by Nomad clients at boot."
+  type        = string
+}
+
 variable "consul_acl_token_secret" {
   type = string
 }
