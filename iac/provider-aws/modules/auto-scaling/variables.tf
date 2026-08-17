@@ -44,7 +44,7 @@ variable "client_spot_instance_types" {
         "c7i-flex.2xlarge",
       ], instance_type)
     ])
-    error_message = "Client spot types must contain at least one approved non-metal Intel 7th-gen 2xlarge instance (C7i, M7i, or R7i)."
+    error_message = "Client spot types must contain at least one approved non-metal Intel 7th/8th-gen 2xlarge instance (C7i/M7i/R7i or C8i/M8i/R8i)."
   }
 }
 

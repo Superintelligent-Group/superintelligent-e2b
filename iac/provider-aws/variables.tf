@@ -218,10 +218,9 @@ variable "client_cluster_size" {
 
 variable "client_server_machine_type" {
   type = string
-  # EC2 nested virtualization is supported on 7th-generation Intel C7i/M7i/R7i
-  # families and flex variants (including non-metal 2xlarge shapes). Keep this explicit rather
-  # than inheriting an older default that silently ignores
-  # CpuOptions.NestedVirtualization.
+  # AWS supports EC2 nested virtualization on non-metal Intel 7th/8th-generation
+  # families and their supported flex variants. Keep this explicit so a
+  # fallback cannot silently land on an unsupported generation.
   default = "m7i.2xlarge"
 }
 

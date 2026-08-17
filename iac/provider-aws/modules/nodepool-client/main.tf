@@ -156,6 +156,11 @@ resource "aws_launch_template" "client" {
   }
 
   cpu_options {
+    # EC2's launch-template API requires the core/thread tuple alongside the
+    # nested flag; setting only NestedVirtualization is silently materialized
+    # as CpuOptions={} on the live template.
+    core_count            = var.nested_virtualization ? var.nested_virtualization_cpu_core_count : null
+    threads_per_core      = var.nested_virtualization ? var.nested_virtualization_threads_per_core : null
     nested_virtualization = var.nested_virtualization ? "enabled" : "disabled"
   }
 
