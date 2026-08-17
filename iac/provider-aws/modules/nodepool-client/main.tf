@@ -169,6 +169,17 @@ resource "aws_launch_template" "client" {
       (var.cluster_tag_name) = var.cluster_tag_value
     }
   }
+
+  # Preserve the existing cost-attribution tag when rolling the template
+  # forward for nested virtualization; replacing a launch-template version
+  # must not silently orphan its EBS volume from the E2B cost taxonomy.
+  tag_specifications {
+    resource_type = "volume"
+
+    tags = {
+      Project = "e2b"
+    }
+  }
 }
 
 resource "aws_autoscaling_group" "client" {
