@@ -132,21 +132,20 @@ clickhouse_cluster_size     = 0
 # risks failed builds.
 #
 # Family choice. Nested virtualization (Firecracker/KVM inside EC2, no bare
-# metal) is supported on the approved Intel 7th-gen C7i/M7i/R7i families and
-# flex variants. Not Graviton. Measured us-east-1 2026-07-27, 8i appeared exactly
-# once on the spot Pareto frontier and never on the on-demand frontier. Keep the
-# active fleet and every fallback on the cheaper 7i generation.
+# metal) is supported on approved Intel 7th/8th-gen C7i/M7i/R7i and
+# C8i/M8i/R8i families plus the documented flex variants. Not Graviton. This
+# is an explicit capability requirement, not a price preference: the launch
+# request must include the full CPU option tuple, or EC2 omits the setting.
 #
 #   8 vCPU tier      on-demand   spot     GiB
-#   c7i-flex.2xl      0.3392    0.1424    16
-#   c7i.2xl           0.3570    0.1472    16
-#   m7i.2xl           0.4032    0.1742    32
-#   m8i.2xl (old)     0.4234    0.1854    32
-#   r7i.2xl           0.5292    0.1875    64   <- 2x the RAM of m7i for +0.013 spot
+#   c7i-flex.2xl      reviewed low-cost candidate
+#   c7i.2xl           reviewed low-cost candidate
+#   m7i.2xl           reviewed low-cost candidate
+#   r7i.2xl           reviewed memory-density candidate
 #
 # Sandbox hosts are memory-bound (each Firecracker microVM reserves RAM), so
-# r7i is the best value per sandbox on the spot path and belongs in the override
-# list. Launch-template defaults stay NON-flex: flex variants trade sustained CPU
+# r7i is the memory-oriented candidate for sandbox density and belongs in the
+# override list. Launch-template defaults stay NON-flex: flex variants trade sustained CPU
 # for price, which is fine when capacity-optimized picks them opportunistically
 # and bad as the guaranteed fallback shape.
 # -----------------------------------------------------------------------------

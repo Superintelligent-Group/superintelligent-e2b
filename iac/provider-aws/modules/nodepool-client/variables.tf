@@ -59,6 +59,18 @@ variable "machine_type" {
   default = "m7i.2xlarge"
 }
 
+variable "nested_virtualization_cpu_core_count" {
+  description = "CPU core count sent with nested virtualization launch-template options."
+  type        = number
+  default     = 4
+}
+
+variable "nested_virtualization_threads_per_core" {
+  description = "Threads per core sent with nested virtualization launch-template options."
+  type        = number
+  default     = 2
+}
+
 variable "node_pool_name" {
   type        = string
   description = "Nomad node pool name for client nodes"

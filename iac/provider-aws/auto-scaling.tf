@@ -17,9 +17,8 @@ module "auto_scaling" {
 
   idle_timeout_minutes = 30
 
-  # Client nodes need nested virtualization for Firecracker. Use only the AWS-
-  # supported non-metal Intel 7th-generation families; 7th-generation shapes
-  # accept the Terraform field but EC2 does not materialize CpuOptions for them.
+  # Client nodes need nested virtualization for Firecracker. AWS supports it on
+  # non-metal Intel 7th/8th-generation families and supported flex variants.
   # Ordered best-value first; capacity-optimized still picks on availability.
   client_spot_instance_types = [
     "r7i.2xlarge", "m7i.2xlarge", "m7i-flex.2xlarge",
