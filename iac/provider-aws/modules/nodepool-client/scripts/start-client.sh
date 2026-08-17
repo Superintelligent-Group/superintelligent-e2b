@@ -100,6 +100,20 @@ aws s3 cp "s3://${SCRIPTS_BUCKET}/run-nomad-${RUN_NOMAD_FILE_HASH}.sh" /opt/noma
 
 chmod +x /opt/consul/bin/run-consul.sh /opt/nomad/bin/run-nomad.sh
 
+# Resolve bootstrap credentials at boot from the instance role. Never embed
+# ACL tokens or gossip keys in launch-template user-data.
+# xtrace is enabled above for bootstrap diagnostics, but must be disabled while
+# resolving and assigning secret values so they cannot land in user-data.log.
+set +x
+command -v aws >/dev/null
+command -v jq >/dev/null
+cluster_secret_json="$(aws secretsmanager get-secret-value --secret-id "${CLUSTER_SECRET_ARN}" --query SecretString --output text)"
+CONSUL_TOKEN="$(jq -er '.CONSUL_ACL_TOKEN' <<<"${cluster_secret_json}")"
+CONSUL_DNS_REQUEST_TOKEN="$(jq -er '.CONSUL_DNS_REQUEST_TOKEN' <<<"${cluster_secret_json}")"
+CONSUL_GOSSIP_ENCRYPTION_KEY="$(jq -er '.CONSUL_GOSSIP_ENCRYPTION_KEY' <<<"${cluster_secret_json}")"
+unset cluster_secret_json
+set -x
+
 mkdir -p /root/docker
 touch /root/docker/config.json
 cat <<EOF >/root/docker/config.json

@@ -2,13 +2,11 @@ locals {
   scripts_path = var.scripts_path != "" ? var.scripts_path : "${path.module}/scripts"
 
   user_data = templatefile("${local.scripts_path}/start-client.sh", {
-    NODE_POOL                    = var.node_pool_name
-    CLUSTER_TAG_NAME             = var.cluster_tag_name
-    CLUSTER_TAG_VALUE            = var.cluster_tag_value
-    SCRIPTS_BUCKET               = var.setup_bucket_name
-    CONSUL_TOKEN                 = var.consul_acl_token
-    CONSUL_GOSSIP_ENCRYPTION_KEY = var.consul_gossip_encryption_key
-    CONSUL_DNS_REQUEST_TOKEN     = var.consul_dns_request_token
+    NODE_POOL          = var.node_pool_name
+    CLUSTER_TAG_NAME   = var.cluster_tag_name
+    CLUSTER_TAG_VALUE  = var.cluster_tag_value
+    SCRIPTS_BUCKET     = var.setup_bucket_name
+    CLUSTER_SECRET_ARN = var.cluster_secret_arn
 
     FC_KERNELS_BUCKET_NAME      = var.fc_kernels_bucket_name
     FC_VERSIONS_BUCKET_NAME     = var.fc_versions_bucket_name
@@ -30,6 +28,12 @@ resource "aws_iam_policy" "client_node_policy" {
 }
 
 data "aws_iam_policy_document" "client_node_policy" {
+  statement {
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [var.cluster_secret_arn]
+  }
+
   statement {
     effect = "Allow"
     actions = [
