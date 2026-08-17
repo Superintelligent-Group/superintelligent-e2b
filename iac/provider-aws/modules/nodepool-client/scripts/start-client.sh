@@ -108,9 +108,9 @@ set +x
 command -v aws >/dev/null
 command -v jq >/dev/null
 cluster_secret_json="$(aws secretsmanager get-secret-value --secret-id "${CLUSTER_SECRET_ARN}" --query SecretString --output text)"
-CONSUL_TOKEN="$(jq -er '.CONSUL_ACL_TOKEN' <<<"${cluster_secret_json}")"
-CONSUL_DNS_REQUEST_TOKEN="$(jq -er '.CONSUL_DNS_REQUEST_TOKEN' <<<"${cluster_secret_json}")"
-CONSUL_GOSSIP_ENCRYPTION_KEY="$(jq -er '.CONSUL_GOSSIP_ENCRYPTION_KEY' <<<"${cluster_secret_json}")"
+CONSUL_TOKEN="$(jq -er '.CONSUL_ACL_TOKEN' <<<"$${cluster_secret_json}")"
+CONSUL_DNS_REQUEST_TOKEN="$(jq -er '.CONSUL_DNS_REQUEST_TOKEN' <<<"$${cluster_secret_json}")"
+CONSUL_GOSSIP_ENCRYPTION_KEY="$(jq -er '.CONSUL_GOSSIP_ENCRYPTION_KEY' <<<"$${cluster_secret_json}")"
 unset cluster_secret_json
 set -x
 
@@ -211,12 +211,12 @@ echo $overcommitment_hugepages >/proc/sys/vm/nr_overcommit_hugepages
 # This allows Consul to handle both .consul queries AND forward internet queries
 # These variables are passed in via Terraform template interpolation
 /opt/consul/bin/run-consul.sh --client \
-    --consul-token "${CONSUL_TOKEN}" \
+    --consul-token "$${CONSUL_TOKEN}" \
     --cluster-tag-name "${CLUSTER_TAG_NAME}" \
     --cluster-tag-value "${CLUSTER_TAG_VALUE}"  \
     --enable-gossip-encryption \
-    --gossip-encryption-key "${CONSUL_GOSSIP_ENCRYPTION_KEY}" \
-    --dns-request-token "${CONSUL_DNS_REQUEST_TOKEN}" &
+    --gossip-encryption-key "$${CONSUL_GOSSIP_ENCRYPTION_KEY}" \
+    --dns-request-token "$${CONSUL_DNS_REQUEST_TOKEN}" &
 
 # Give Consul a moment to start its DNS server on port 8600
 echo "- Waiting for Consul DNS to start on port 8600..."
@@ -257,7 +257,7 @@ done
 echo "- Flushing DNS caches"
 resolvectl flush-caches
 
-/opt/nomad/bin/run-nomad.sh --client --consul-token "${CONSUL_TOKEN}" --node-pool "${NODE_POOL}" --node-labels "${NODE_LABELS}" &
+/opt/nomad/bin/run-nomad.sh --client --consul-token "$${CONSUL_TOKEN}" --node-pool "${NODE_POOL}" --node-labels "${NODE_LABELS}" &
 
 # Add alias for ssh-ing to sbx
 echo '_sbx_ssh() {
