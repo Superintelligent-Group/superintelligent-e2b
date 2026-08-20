@@ -2,6 +2,17 @@ variable "prefix" {
   type = string
 }
 
+variable "project_tag" {
+  type        = string
+  description = "Explicit Project cost-attribution tag for E2B registry and secrets."
+  default     = "e2b"
+
+  validation {
+    condition     = trimspace(var.project_tag) != ""
+    error_message = "project_tag must be a non-empty cost-attribution label."
+  }
+}
+
 variable "bucket_prefix" {
   type = string
 }
