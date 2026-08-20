@@ -16,6 +16,12 @@ aws_region = "us-east-1"
 # reconciled back into tracked config.
 prefix      = "e2b-"
 environment = "dev"
+launch_darkly_enabled = false
+# Explicitly override the image's legacy baked key while the dev environment
+# uses the offline feature-flag store.
+api_env_vars = {
+  LAUNCH_DARKLY_API_KEY = ""
+}
 # Required by module.init bucket names; reviewed instead of synthesized through
 # a higher-precedence TF_VAR_bucket_prefix environment value.
 bucket_prefix = "e2b-014155356804-"

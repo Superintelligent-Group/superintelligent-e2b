@@ -19,6 +19,15 @@ variable "environment" {
   type = string
 }
 
+# LaunchDarkly is optional in development. An empty key deliberately selects
+# the shared offline store; a stale remote key must never prevent the API or
+# worker jobs from starting.
+variable "launch_darkly_enabled" {
+  type        = bool
+  default     = true
+  description = "Enable LaunchDarkly remote evaluation for this environment."
+}
+
 variable "redis_managed" {
   type    = bool
   default = false
