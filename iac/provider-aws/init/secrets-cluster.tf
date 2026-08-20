@@ -10,6 +10,7 @@ resource "random_id" "consul_gossip_encryption_key" {
 
 resource "aws_secretsmanager_secret" "cluster" {
   name = "${var.prefix}cluster"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "cluster" {
