@@ -150,6 +150,25 @@ resource "aws_lambda_function_url" "wake" {
   authorization_type = "NONE" # Swarm worker calls this — secured by obscurity + idempotency
 }
 
+# A public Function URL still requires an explicit resource-based permission.
+# Without this statement AWS returns 403 before the wake handler runs, leaving
+# the scale-to-zero client pool asleep and the Nomad jobs pending.
+resource "aws_lambda_permission" "wake_function_url" {
+  statement_id           = "AllowPublicFunctionUrl"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.wake.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
+resource "aws_lambda_permission" "wake_function_url_invoke" {
+  statement_id             = "AllowPublicInvokeFunction"
+  action                   = "lambda:InvokeFunction"
+  function_name            = aws_lambda_function.wake.function_name
+  principal                = "*"
+  invoked_via_function_url = true
+}
+
 # --- EventBridge: Periodic Shutdown Check ---
 
 resource "aws_cloudwatch_event_rule" "idle_check" {
