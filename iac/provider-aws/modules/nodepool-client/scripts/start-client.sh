@@ -109,6 +109,7 @@ command -v aws >/dev/null
 command -v jq >/dev/null
 cluster_secret_json="$(aws secretsmanager get-secret-value --secret-id "${CLUSTER_SECRET_ARN}" --query SecretString --output text)"
 CONSUL_TOKEN="$(jq -er '.CONSUL_ACL_TOKEN' <<<"$${cluster_secret_json}")"
+NOMAD_ACL_TOKEN="$(jq -er '.NOMAD_ACL_TOKEN' <<<"$${cluster_secret_json}")"
 CONSUL_DNS_REQUEST_TOKEN="$(jq -er '.CONSUL_DNS_REQUEST_TOKEN' <<<"$${cluster_secret_json}")"
 CONSUL_GOSSIP_ENCRYPTION_KEY="$(jq -er '.CONSUL_GOSSIP_ENCRYPTION_KEY' <<<"$${cluster_secret_json}")"
 unset cluster_secret_json
@@ -257,7 +258,9 @@ done
 echo "- Flushing DNS caches"
 resolvectl flush-caches
 
-/opt/nomad/bin/run-nomad.sh --client --consul-token "$${CONSUL_TOKEN}" --node-pool "${NODE_POOL}" --node-labels "${NODE_LABELS}" &
+set +x
+/opt/nomad/bin/run-nomad.sh --client --consul-token "$${CONSUL_TOKEN}" --nomad-token "$${NOMAD_ACL_TOKEN}" --node-pool "${NODE_POOL}" --node-labels "${NODE_LABELS}" &
+set -x
 
 # Add alias for ssh-ing to sbx
 echo '_sbx_ssh() {

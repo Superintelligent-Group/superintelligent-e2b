@@ -162,10 +162,10 @@ resource "aws_lambda_permission" "wake_function_url" {
 }
 
 resource "aws_lambda_permission" "wake_function_url_invoke" {
-  statement_id           = "AllowPublicInvokeFunction"
-  action                 = "lambda:InvokeFunction"
-  function_name          = aws_lambda_function.wake.function_name
-  principal              = "*"
+  statement_id             = "AllowPublicInvokeFunction"
+  action                   = "lambda:InvokeFunction"
+  function_name            = aws_lambda_function.wake.function_name
+  principal                = "*"
   invoked_via_function_url = true
 }
 

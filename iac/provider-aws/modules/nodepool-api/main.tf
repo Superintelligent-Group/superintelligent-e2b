@@ -7,6 +7,7 @@ locals {
     CLUSTER_TAG_VALUE            = var.cluster_tag_value
     SCRIPTS_BUCKET               = var.setup_bucket_name
     CONSUL_TOKEN                 = var.consul_acl_token
+    CLUSTER_SECRET_ARN           = var.cluster_secret_arn
     CONSUL_GOSSIP_ENCRYPTION_KEY = var.consul_gossip_encryption_key
     CONSUL_DNS_REQUEST_TOKEN     = var.consul_dns_request_token
 
@@ -78,6 +79,20 @@ resource "aws_iam_role_policy_attachment" "api" {
 
   role       = aws_iam_role.api.name
   policy_arn = each.value
+}
+
+resource "aws_iam_role_policy" "api_cluster_secret_read" {
+  name = "${var.prefix}api-cluster-secret-read"
+  role = aws_iam_role.api.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = var.cluster_secret_arn
+    }]
+  })
 }
 
 resource "aws_iam_instance_profile" "api" {

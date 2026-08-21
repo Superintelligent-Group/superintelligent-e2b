@@ -3,8 +3,8 @@
 
 set -e
 
-# Enable command tracing
-set -x
+# Do not enable shell tracing here. Client startup supplies an ACL token and
+# xtrace would write it to the supervisor/user-data log while parsing args.
 
 readonly NOMAD_CONFIG_FILE="default.hcl"
 readonly SUPERVISOR_CONFIG_PATH="/etc/supervisor/conf.d/run-nomad.conf"
@@ -197,6 +197,7 @@ function generate_nomad_config {
   local -r consul_token="$6"
   local -r node_pool="$7"
   local -r node_labels="$8"
+  local -r nomad_token="$9"
   local -r config_path="$config_dir/$NOMAD_CONFIG_FILE"
 
   local instance_name=""
@@ -204,12 +205,24 @@ function generate_nomad_config {
   local instance_region=""
   local instance_zone=""
   local job_constraint=""
+  local agent_acl_config=""
 
   instance_name=$(get_instance_name)
   instance_ip_address=$(get_instance_ip_address)
   instance_region=$(get_instance_region)
   zone=$(get_instance_zone)
   job_constraint=$(get_instance_tag_value "job-constraint" || true)
+
+  if [[ "$client" == "true" ]]; then
+    agent_acl_config=$(cat <<EOF
+  tokens {
+    # Client agents authenticate their RPC heartbeats to ACL-enabled servers.
+    # The token is resolved from the cluster secret at boot.
+    agent = "$nomad_token"
+  }
+EOF
+)
+  fi
 
   local server_config=""
   if [[ "$server" == "true" ]]; then
@@ -300,6 +313,7 @@ telemetry {
 
 acl {
   enabled = true
+$agent_acl_config
 }
 
 limits {
@@ -475,7 +489,11 @@ function run {
 
   user=$(get_owner_of_path "$config_dir")
 
-  generate_nomad_config "$server" "$client" "$num_servers" "$config_dir" "$user" "$consul_token" "$node_pool" "$node_labels"
+  if [[ "$client" == "true" ]]; then
+    assert_not_empty "--nomad-token" "$nomad_token"
+  fi
+
+  generate_nomad_config "$server" "$client" "$num_servers" "$config_dir" "$user" "$consul_token" "$node_pool" "$node_labels" "$nomad_token"
   generate_supervisor_config "$SUPERVISOR_CONFIG_PATH" "$config_dir" "$data_dir" "$bin_dir" "$log_dir" "$user" "$use_sudo"
   start_nomad
 

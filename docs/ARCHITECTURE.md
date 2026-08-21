@@ -363,6 +363,9 @@ flowchart TB
 
 - **Server nodes** run only Nomad/Consul servers (scheduling, service discovery, Consul DNS —
   services address each other as `*.service.consul`).
+- **Nomad client nodes** resolve the cluster's Nomad ACL agent token from the instance-scoped
+  cluster secret at boot and place it only in the generated local agent config; this authenticates
+  RPC heartbeats without embedding credentials in launch-template user-data.
 - **API nodes** host every control-plane container and are the only LB backend.
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`
   (it needs root for Firecracker, namespaces, NBD, cgroups). Configured with hugepages and local
