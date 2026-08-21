@@ -198,6 +198,11 @@ data "aws_iam_policy_document" "cluster_node_ec2_policy" {
 module "control_server" {
   source = "../modules/nodepool-control-server"
 
+  # The launch template consumes these content-addressed bootstrap scripts.
+  # Keep the upload and every node-pool rollout in one dependency graph so a
+  # new hash can never launch an instance before its S3 object exists.
+  depends_on = [aws_s3_object.setup_config]
+
   prefix         = var.prefix
   aws_account_id = var.aws_account_id
 
@@ -228,6 +233,8 @@ module "control_server" {
 module "api" {
   source = "../modules/nodepool-api"
 
+  depends_on = [aws_s3_object.setup_config]
+
   prefix         = var.prefix
   aws_account_id = var.aws_account_id
 
@@ -249,7 +256,6 @@ module "api" {
   machine_type        = var.api_machine_type
 
   node_pool_name               = var.api_node_pool_name
-  cluster_secret_arn           = var.cluster_secret_arn
   consul_acl_token             = var.consul_acl_token_secret
   consul_gossip_encryption_key = var.consul_gossip_encryption_key
   consul_dns_request_token     = var.consul_dns_request_token_secret
@@ -262,6 +268,8 @@ module "api" {
 
 module "clickhouse" {
   source = "../modules/nodepool-clickhouse"
+
+  depends_on = [aws_s3_object.setup_config]
 
   prefix         = var.prefix
   aws_account_id = var.aws_account_id
@@ -282,7 +290,6 @@ module "clickhouse" {
   machine_type        = var.clickhouse_machine_type
 
   node_pool_name                    = var.clickhouse_node_pool_name
-  cluster_secret_arn                = var.cluster_secret_arn
   clickhouse_az                     = var.clickhouse_az
   clickhouse_subnet_id              = var.clickhouse_subnet_id
   clickhouse_backups_bucket_arn     = data.aws_s3_bucket.clickhouse_bucket.arn
@@ -296,6 +303,7 @@ module "clickhouse" {
 
 module "build" {
   source             = "../modules/nodepool-client"
+  depends_on         = [aws_s3_object.setup_config]
   cluster_secret_arn = var.cluster_secret_arn
 
   name           = "orch-build"
@@ -339,6 +347,7 @@ module "build" {
 
 module "client" {
   source             = "../modules/nodepool-client"
+  depends_on         = [aws_s3_object.setup_config]
   cluster_secret_arn = var.cluster_secret_arn
 
   name           = "orch-client"

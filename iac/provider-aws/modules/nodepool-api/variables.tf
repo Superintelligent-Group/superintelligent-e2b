@@ -69,11 +69,6 @@ variable "consul_acl_token" {
   type = string
 }
 
-variable "cluster_secret_arn" {
-  type        = string
-  description = "Secrets Manager ARN containing the Nomad and Consul bootstrap credentials."
-}
-
 variable "consul_gossip_encryption_key" {
   type = string
 }

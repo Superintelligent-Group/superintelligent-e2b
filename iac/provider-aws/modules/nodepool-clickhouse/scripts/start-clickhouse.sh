@@ -81,14 +81,6 @@ aws s3 cp "s3://${SCRIPTS_BUCKET}/run-nomad-${RUN_NOMAD_FILE_HASH}.sh" /opt/noma
 
 chmod +x /opt/consul/bin/run-consul.sh /opt/nomad/bin/run-nomad.sh
 
-set +x
-command -v aws >/dev/null
-command -v jq >/dev/null
-cluster_secret_json="$(aws secretsmanager get-secret-value --secret-id "${CLUSTER_SECRET_ARN}" --query SecretString --output text)"
-NOMAD_ACL_TOKEN="$(jq -er '.NOMAD_ACL_TOKEN' <<<"$cluster_secret_json")"
-unset cluster_secret_json
-set -x
-
 mkdir -p /root/docker
 touch /root/docker/config.json
 cat <<EOF >/root/docker/config.json
@@ -152,6 +144,4 @@ systemctl restart systemd-resolved
     --gossip-encryption-key "${CONSUL_GOSSIP_ENCRYPTION_KEY}" \
     --dns-request-token "${CONSUL_DNS_REQUEST_TOKEN}" &
 
-set +x
-/opt/nomad/bin/run-nomad.sh --client --consul-token "${CONSUL_TOKEN}" --nomad-token "$${NOMAD_ACL_TOKEN}" --node-pool "${NODE_POOL}" &
-set -x
+/opt/nomad/bin/run-nomad.sh --client --consul-token "${CONSUL_TOKEN}" --node-pool "${NODE_POOL}" &
