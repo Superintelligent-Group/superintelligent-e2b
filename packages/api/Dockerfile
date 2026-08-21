@@ -3,8 +3,6 @@ ARG ALPINE_VERSION=3.24
 
 FROM golang:${GOLANG_VERSION}-alpine${ALPINE_VERSION} AS builder
 
-RUN apk add --no-cache make
-
 # Copy all module dependency files at once for better Docker layer caching
 WORKDIR /build
 COPY ./shared/go.mod ./shared/go.sum ./shared/
@@ -38,7 +36,9 @@ WORKDIR /build/api
 
 ARG COMMIT_SHA
 ARG EXPECTED_MIGRATION_TIMESTAMP
-RUN --mount=type=cache,target=/root/.cache/go-build make build COMMIT_SHA=${COMMIT_SHA} EXPECTED_MIGRATION_TIMESTAMP=${EXPECTED_MIGRATION_TIMESTAMP}
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o bin/api \
+    -ldflags "-X=main.commitSHA=${COMMIT_SHA} -X=main.expectedMigrationTimestamp=${EXPECTED_MIGRATION_TIMESTAMP}" .
 
 RUN chmod +x /build/api/bin/api
 

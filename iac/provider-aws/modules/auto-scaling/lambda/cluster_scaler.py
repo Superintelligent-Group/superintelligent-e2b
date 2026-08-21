@@ -2,7 +2,8 @@
 E2B Cluster Auto-Scaler Lambda
 
 Two entry points:
-  - wake_handler:     Scales up control + API + client ASGs (spot preferred),
+  - wake_handler:     Scales up control + API + client + build ASGs (spot
+                      preferred where configured),
                       then re-evaluates all Nomad jobs so dead/pending ones
                       reschedule onto the new nodes.
   - shutdown_handler:  Checks for idle and scales worker nodes to zero.
@@ -320,7 +321,11 @@ def wake_handler(event, context):
     _record_activity()
 
     # Check if already up
-    already_up = _is_asg_up(API_ASG) and _is_asg_up(CLIENT_ASG)
+    already_up = (
+        _is_asg_up(API_ASG)
+        and _is_asg_up(CLIENT_ASG)
+        and _is_asg_up(BUILD_ASG)
+    )
     if already_up:
         # ASGs are up, but is the API actually healthy?
         # (if API is unhealthy, continue with wake flow and final API check)
@@ -341,7 +346,11 @@ def wake_handler(event, context):
             _scale_asg(CONTROL_ASG, 1)  # Control plane on-demand for reliability
             _wait_for_healthy(CONTROL_ASG, timeout_seconds=240)
 
-        # Scale up API + Client in parallel, using spot
+        # Scale up API + Client in parallel, using spot.  The build pool is
+        # deliberately part of the same wake transaction: template builds are
+        # the admission dependency for a governed sandbox, so leaving the
+        # build ASG at zero makes every non-prebuilt template remain pending
+        # forever while the API appears healthy.
         for asg_name, spot_types, max_sz in [
             (API_ASG, API_SPOT_INSTANCE_TYPES, 2),
             (CLIENT_ASG, SPOT_INSTANCE_TYPES, 3),
@@ -353,19 +362,32 @@ def wake_handler(event, context):
                 print(f"WARN: spot scaling failed for {asg_name}, falling back to on-demand: {e}")
                 _scale_asg(asg_name, 1, max_size=max_sz)
 
-        # API and client boot independently; wait in parallel so one slow pool
-        # cannot consume the entire readiness budget before the other is checked.
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            # Build nodes are intentionally on-demand here: the build pool is
+            # scale-to-zero and has no configured spot override.  Shutdown
+            # returns it to zero after the idle window.
+            _scale_asg(BUILD_ASG, 1, max_size=1)
+            print(f"Scaled up {BUILD_ASG}")
+        except Exception as e:
+            print(f"WARN: build pool scale-up failed: {e}")
+
+        # API, client, and build boot independently; wait in parallel so one
+        # slow pool cannot consume the entire readiness budget before the
+        # others are checked.
+        with ThreadPoolExecutor(max_workers=3) as pool:
             api_future = pool.submit(_wait_for_healthy, API_ASG, 300)
             client_future = pool.submit(_wait_for_healthy, CLIENT_ASG, 300)
+            build_future = pool.submit(_wait_for_healthy, BUILD_ASG, 300)
             api_ready = api_future.result()
             client_ready = client_future.result()
+            build_ready = build_future.result()
         print(f"API node healthy: {api_ready}")
         print(f"Client node healthy: {client_ready}")
+        print(f"Build node healthy: {build_ready}")
 
         # Nomad registration is a short bounded readiness check; legacy
         # Postgres-wait logic is intentionally absent from this path.
-        _wait_for_nomad_nodes({"api", "default"}, timeout_seconds=30)
+        _wait_for_nomad_nodes({"api", "default", "build"}, timeout_seconds=30)
 
         # Resubmit dead/pending Nomad jobs so they schedule on new nodes
         _resubmit_nomad_jobs()
@@ -379,7 +401,7 @@ def wake_handler(event, context):
 
     _record_activity()
 
-    ready = client_ready and api_healthy
+    ready = client_ready and api_healthy and (build_ready if not already_up else True)
     return {
         # Never advertise readiness when the public API/ALB is still returning
         # errors. Callers may retry a 503 while scale-to-zero remains guarded.

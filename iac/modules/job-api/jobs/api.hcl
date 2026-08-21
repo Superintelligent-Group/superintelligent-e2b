@@ -59,6 +59,9 @@ job "api" {
         interval = "3s"
         timeout  = "3s"
         port     = "${port_number}"
+        header {
+          Host = ["api.${domain_name}"]
+        }
       }
     }
 
