@@ -84,3 +84,22 @@ resource "aws_route53_record" "e2b_base" {
     evaluate_target_health = true
   }
 }
+
+# The Nomad API is a separate host route on the same ingress ALB. Keep this
+# explicit instead of relying on the wildcard record: an older, manually
+# created `nomad.e2b.superintelligent.group` record can otherwise continue to
+# send scheduler traffic to the retired Supabase ALB while the E2B stack is
+# healthy. This record is imported into the stack before apply so ownership is
+# explicit and future ALB changes remain convergent.
+resource "aws_route53_record" "nomad" {
+  count   = var.manage_nomad_record ? 1 : 0
+  zone_id = data.aws_route53_zone.domain.zone_id
+  name    = "nomad.${var.domain_name}"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.ingress.dns_name
+    zone_id                = aws_lb.ingress.zone_id
+    evaluate_target_health = true
+  }
+}

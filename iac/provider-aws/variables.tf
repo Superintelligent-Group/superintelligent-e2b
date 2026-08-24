@@ -336,6 +336,12 @@ variable "hosted_zone_name" {
   default     = ""
 }
 
+variable "manage_nomad_record" {
+  description = "Manage the explicit nomad.<domain_name> Route 53 alias for the canonical E2B ingress ALB. Keep disabled when DNS is owned by another stack."
+  type        = bool
+  default     = false
+}
+
 variable "enable_otel_router_logs" {
   type        = bool
   default     = false

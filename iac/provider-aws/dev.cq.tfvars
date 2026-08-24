@@ -37,6 +37,10 @@ domain_name = "e2b.superintelligent.group"
 hosted_zone_name    = "e2b.superintelligent.group"
 acm_certificate_arn = "arn:aws:acm:us-east-1:014155356804:certificate/152016f3-f662-42b6-8a99-763d2d991dee"
 
+# The explicit Nomad record previously pointed at the retired Supabase ALB.
+# This stack owns the canonical E2B ingress ALB, so manage that record here.
+manage_nomad_record = true
+
 # DNS — using Cloudflare (leave Route53 disabled)
 create_route53_record = false
 
