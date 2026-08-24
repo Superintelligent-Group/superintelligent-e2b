@@ -10,6 +10,13 @@ resource "random_id" "consul_gossip_encryption_key" {
 
 resource "aws_secretsmanager_secret" "cluster" {
   name = "${var.prefix}cluster"
+
+  # Keep the durable control-plane secret in the same cost taxonomy as the
+  # rest of the E2B runtime. The tag is non-secret metadata and must survive
+  # targeted launch-template reconciliations.
+  tags = {
+    Project = "e2b"
+  }
 }
 
 resource "aws_secretsmanager_secret_version" "cluster" {

@@ -205,6 +205,14 @@ resource "aws_autoscaling_group" "client" {
     version = aws_launch_template.client.latest_version
   }
 
+  # Preserve the cost-allocation identity on both the ASG and instances it
+  # launches. This is part of the runtime baseline, not an optional report tag.
+  tag {
+    key                 = "Project"
+    value               = "e2b"
+    propagate_at_launch = true
+  }
+
   // Do not wait for slow EC2 Metal instance to terminate before detaching from ASG
   force_delete           = true
   force_delete_warm_pool = true
