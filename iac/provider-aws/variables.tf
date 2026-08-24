@@ -336,6 +336,16 @@ variable "hosted_zone_name" {
   default     = ""
 }
 
+# DNS ownership is an operational decision, not an accidental side effect of
+# applying the compute stack. Keep this opt-in because some environments use
+# an external DNS authority (for example Cloudflare) or require a separately
+# approved Route53 role for the cutover.
+variable "manage_nomad_route53_record" {
+  description = "When true, manage nomad.<domain_name> as an alias to the canonical ingress ALB in the selected Route53 zone."
+  type        = bool
+  default     = false
+}
+
 variable "enable_otel_router_logs" {
   type        = bool
   default     = false

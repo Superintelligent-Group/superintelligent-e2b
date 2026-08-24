@@ -84,3 +84,22 @@ resource "aws_route53_record" "e2b_base" {
     evaluate_target_health = true
   }
 }
+
+# The Nomad API is the control-plane endpoint consumed by wake/reconcile
+# clients. Do not create or overwrite this record unless the environment has
+# explicitly opted into Route53 ownership; the default preserves external DNS
+# authorities and makes a plan safe to run with read-only credentials.
+resource "aws_route53_record" "nomad" {
+  count = var.manage_nomad_route53_record ? 1 : 0
+
+  allow_overwrite = true
+  zone_id         = data.aws_route53_zone.domain.zone_id
+  name            = "nomad.${var.domain_name}"
+  type            = "A"
+
+  alias {
+    name                   = aws_lb.ingress.dns_name
+    zone_id                = aws_lb.ingress.zone_id
+    evaluate_target_health = true
+  }
+}
