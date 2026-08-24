@@ -287,6 +287,31 @@ if [[ "$nomad_health_ready" != "true" ]]; then
   exit 1
 fi
 
+# A listening local agent is necessary but not sufficient: the client must
+# complete its RPC registration with a Nomad server before this node can run
+# work. Keep this bounded and leave the rendered config plus supervisor logs
+# in the console when the registration contract is not met.
+echo "- Waiting for Nomad server registration..."
+nomad_registration_ready="false"
+set +x
+for i in {1..60}; do
+  if NOMAD_TOKEN="$${NOMAD_ACL_TOKEN}" nomad node status -self >/dev/null 2>&1; then
+    nomad_registration_ready="true"
+    echo "- Nomad server registration is ready (attempt $i/60)"
+    break
+  fi
+  sleep 1
+done
+set -x
+if [ "$nomad_registration_ready" != "true" ]; then
+  echo "- ERROR: Nomad client did not register with a server after 60 seconds"
+  echo "- Rendered client configuration:"
+  sed -n '/^client {/,/^}/p' /opt/nomad/config/default.hcl || true
+  supervisorctl status nomad || true
+  tail -n 120 /var/log/nomad/* 2>/dev/null || true
+  exit 1
+fi
+
 # Add alias for ssh-ing to sbx
 echo '_sbx_ssh() {
   local address=$(dig @127.0.0.4 $1. A +short 2>/dev/null)
