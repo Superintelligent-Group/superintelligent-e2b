@@ -266,6 +266,28 @@ variable "allow_sandbox_internal_cidrs" {
   default     = ""
 }
 
+variable "nbd_max_devices" {
+  description = "Kernel NBD device capacity requested on Firecracker-capable nodes."
+  type        = number
+  default     = 4096
+
+  validation {
+    condition     = var.nbd_max_devices > 0 && var.nbd_max_devices <= 65536
+    error_message = "nbd_max_devices must be between 1 and 65536."
+  }
+}
+
+variable "nbd_pool_size" {
+  description = "Number of NBD overlays kept warm by each orchestrator."
+  type        = number
+  default     = 64
+
+  validation {
+    condition     = var.nbd_pool_size > 0 && var.nbd_pool_size <= 65536
+    error_message = "nbd_pool_size must be between 1 and 65536."
+  }
+}
+
 variable "envd_timeout" {
   type    = string
   default = "40s"

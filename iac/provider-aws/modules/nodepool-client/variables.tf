@@ -98,6 +98,17 @@ variable "base_hugepages_percentage" {
   default     = 60
 }
 
+variable "nbd_max_devices" {
+  description = "Kernel NBD device capacity made available to this Firecracker node pool."
+  type        = number
+  default     = 4096
+
+  validation {
+    condition     = var.nbd_max_devices > 0 && var.nbd_max_devices <= 65536
+    error_message = "nbd_max_devices must be between 1 and 65536."
+  }
+}
+
 variable "nested_virtualization" {
   type    = bool
   default = true

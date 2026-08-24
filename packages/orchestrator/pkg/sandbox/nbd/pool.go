@@ -177,6 +177,21 @@ func (d *DevicePool) Populate(ctx context.Context) {
 		default:
 		}
 
+		// Once the warm channel is full, wait for GetDevice to consume a slot
+		// before looking for another kernel device. Without this gate, a pool
+		// whose configured size exceeds the kernel's nbds_max spins forever and
+		// reports misleading "no free slots" warnings even though it is ready.
+		if len(d.slots) >= cap(d.slots) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-d.done:
+				return
+			case <-time.After(waitOnNBDError):
+			}
+			continue
+		}
+
 		device, err := d.getFreeDeviceSlot()
 		if err != nil {
 			if failedCount%100 == 0 {

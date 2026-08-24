@@ -58,7 +58,24 @@ vm.max_map_count=1048576
 EOF
 sysctl -p
 
-echo "Disabling inotify for NBD devices"
+echo "Configuring NBD capacity"
+# The AMI may have loaded nbd with the kernel default before user-data runs.
+# Persist the desired capacity and reload the module when it is still unused;
+# silently accepting a smaller capacity makes the orchestrator's pool appear
+# healthy while reducing the number of concurrent Firecracker sandboxes.
+cat <<EOF >/etc/modprobe.d/e2b-nbd.conf
+options nbd nbds_max=${NBD_MAX_DEVICES}
+EOF
+
+current_nbd_max="$(cat /sys/module/nbd/parameters/nbds_max 2>/dev/null || echo 0)"
+if [ "$current_nbd_max" -gt 0 ] && [ "$current_nbd_max" -lt "${NBD_MAX_DEVICES}" ]; then
+  if ! modprobe -r nbd 2>/dev/null; then
+    echo "ERROR: nbd is already loaded at $${current_nbd_max}; cannot raise capacity to ${NBD_MAX_DEVICES} safely"
+    exit 1
+  fi
+fi
+
+# Disable inotify for NBD devices.
 # https://lore.kernel.org/lkml/20220422054224.19527-1-matthew.ruffell@canonical.com/
 cat <<EOH >/etc/udev/rules.d/97-nbd-device.rules
 # Disable inotify watching of change events for NBD devices
@@ -68,8 +85,15 @@ EOH
 udevadm control --reload-rules
 udevadm trigger
 
-# Load the nbd module with 4096 devices
-modprobe nbd nbds_max=4096
+# Load the NBD module with the declared capacity and fail closed if the
+# kernel did not honor it. The orchestrator must never run with an unknown
+# sandbox-device ceiling.
+modprobe nbd nbds_max="${NBD_MAX_DEVICES}"
+actual_nbd_max="$(cat /sys/module/nbd/parameters/nbds_max)"
+if [ "$actual_nbd_max" -lt "${NBD_MAX_DEVICES}" ]; then
+  echo "ERROR: nbd capacity is $${actual_nbd_max}; expected at least ${NBD_MAX_DEVICES}"
+  exit 1
+fi
 
 # Create the directory for the fc mounts
 mkdir -p /fc-vm

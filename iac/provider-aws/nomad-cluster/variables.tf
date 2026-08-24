@@ -170,6 +170,17 @@ variable "client_node_labels" {
   type        = list(string)
 }
 
+variable "nbd_max_devices" {
+  description = "Kernel NBD device capacity declared for Firecracker-capable node pools."
+  type        = number
+  default     = 4096
+
+  validation {
+    condition     = var.nbd_max_devices > 0 && var.nbd_max_devices <= 65536
+    error_message = "nbd_max_devices must be between 1 and 65536."
+  }
+}
+
 // ---
 // Build (Template Manager)
 // ---

@@ -154,3 +154,9 @@ clickhouse_cluster_size     = 0
 client_server_machine_type = "m7i.2xlarge" # supported non-metal nested virtualization shape
 api_server_machine_type    = "t3.large"    # was t3.xlarge default; matches api_spot_instance_types
 build_server_machine_type  = "m7i.2xlarge" # supported non-metal nested virtualization shape
+
+# Firecracker host capacity. Keep the kernel ceiling and warm overlay pool
+# explicit so a replacement worker cannot silently boot with a smaller NBD
+# surface than the orchestrator expects.
+nbd_max_devices = 4096
+nbd_pool_size   = 64
