@@ -76,6 +76,17 @@ variable "node_pool_name" {
   description = "Nomad node pool name for client nodes"
 }
 
+variable "node_type" {
+  type        = string
+  description = "Explicit Nomad role for this pool; controls which system jobs may schedule here."
+  default     = "worker"
+
+  validation {
+    condition     = contains(["worker", "build"], var.node_type)
+    error_message = "node_type must be worker or build."
+  }
+}
+
 variable "node_labels" {
   description = "Labels to assign to nodes for scheduling purposes"
   type        = list(string)

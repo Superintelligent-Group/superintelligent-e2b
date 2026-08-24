@@ -5,6 +5,12 @@ job "orchestrator-${latest_orchestrator_job_id}" {
   priority = 91
 
   group "client-orchestrator" {
+    # Build nodes have a separate role and must never reserve sandbox ports.
+    constraint {
+      attribute = "$${meta.node_type}"
+      operator  = "="
+      value     = "worker"
+    }
     // For future as we can remove static and allow multiple instances on one machine if needed.
     // Also network allocation is used by Nomad service discovery on API and edge API to find jobs and register them.
     network {
