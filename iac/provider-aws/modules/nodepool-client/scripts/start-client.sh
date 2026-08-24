@@ -294,10 +294,25 @@ fi
 echo "- Waiting for Nomad server registration..."
 nomad_registration_ready="false"
 set +x
+metadata_token=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 5 \
+  --request PUT --header 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \
+  http://169.254.169.254/latest/api/token)
+instance_id=$(curl --silent --show-error --fail --header "X-aws-ec2-metadata-token: $metadata_token" \
+  http://169.254.169.254/latest/meta-data/instance-id)
 for i in {1..60}; do
-  if NOMAD_TOKEN="$${NOMAD_ACL_TOKEN}" nomad node status -self >/dev/null 2>&1; then
-    nomad_registration_ready="true"
-    echo "- Nomad server registration is ready (attempt $i/60)"
+  if [ -s /run/nomad-server-addresses ]; then
+    while IFS= read -r server_address; do
+      server_http_address="http://$${server_address%:4647}:4646"
+      if curl --silent --show-error --fail --max-time 2 \
+        --header "X-Nomad-Token: $${NOMAD_ACL_TOKEN}" \
+        "$server_http_address/v1/nodes" | grep -q "\"Name\":\"$${instance_id}\""; then
+        nomad_registration_ready="true"
+        echo "- Nomad server registration is ready (attempt $i/60)"
+        break 2
+      fi
+    done < /run/nomad-server-addresses
+  fi
+  if [ "$nomad_registration_ready" = "true" ]; then
     break
   fi
   sleep 1
