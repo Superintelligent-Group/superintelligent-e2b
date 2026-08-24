@@ -389,15 +389,25 @@ function register_nomad_server_service {
 function discover_nomad_server_addresses {
   local -r consul_token="$1"
   local response=""
-  response=$(curl --silent --show-error --fail --max-time 5 \
-    --header "X-Consul-Token: $consul_token" \
-    http://127.0.0.1:8500/v1/catalog/service/nomad-server)
+  local addresses=""
+  for i in {1..60}; do
+    response=$(curl --silent --show-error --fail --max-time 5 \
+      --header "X-Consul-Token: $consul_token" \
+      http://127.0.0.1:8500/v1/catalog/service/nomad-server 2>/dev/null || true)
 
-  # Keep the generated client config deterministic and avoid a JSON parser
-  # dependency in the bootstrap image. Consul's Address field is an IPv4
-  # literal supplied by our own server registration above.
-  echo "$response" | grep -oE '"Address":"[0-9.]+"' | \
-    sed -E 's/"Address":"([0-9.]+)"/"\1:4647"/' | paste -sd, -
+    # Keep the generated client config deterministic and avoid a JSON parser
+    # dependency in the bootstrap image. Consul's Address field is an IPv4
+    # literal supplied by our own server registration above.
+    addresses=$(echo "$response" | grep -oE '"Address":"[0-9.]+"' | \
+      sed -E 's/"Address":"([0-9.]+)"/"\1:4647"/' | paste -sd, -)
+    if [[ -n "$addresses" ]]; then
+      echo "$addresses"
+      return 0
+    fi
+    log_info "No Nomad server endpoint yet; waiting for Consul catalog (attempt $i/60)"
+    sleep 1
+  done
+  return 1
 }
 
 function bootstrap {
