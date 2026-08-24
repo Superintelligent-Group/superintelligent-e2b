@@ -103,3 +103,20 @@ resource "aws_route53_record" "nomad" {
     evaluate_target_health = true
   }
 }
+
+# Keep the API hostname explicit as well.  A legacy explicit record can mask
+# the wildcard and continue routing API traffic to the retired Supabase ALB.
+# Managing this alongside the base, wildcard, and Nomad records makes every
+# public E2B control-plane hostname converge on the same ingress ALB.
+resource "aws_route53_record" "api" {
+  count   = var.manage_nomad_record ? 1 : 0
+  zone_id = data.aws_route53_zone.domain.zone_id
+  name    = "api.${var.domain_name}"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.ingress.dns_name
+    zone_id                = aws_lb.ingress.zone_id
+    evaluate_target_health = true
+  }
+}
