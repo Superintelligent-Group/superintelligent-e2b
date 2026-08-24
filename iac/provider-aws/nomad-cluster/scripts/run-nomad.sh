@@ -253,6 +253,7 @@ client {
   node_pool = "$node_pool"
   meta {
     "node_pool" = "$node_pool"
+    "node_type" = "$node_type"
     "node_labels" = "${node_labels:-}"
     ${job_constraint:+"\"job_constraint\"" = "\"$job_constraint\""}
   }
