@@ -7,7 +7,7 @@ variable "aws_profile" {
 }
 
 variable "source_ami_filter_name" {
-  type = string
+  type    = string
   default = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 }
 
@@ -21,8 +21,13 @@ variable "consul_version" {
 }
 
 variable "nomad_version" {
-  type    = string
-  default = "1.8.4"
+  type = string
+  # Keep the immutable node image on the same major/minor line as the live
+  # Nomad servers.  A client from an older line can boot successfully while
+  # silently failing to register or interpret newer jobspec fields, leaving
+  # paid capacity invisible to the scheduler.  Override this explicitly when
+  # building a deliberately different compatibility image.
+  default = "2.0.5"
 }
 
 # Keep in sync with `clickhouse_version` in iac/modules/job-clickhouse/variables.tf
