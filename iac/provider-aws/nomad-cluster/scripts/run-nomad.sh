@@ -552,6 +552,7 @@ function run {
       exit 1
     fi
     export NOMAD_SERVER_ADDRESSES="$server_addresses"
+    printf '%s\n' "$server_addresses" >/run/nomad-server-addresses
   else
     export NOMAD_SERVER_ADDRESSES=""
   fi
