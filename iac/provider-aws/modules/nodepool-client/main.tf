@@ -3,6 +3,7 @@ locals {
 
   user_data = templatefile("${local.scripts_path}/start-client.sh", {
     NODE_POOL          = var.node_pool_name
+    NODE_TYPE          = var.node_type
     CLUSTER_TAG_NAME   = var.cluster_tag_name
     CLUSTER_TAG_VALUE  = var.cluster_tag_value
     SCRIPTS_BUCKET     = var.setup_bucket_name

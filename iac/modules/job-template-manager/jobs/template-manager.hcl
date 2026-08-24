@@ -4,6 +4,12 @@ job "template-manager" {
   priority = 75
 
   group "template-manager" {
+    # Template builds run only on explicitly classified build nodes.
+    constraint {
+      attribute = "$${meta.node_type}"
+      operator  = "="
+      value     = "build"
+    }
     # Count is fetched from current Nomad state to preserve autoscaler-managed value
     count = ${current_count}
 

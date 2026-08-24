@@ -61,7 +61,7 @@ flowchart TB
         end
     end
 
-    subgraph buildnode["Build nodes"]
+    subgraph buildnode["Build nodes (role=build; no sandbox orchestrator)"]
         TM["template-manager<br/>(orchestrator binary, gRPC :5008)"]
     end
 
@@ -87,7 +87,7 @@ flowchart TB
 |---|---|---|---|
 | API | `packages/api` | API nodes | Public REST API; sandbox lifecycle, placement, auth, quotas |
 | Orchestrator | `packages/orchestrator` | every sandbox node | Runs Firecracker VMs; sandbox create/pause/resume/kill |
-| Template manager | `packages/orchestrator` (role) | build nodes | Builds templates from Docker images |
+| Template manager | `packages/orchestrator` (role) | build nodes (`meta.node_type=build`) | Builds templates from Docker images |
 | Client proxy | `packages/client-proxy` | API nodes | Edge router: sandbox URL → correct node |
 | Envd | `packages/envd` | inside every VM | In-VM agent: process/filesystem API for SDKs |
 | Dashboard API | `packages/dashboard-api` | API nodes | Backend for the web dashboard (teams, builds, admin) |
@@ -370,7 +370,8 @@ flowchart TB
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`
   (it needs root for Firecracker, namespaces, NBD, cgroups). Configured with hugepages and local
   template caches. Autoscaled.
-- **Build nodes** run the same binary in template-manager mode; the `nomad-nodepool-apm`
+- **Build nodes** run the same binary in template-manager mode, are explicitly classified as
+  `meta.node_type=build`, and never run the sandbox orchestrator; the `nomad-nodepool-apm`
   autoscaler plugin scales the job with the node pool.
 - PostgreSQL is external (connection string via secrets); Redis runs as a Nomad job or as a
   managed service; ClickHouse runs on its own pool.

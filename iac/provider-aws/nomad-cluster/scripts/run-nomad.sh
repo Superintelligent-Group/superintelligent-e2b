@@ -40,6 +40,7 @@ function print_usage {
   echo -e "  --skip-nomad-config\tIf this flag is set, don't generate a Nomad configuration file. Optional. Default is false."
   echo -e "  --api\t\tIf set, run the Nomad agent dedicated to API. Optional. Default is false."
   echo -e "  --node-labels\t\tComma-separated list of scheduling labels for this node. Optional."
+  echo -e "  --node-type\t\tExplicit node role (worker or build). Optional; defaults to worker."
   echo
   echo "Example:"
   echo
@@ -196,8 +197,9 @@ function generate_nomad_config {
   local -r user="$5"
   local -r consul_token="$6"
   local -r node_pool="$7"
-  local -r node_labels="$8"
-  local -r nomad_token="$9"
+  local -r node_type="$8"
+  local -r node_labels="$9"
+  local -r nomad_token="${10}"
   local -r config_path="$config_dir/$NOMAD_CONFIG_FILE"
 
   local instance_name=""
@@ -407,6 +409,7 @@ function run {
   local server="false"
   local client="false"
   local num_servers=""
+  local node_type="worker"
   local all_args=()
 
   while [[ $# > 0 ]]; do
@@ -439,6 +442,10 @@ function run {
       ;;
     --node-labels)
       node_labels="$2"
+      shift
+      ;;
+    --node-type)
+      node_type="$2"
       shift
       ;;
     --cluster-tag-value)
@@ -493,7 +500,12 @@ function run {
     assert_not_empty "--nomad-token" "$nomad_token"
   fi
 
-  generate_nomad_config "$server" "$client" "$num_servers" "$config_dir" "$user" "$consul_token" "$node_pool" "$node_labels" "$nomad_token"
+  if [[ "$node_type" != "worker" && "$node_type" != "build" ]]; then
+    log_error "The value for '--node-type' must be worker or build"
+    exit 1
+  fi
+
+  generate_nomad_config "$server" "$client" "$num_servers" "$config_dir" "$user" "$consul_token" "$node_pool" "$node_type" "$node_labels" "$nomad_token"
   generate_supervisor_config "$SUPERVISOR_CONFIG_PATH" "$config_dir" "$data_dir" "$bin_dir" "$log_dir" "$user" "$use_sudo"
   start_nomad
 

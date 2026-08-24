@@ -319,6 +319,7 @@ module "build" {
   machine_type        = var.build_machine_type
 
   node_pool_name                    = var.build_node_pool_name
+  node_type                         = "build"
   node_labels                       = var.build_node_labels
   nested_virtualization             = var.build_server_nested_virtualization
   aws_ecr_account_repository_domain = local.aws_ecr_account_repository_domain
@@ -362,6 +363,7 @@ module "client" {
   machine_type        = var.client_machine_type
 
   node_pool_name                    = var.client_node_pool_name
+  node_type                         = "worker"
   node_labels                       = var.client_node_labels
   base_hugepages_percentage         = var.client_base_hugepages_percentage
   nested_virtualization             = var.client_server_nested_virtualization
