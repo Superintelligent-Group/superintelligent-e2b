@@ -262,6 +262,31 @@ set +x
 /opt/nomad/bin/run-nomad.sh --client --consul-token "$${CONSUL_TOKEN}" --nomad-token "$${NOMAD_ACL_TOKEN}" --node-pool "${NODE_POOL}" --node-type "${NODE_TYPE}" --node-labels "${NODE_LABELS}" &
 set -x
 
+# Do not report cloud-init success until the local Nomad client is serving.
+# This bounded gate leaves actionable console/journal evidence on failure;
+# server-side node registration is checked by the deployment acceptance probe.
+echo "- Waiting for local Nomad client health..."
+nomad_health_ready="false"
+for i in {1..60}; do
+  if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:4646/v1/agent/health >/dev/null 2>&1; then
+    nomad_health_ready="true"
+    echo "- Nomad client health is ready (attempt $i/60)"
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$nomad_health_ready" != "true" ]]; then
+  echo "- ERROR: Nomad client did not become healthy after 60 seconds"
+  supervisorctl status nomad || true
+  for log_file in /opt/nomad/log/*; do
+    [[ -f "$log_file" ]] || continue
+    echo "--- $log_file (tail) ---"
+    tail -n 80 "$log_file" || true
+  done
+  exit 1
+fi
+
 # Add alias for ssh-ing to sbx
 echo '_sbx_ssh() {
   local address=$(dig @127.0.0.4 $1. A +short 2>/dev/null)
