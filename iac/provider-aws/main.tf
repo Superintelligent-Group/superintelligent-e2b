@@ -198,6 +198,7 @@ locals {
     S3_USE_PATH_STYLE            = tostring(var.s3_use_path_style)
     AWS_REGION                   = data.aws_region.current.id
     AWS_DOCKER_REPOSITORY_NAME   = module.init.custom_environments_repository_name
+    NBD_POOL_SIZE                = tostring(var.nbd_pool_size)
     API_SECRET                   = module.init.api_secret
     ENVIRONMENT                  = var.environment
     DOMAIN_NAME                  = var.domain_name
@@ -288,6 +289,7 @@ module "cluster" {
   client_machine_type                 = var.client_server_machine_type
   client_security_group_ids           = [aws_security_group.cluster_node.id]
   client_server_nested_virtualization = var.client_server_nested_virtualization
+  nbd_max_devices                     = var.nbd_max_devices
   client_node_labels                  = var.client_node_labels
 
   postgres_ebs_az = "${data.aws_region.current.id}c" # Must match API node AZ

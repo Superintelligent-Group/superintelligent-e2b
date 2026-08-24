@@ -15,6 +15,7 @@ locals {
     FC_BUSYBOX_BUCKET_NAME      = var.fc_busybox_bucket_name
     NODE_LABELS                 = join(",", var.node_labels)
     BASE_HUGEPAGES_PERCENTAGE   = var.base_hugepages_percentage
+    NBD_MAX_DEVICES             = var.nbd_max_devices
 
     AWS_ECR_ACCOUNT_REPOSITORY_DOMAIN = var.aws_ecr_account_repository_domain
 

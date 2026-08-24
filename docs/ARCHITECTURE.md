@@ -369,7 +369,10 @@ flowchart TB
 - **API nodes** host every control-plane container and are the only LB backend.
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`
   (it needs root for Firecracker, namespaces, NBD, cgroups). Configured with hugepages and local
-  template caches. Autoscaled.
+  template caches. The NBD kernel capacity and the orchestrator's warm overlay pool are declared
+  together in Terraform; node bootstrap persists and verifies the kernel ceiling before Nomad is
+  started, so a worker cannot silently run with fewer overlay devices than its configured pool.
+  Autoscaled.
 - **Build nodes** run the same binary in template-manager mode, are explicitly classified as
   `meta.node_type=build`, and never run the sandbox orchestrator; the `nomad-nodepool-apm`
   autoscaler plugin scales the job with the node pool.
