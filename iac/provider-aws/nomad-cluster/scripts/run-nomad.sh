@@ -552,7 +552,9 @@ function run {
       exit 1
     fi
     export NOMAD_SERVER_ADDRESSES="$server_addresses"
-    printf '%s\n' "$server_addresses" >/run/nomad-server-addresses
+    # Keep the runtime probe's address file machine-readable while retaining
+    # HCL quoting in the generated client stanza.
+    printf '%s\n' "$server_addresses" | tr -d '\"' | tr ',' '\n' >/run/nomad-server-addresses
   else
     export NOMAD_SERVER_ADDRESSES=""
   fi
