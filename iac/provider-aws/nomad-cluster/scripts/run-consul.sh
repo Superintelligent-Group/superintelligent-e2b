@@ -397,6 +397,16 @@ function start_consul {
   sudo systemctl daemon-reload
   sudo systemctl enable consul.service
   sudo systemctl restart consul.service
+
+  # Fail with actionable evidence instead of leaving the caller in an
+  # unbounded readiness loop.  Bootstrap is an operational gate: a node that
+  # cannot prove Consul health must never continue on to Nomad registration.
+  if ! sudo systemctl is-active --quiet consul.service; then
+    log_error "Consul service failed to become active"
+    sudo systemctl --no-pager --full status consul.service || true
+    sudo journalctl --no-pager -u consul.service -n 80 || true
+    return 1
+  fi
 }
 
 function bootstrap {
@@ -432,9 +442,18 @@ function bootstrap {
 function setup_dns_resolving {
   local consul_token="$1"
   local dns_request_token="$2"
+  local attempts=0
+  local -r max_attempts=120
 
   until consul info -token="${consul_token}" > /dev/null 2>&1;
   do
+    attempts=$((attempts + 1))
+    if ((attempts >= max_attempts)); then
+      log_error "Consul did not become ready after ${max_attempts}s"
+      sudo systemctl --no-pager --full status consul.service || true
+      sudo journalctl --no-pager -u consul.service -n 80 || true
+      return 1
+    fi
     log_info "Waiting for Consul to start"
     sleep 1
   done
