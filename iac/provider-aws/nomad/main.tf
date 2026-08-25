@@ -130,11 +130,11 @@ module "api" {
 
 data "aws_s3_object" "orchestrator" {
   bucket = var.fc_env_pipeline_bucket_name
-  key    = "orchestrator"
+  key    = var.orchestrator_artifact_key
 }
 
 locals {
-  orchestrator_artifact_source = "s3::https://${var.fc_env_pipeline_bucket_name}.s3.${var.aws_region}.amazonaws.com/orchestrator?etag=${data.aws_s3_object.orchestrator.etag}"
+  orchestrator_artifact_source = "s3::https://${var.fc_env_pipeline_bucket_name}.s3.${var.aws_region}.amazonaws.com/${var.orchestrator_artifact_key}?etag=${data.aws_s3_object.orchestrator.etag}"
 }
 
 module "orchestrator" {
@@ -152,11 +152,11 @@ module "orchestrator" {
 
 data "aws_s3_object" "template_manager" {
   bucket = var.fc_env_pipeline_bucket_name
-  key    = "template-manager"
+  key    = var.template_manager_artifact_key
 }
 
 locals {
-  template_manager_artifact_source = "s3::https://${var.fc_env_pipeline_bucket_name}.s3.${var.aws_region}.amazonaws.com/template-manager?etag=${data.aws_s3_object.template_manager.etag}"
+  template_manager_artifact_source = "s3::https://${var.fc_env_pipeline_bucket_name}.s3.${var.aws_region}.amazonaws.com/${var.template_manager_artifact_key}?etag=${data.aws_s3_object.template_manager.etag}"
 }
 
 module "template_manager" {

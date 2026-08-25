@@ -1,10 +1,20 @@
+# The Docker build context is `packages/`, so the repository-level guard
+# includes are intentionally unavailable inside the isolated compiler image.
+# Upload targets still load them from the full checkout; the image only runs
+# build-local and never performs a provider write.
+ifneq ($(wildcard ../../scripts/make-raw-input-authority.mk),)
 include ../../scripts/make-raw-input-authority.mk
 $(call aws_guard_writer_inputs)
+endif
 ENV := $(shell cat ../../.last_used_env || echo "not-set")
 -include ../../.env.${ENV}
+ifneq ($(wildcard ../../scripts/make-raw-input-authority.mk),)
 $(call aws_guard_writer_inputs)
+endif
 
+ifneq ($(wildcard ../../scripts/aws-account-authority.mk),)
 include ../../scripts/aws-account-authority.mk
+endif
 
 AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
 GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
@@ -110,11 +120,14 @@ endif
 
 .PHONY: upload/orchestrator
 upload/orchestrator: aws-write-account-guard
+	$(eval COMMIT_SHA := $(shell git rev-parse --short HEAD))
 	chmod +x ./bin/orchestrator
 ifeq ($(PROVIDER),aws)
 	aws s3 cp ./bin/orchestrator "s3://${AWS_BUCKET_PREFIX}fc-env-pipeline/orchestrator" --profile ${AWS_PROFILE} --cache-control "no-cache, max-age=0"
+	aws s3 cp ./bin/orchestrator "s3://${AWS_BUCKET_PREFIX}fc-env-pipeline/orchestrator.$(COMMIT_SHA)" --profile ${AWS_PROFILE} --cache-control "no-cache, max-age=0"
 else
 	gsutil -h "Cache-Control:no-cache, max-age=0" cp ./bin/orchestrator "gs://${GCP_BUCKET_PREFIX}fc-env-pipeline/orchestrator"
+	gsutil -h "Cache-Control:no-cache, max-age=0" cp ./bin/orchestrator "gs://${GCP_BUCKET_PREFIX}fc-env-pipeline/orchestrator.$(COMMIT_SHA)"
 endif
 
 .PHONY: upload/template-manager
