@@ -222,6 +222,14 @@ into the cloud artifact registry (`/v2/e2b/custom-envs/<templateID>` → project
 | **Object storage** (GCS/S3/local, `packages/shared/pkg/storage`) | orchestrator, template-manager | Template & snapshot artifacts, keyed by build ID: `{buildID}/memfile`, `{buildID}/rootfs.ext4`, `{buildID}/snapfile`, `{buildID}/metadata.json` + `.header` index files |
 | **Consul KV** | orchestrator | Network slot allocation across restarts |
 
+The native Nomad binaries are a separate deployment artifact from template
+contents. AWS publishes each promoted orchestrator and template-manager binary
+under a commit-keyed S3 object (for example `orchestrator.<commit>` and
+`template-manager.<commit>`). The AWS Nomad module accepts those object keys as
+inputs and includes the selected object's ETag in the artifact URL; mutable
+compatibility aliases may exist, but a promotion should always pass the
+commit-keyed inputs so a later upload cannot silently change a running job.
+
 A template and a paused-sandbox snapshot have the **same artifact shape** — a snapshot is just a
 new build whose memfile/rootfs are stored as diffs against the template it came from (diff chains
 are resolved through the `.header` files).

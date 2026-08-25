@@ -227,6 +227,18 @@ variable "fc_env_pipeline_bucket_name" {
   type = string
 }
 
+variable "orchestrator_artifact_key" {
+  type        = string
+  description = "Promoted S3 object key for the orchestrator binary. Prefer the immutable orchestrator.<commit> key."
+  default     = "orchestrator"
+}
+
+variable "template_manager_artifact_key" {
+  type        = string
+  description = "Promoted S3 object key for the template-manager binary. Prefer the immutable template-manager.<commit> key."
+  default     = "template-manager"
+}
+
 variable "template_bucket_name" {
   type = string
 }
