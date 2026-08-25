@@ -53,7 +53,7 @@ func (s *scriptedClient) GetStatus(context.Context, uuid.UUID, string, uuid.UUID
 	return result.resp, result.err
 }
 
-func (s *scriptedClient) SetStatus(_ context.Context, _ uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) error {
+func (s *scriptedClient) SetTerminalStatus(_ context.Context, _ uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -61,6 +61,10 @@ func (s *scriptedClient) SetStatus(_ context.Context, _ uuid.UUID, statusGroup t
 		s.failedReasons = append(s.failedReasons, reason.GetMessage())
 	}
 
+	return true, nil
+}
+
+func (s *scriptedClient) DeleteBuild(context.Context, uuid.UUID, string, uuid.UUID, string) error {
 	return nil
 }
 
