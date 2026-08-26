@@ -31,7 +31,7 @@ import (
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/layer")
 
 type uploadWaiter interface {
-	Wait(context.Context) error
+	Wait(ctx context.Context) error
 }
 
 type LayerExecutor struct {

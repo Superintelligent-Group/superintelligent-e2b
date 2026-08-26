@@ -15,10 +15,13 @@ type testUploadWaiter struct {
 
 func (w *testUploadWaiter) Wait(context.Context) error {
 	w.waits++
+
 	return w.err
 }
 
 func TestWaitForParentUploadConsumesSuccessfulUpload(t *testing.T) {
+	t.Parallel()
+
 	upload := &testUploadWaiter{}
 	executor := &LayerExecutor{pendingUploads: map[string]uploadWaiter{"parent": upload}}
 
@@ -34,6 +37,8 @@ func TestWaitForParentUploadConsumesSuccessfulUpload(t *testing.T) {
 }
 
 func TestWaitForParentUploadKeepsFailedUploadForRetry(t *testing.T) {
+	t.Parallel()
+
 	wantErr := errors.New("upload failed")
 	upload := &testUploadWaiter{err: wantErr}
 	executor := &LayerExecutor{pendingUploads: map[string]uploadWaiter{"parent": upload}}
