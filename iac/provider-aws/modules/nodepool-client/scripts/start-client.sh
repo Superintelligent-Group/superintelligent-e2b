@@ -286,6 +286,71 @@ set +x
 /opt/nomad/bin/run-nomad.sh --client --consul-token "$${CONSUL_TOKEN}" --nomad-token "$${NOMAD_ACL_TOKEN}" --node-pool "${NODE_POOL}" --node-type "${NODE_TYPE}" --node-labels "${NODE_LABELS}" &
 set -x
 
+# Do not report cloud-init success until the local Nomad client is serving.
+# This bounded gate leaves actionable console/journal evidence on failure;
+# server-side node registration is checked by the deployment acceptance probe.
+echo "- Waiting for local Nomad client health..."
+nomad_health_ready="false"
+for i in {1..60}; do
+  if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:4646/v1/agent/health >/dev/null 2>&1; then
+    nomad_health_ready="true"
+    echo "- Nomad client health is ready (attempt $i/60)"
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$nomad_health_ready" != "true" ]]; then
+  echo "- ERROR: Nomad client did not become healthy after 60 seconds"
+  supervisorctl status nomad || true
+  for log_file in /opt/nomad/log/*; do
+    [[ -f "$log_file" ]] || continue
+    echo "--- $log_file (tail) ---"
+    tail -n 80 "$log_file" || true
+  done
+  exit 1
+fi
+
+# A listening local agent is necessary but not sufficient: the client must
+# complete its RPC registration with a Nomad server before this node can run
+# work. Keep this bounded and leave the rendered config plus supervisor logs
+# in the console when the registration contract is not met.
+echo "- Waiting for Nomad server registration..."
+nomad_registration_ready="false"
+set +x
+metadata_token=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 5 \
+  --request PUT --header 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \
+  http://169.254.169.254/latest/api/token)
+instance_id=$(curl --silent --show-error --fail --header "X-aws-ec2-metadata-token: $metadata_token" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+for i in {1..60}; do
+  if [ -s /run/nomad-server-addresses ]; then
+    while IFS= read -r server_address; do
+      server_http_address="http://$${server_address%:4647}:4646"
+      if curl --silent --show-error --fail --max-time 2 \
+        --header "X-Nomad-Token: $${NOMAD_ACL_TOKEN}" \
+        "$server_http_address/v1/nodes" | grep -q "\"Name\":\"$${instance_id}\""; then
+        nomad_registration_ready="true"
+        echo "- Nomad server registration is ready (attempt $i/60)"
+        break 2
+      fi
+    done < /run/nomad-server-addresses
+  fi
+  if [ "$nomad_registration_ready" = "true" ]; then
+    break
+  fi
+  sleep 1
+done
+set -x
+if [ "$nomad_registration_ready" != "true" ]; then
+  echo "- ERROR: Nomad client did not register with a server after 60 seconds"
+  echo "- Rendered client configuration:"
+  sed -n '/^client {/,/^}/p' /opt/nomad/config/default.hcl || true
+  supervisorctl status nomad || true
+  tail -n 120 /var/log/nomad/* 2>/dev/null || true
+  exit 1
+fi
+
 # Add alias for ssh-ing to sbx
 echo '_sbx_ssh() {
   local address=$(dig @127.0.0.4 $1. A +short 2>/dev/null)

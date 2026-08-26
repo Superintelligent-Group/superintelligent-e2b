@@ -12,8 +12,8 @@ const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-e
 const profile = process.env.AWS_PROFILE || undefined
 const allowed = new Set(['c7i', 'm7i', 'r7i', 'c7i-flex', 'm7i-flex', 'c8i', 'm8i', 'r8i', 'c8i-flex', 'm8i-flex', 'r8i-flex', 'c8id', 'm8id', 'r8id', 'x8i', 'i7i'])
 const pools = [
-  { asg: 'e2b-orch-build', lt: 'lt-0d7f4811fc7e98c39' },
-  { asg: 'e2b-orch-client', lt: 'lt-06c34f58c639c8923' },
+  { asg: process.env.E2B_BUILD_ASG || 'e2b-orch-build' },
+  { asg: process.env.E2B_CLIENT_ASG || 'e2b-orch-client' },
 ]
 
 function aws(args) {
@@ -31,9 +31,12 @@ function family(type) {
 const evidence = { region, readOnly: true, pools: [], checks: [] }
 for (const pool of pools) {
   const group = aws(['autoscaling', 'describe-auto-scaling-groups', '--auto-scaling-group-names', pool.asg]).AutoScalingGroups?.[0]
-  const latest = aws(['ec2', 'describe-launch-template-versions', '--launch-template-id', pool.lt, '--versions', '$Latest']).LaunchTemplateVersions?.[0]
-  if (!group || !latest) {
-    fail(`missing live resource for ${pool.asg}`)
+  const launchTemplateId = group?.LaunchTemplate?.LaunchTemplateId
+  const latest = launchTemplateId
+    ? aws(['ec2', 'describe-launch-template-versions', '--launch-template-id', launchTemplateId, '--versions', '$Latest']).LaunchTemplateVersions?.[0]
+    : undefined
+  if (!group || !launchTemplateId || !latest) {
+    fail(`missing live ASG or launch template for ${pool.asg}`)
     continue
   }
   const type = latest.LaunchTemplateData?.InstanceType
@@ -41,7 +44,7 @@ for (const pool of pools) {
   const pointer = String(group.LaunchTemplate?.Version || '')
   const record = {
     asg: pool.asg,
-    launchTemplateId: pool.lt,
+    launchTemplateId,
     latestVersion: version,
     asgVersion: pointer,
     instanceType: type,

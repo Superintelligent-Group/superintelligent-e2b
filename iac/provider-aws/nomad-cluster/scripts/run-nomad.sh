@@ -199,7 +199,6 @@ function generate_nomad_config {
   local -r node_pool="$7"
   local -r node_type="$8"
   local -r node_labels="$9"
-  local -r nomad_token="${10}"
   local -r config_path="$config_dir/$NOMAD_CONFIG_FILE"
 
   local instance_name=""
@@ -207,24 +206,12 @@ function generate_nomad_config {
   local instance_region=""
   local instance_zone=""
   local job_constraint=""
-  local agent_acl_config=""
 
   instance_name=$(get_instance_name)
   instance_ip_address=$(get_instance_ip_address)
   instance_region=$(get_instance_region)
   zone=$(get_instance_zone)
   job_constraint=$(get_instance_tag_value "job-constraint" || true)
-
-  if [[ "$client" == "true" ]]; then
-    agent_acl_config=$(cat <<EOF
-  tokens {
-    # Client agents authenticate their RPC heartbeats to ACL-enabled servers.
-    # The token is resolved from the cluster secret at boot.
-    agent = "$nomad_token"
-  }
-EOF
-)
-  fi
 
   local server_config=""
   if [[ "$server" == "true" ]]; then
@@ -251,6 +238,7 @@ EOF
 client {
   enabled = true
   node_pool = "$node_pool"
+  servers = [$NOMAD_SERVER_ADDRESSES]
   meta {
     "node_pool" = "$node_pool"
     "node_type" = "$node_type"
@@ -315,8 +303,10 @@ telemetry {
 }
 
 acl {
+  # Nomad 1.8.x has no client-agent token field in the agent HCL schema.
+  # Client registration is authenticated by the cluster's RPC/security
+  # boundary; API tokens are supplied only to explicit CLI/API operations.
   enabled = true
-$agent_acl_config
 }
 
 limits {
@@ -368,12 +358,61 @@ function start_nomad {
   supervisorctl update
 }
 
-function bootstrap {
-  log_info "Waiting for Nomad to start"
-  while test -z "$(curl -s http://127.0.0.1:4646/v1/agent/health)"; do
-    log_info "Nomad not yet started. Waiting for 1 second."
+function wait_for_nomad_health {
+  log_info "Waiting for local Nomad agent health"
+  for i in {1..60}; do
+    if curl --silent --show-error --fail --max-time 2 \
+      http://127.0.0.1:4646/v1/agent/health >/dev/null 2>&1; then
+      log_info "Nomad agent health is ready (attempt $i/60)"
+      return 0
+    fi
     sleep 1
   done
+  log_error "Nomad agent did not become healthy after 60 seconds"
+  supervisorctl status nomad || true
+  tail -n 80 /var/log/nomad/* 2>/dev/null || true
+  return 1
+}
+
+function register_nomad_server_service {
+  local -r instance_ip_address="$1"
+  local -r consul_token="$2"
+  log_info "Registering Nomad RPC endpoint in Consul"
+  curl --silent --show-error --fail --max-time 5 \
+    --request PUT \
+    --header "X-Consul-Token: $consul_token" \
+    --header "Content-Type: application/json" \
+    --data "{\"ID\":\"nomad-server-$instance_ip_address\",\"Name\":\"nomad-server\",\"Address\":\"$instance_ip_address\",\"Port\":4647}" \
+    http://127.0.0.1:8500/v1/agent/service/register >/dev/null
+}
+
+function discover_nomad_server_addresses {
+  local -r consul_token="$1"
+  local response=""
+  local addresses=""
+  for i in {1..60}; do
+    response=$(curl --silent --show-error --fail --max-time 5 \
+      --header "X-Consul-Token: $consul_token" \
+      http://127.0.0.1:8500/v1/catalog/service/nomad-server 2>/dev/null || true)
+
+    # Keep the generated client config deterministic and avoid a JSON parser
+    # dependency in the bootstrap image. Consul's Address field is an IPv4
+    # literal supplied by our own server registration above.
+    addresses=$(echo "$response" | grep -oE '"Address":"[0-9.]+"' | \
+      sed -E 's/"Address":"([0-9.]+)"/"\1:4647"/' | paste -sd, -)
+    if [[ -n "$addresses" ]]; then
+      echo "$addresses"
+      return 0
+    fi
+    log_info "No Nomad server endpoint yet; waiting for Consul catalog (attempt $i/60)"
+    sleep 1
+  done
+  return 1
+}
+
+function bootstrap {
+  log_info "Waiting for Nomad to start"
+  wait_for_nomad_health || exit 1
   log_info "Nomad server started."
 
   local -r nomad_token="$1"
@@ -506,13 +545,28 @@ function run {
     exit 1
   fi
 
-  generate_nomad_config "$server" "$client" "$num_servers" "$config_dir" "$user" "$consul_token" "$node_pool" "$node_type" "$node_labels" "$nomad_token"
+  if [[ "$client" == "true" ]]; then
+    local -r server_addresses="$(discover_nomad_server_addresses "$consul_token")"
+    if [[ -z "$server_addresses" ]]; then
+      log_error "No Nomad server endpoints were discoverable through Consul"
+      exit 1
+    fi
+    export NOMAD_SERVER_ADDRESSES="$server_addresses"
+    # Keep the runtime probe's address file machine-readable while retaining
+    # HCL quoting in the generated client stanza.
+    printf '%s\n' "$server_addresses" | tr -d '\"' | tr ',' '\n' >/run/nomad-server-addresses
+  else
+    export NOMAD_SERVER_ADDRESSES=""
+  fi
+
+  generate_nomad_config "$server" "$client" "$num_servers" "$config_dir" "$user" "$consul_token" "$node_pool" "$node_type" "$node_labels"
   generate_supervisor_config "$SUPERVISOR_CONFIG_PATH" "$config_dir" "$data_dir" "$bin_dir" "$log_dir" "$user" "$use_sudo"
   start_nomad
 
   if [[ "$server" == "true" ]]; then
     bootstrap "$nomad_token"
     create_node_pools "$nomad_token"
+    register_nomad_server_service "$(get_instance_ip_address)" "$consul_token"
   fi
 }
 
