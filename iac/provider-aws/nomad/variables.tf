@@ -217,6 +217,12 @@ variable "orchestrator_proxy_port" {
   default = 5007
 }
 
+variable "orchestrator_memory_mb" {
+  type        = number
+  description = "Nomad memory reservation for the orchestrator and Firecracker children."
+  default     = 4096
+}
+
 variable "orchestrator_env_vars" {
   type      = map(string)
   default   = {}

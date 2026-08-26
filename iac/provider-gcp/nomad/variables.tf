@@ -10,6 +10,12 @@ variable "orchestrator_node_pool" {
   type = string
 }
 
+variable "orchestrator_memory_mb" {
+  type        = number
+  description = "Nomad memory reservation for the orchestrator and Firecracker children."
+  default     = 4096
+}
+
 variable "core_repository_name" {
   type = string
 }

@@ -357,6 +357,7 @@ module "orchestrator" {
   node_pool  = var.orchestrator_node_pool
   port       = var.orchestrator_port
   proxy_port = var.orchestrator_proxy_port
+  memory_mb  = var.orchestrator_memory_mb
 
   environment           = var.environment
   artifact_source       = local.orchestrator_artifact_source
