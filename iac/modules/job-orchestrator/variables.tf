@@ -10,6 +10,12 @@ variable "proxy_port" {
   type = number
 }
 
+variable "memory_mb" {
+  type        = number
+  description = "Nomad memory reservation for the orchestrator process and its Firecracker children. Must include guest RAM plus host/runtime headroom."
+  default     = 4096
+}
+
 variable "environment" {
   type = string
 }

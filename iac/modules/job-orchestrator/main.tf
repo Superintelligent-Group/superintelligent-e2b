@@ -8,6 +8,7 @@ locals {
     node_pool  = var.node_pool
     port       = var.port
     proxy_port = var.proxy_port
+    memory_mb  = var.memory_mb
 
     artifact_source = var.artifact_source
 

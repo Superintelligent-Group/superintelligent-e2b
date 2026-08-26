@@ -83,7 +83,11 @@ job "orchestrator-${latest_orchestrator_job_id}" {
       }
 
       resources {
-        memory     = 1024
+        # Firecracker's guest RAM is mmap'd by the orchestrator while loading
+        # snapshots. Reserve enough cgroup headroom for the guest plus the
+        # orchestrator/UFFD process; reserving less than guest RAM fails with
+        # "mmap memfd: cannot allocate memory" even when the host has free RAM.
+        memory     = ${memory_mb}
         memory_max = -1
       }
 

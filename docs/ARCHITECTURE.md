@@ -376,8 +376,10 @@ flowchart TB
   RPC heartbeats without embedding credentials in launch-template user-data.
 - **API nodes** host every control-plane container and are the only LB backend.
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`
-  (it needs root for Firecracker, namespaces, NBD, cgroups). Configured with hugepages and local
-  template caches. The NBD kernel capacity and the orchestrator's warm overlay pool are declared
+  (it needs root for Firecracker, namespaces, NBD, cgroups). Its Nomad memory reservation is
+  parameterized above the largest guest template so Firecracker's snapshot memfd mapping has
+  cgroup headroom; reserving less than guest RAM can fail even when host memory is available.
+  Configured with hugepages and local template caches. The NBD kernel capacity and the orchestrator's warm overlay pool are declared
   together in Terraform; node bootstrap persists and verifies the kernel ceiling before Nomad is
   started, so a worker cannot silently run with fewer overlay devices than its configured pool.
   Autoscaled.
