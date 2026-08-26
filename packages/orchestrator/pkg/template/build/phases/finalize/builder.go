@@ -219,7 +219,7 @@ func (ppb *PostProcessingBuilder) Build(
 		// this wrapper, failures while creating or running the final sandbox escape
 		// without PhaseMeta and are reduced to an opaque internal error by the
 		// template server, leaving the caller with no actionable step or logs.
-		return phases.LayerResult{}, phases.NewPhaseBuildError(
+		return phases.LayerResult{}, phases.NewInternalPhaseBuildError(
 			ppb.Metadata(),
 			fmt.Errorf("error running start and ready commands in sandbox: %w", err),
 		)

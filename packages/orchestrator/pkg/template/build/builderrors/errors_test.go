@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases"
@@ -28,6 +29,30 @@ func TestWrapContextAsUserError_AlreadyUserError(t *testing.T) {
 	got := WrapContextAsUserError(ctx, userErr)
 	if !errors.Is(got, userErr) {
 		t.Errorf("expected original user error returned as-is, got %v", got)
+	}
+}
+
+func TestUnwrapUserError_InternalPhasePreservesStepWithoutExposingDetails(t *testing.T) {
+	t.Parallel()
+
+	internalErr := phases.NewInternalPhaseBuildError(
+		phases.PhaseMeta{Phase: "finalize", StepType: "finalize"},
+		errors.New("private sandbox startup detail"),
+	)
+
+	if IsUserError(internalErr) {
+		t.Fatal("internal phase error must remain an internal error")
+	}
+
+	reason := UnwrapUserError(internalErr)
+	if reason.GetMessage() != InternalErrorMessage {
+		t.Fatalf("message = %q, want generic internal message", reason.GetMessage())
+	}
+	if reason.GetStep() != "finalize" {
+		t.Fatalf("step = %q, want finalize", reason.GetStep())
+	}
+	if strings.Contains(reason.GetMessage(), "private sandbox startup detail") {
+		t.Fatal("internal error detail leaked into public reason")
 	}
 }
 

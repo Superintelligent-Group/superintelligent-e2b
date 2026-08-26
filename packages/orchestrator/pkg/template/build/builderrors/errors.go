@@ -23,7 +23,8 @@ var (
 // IsUserError returns true if the error is a user error (i.e., a PhaseBuildError).
 // User errors are caused by the user's configuration and should be shown to them.
 func IsUserError(err error) bool {
-	return phases.UnwrapPhaseBuildError(err) != nil
+	phaseBuildError := phases.UnwrapPhaseBuildError(err)
+	return phaseBuildError != nil && phaseBuildError.UserFacing
 }
 
 // WrapContextAsUserError wraps context errors as user errors only when the build-level
@@ -64,6 +65,14 @@ func WrapContextAsUserError(buildCtx context.Context, err error) error {
 func UnwrapUserError(err error) *template_manager.TemplateBuildStatusReason {
 	phaseBuildError := phases.UnwrapPhaseBuildError(err)
 	if phaseBuildError != nil {
+		if !phaseBuildError.UserFacing {
+			step := phaseBuildError.Step
+			return &template_manager.TemplateBuildStatusReason{
+				Message: InternalErrorMessage,
+				Step:    &step,
+			}
+		}
+
 		return &template_manager.TemplateBuildStatusReason{
 			Message: phaseBuildError.Error(),
 			Step:    &phaseBuildError.Step,
