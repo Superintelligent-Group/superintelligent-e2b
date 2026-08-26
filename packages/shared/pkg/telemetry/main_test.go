@@ -6,6 +6,8 @@ import (
 )
 
 func TestNewWithoutCollectorUsesNoopClient(t *testing.T) {
+	t.Parallel()
+
 	previous := otelCollectorGRPCEndpoint
 	otelCollectorGRPCEndpoint = ""
 	t.Cleanup(func() { otelCollectorGRPCEndpoint = previous })
