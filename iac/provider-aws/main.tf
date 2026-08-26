@@ -343,6 +343,7 @@ module "nomad" {
   orchestrator_node_pool              = local.client_pool_name
   orchestrator_port                   = var.orchestrator_port
   orchestrator_proxy_port             = var.orchestrator_proxy_port
+  orchestrator_memory_mb              = var.orchestrator_memory_mb
   fc_env_pipeline_bucket_name         = module.init.fc_env_pipeline_bucket_name
   template_bucket_name                = module.init.fc_template_bucket_name
   build_cache_bucket_name             = module.init.fc_template_build_cache_bucket_name

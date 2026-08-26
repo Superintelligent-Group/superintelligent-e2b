@@ -260,6 +260,17 @@ variable "orchestrator_proxy_port" {
   default = 5007
 }
 
+variable "orchestrator_memory_mb" {
+  type        = number
+  description = "Nomad memory reservation for the orchestrator and Firecracker children. Must cover the largest promoted snapshot plus restore headroom."
+  default     = 12288
+
+  validation {
+    condition     = var.orchestrator_memory_mb >= 10240
+    error_message = "orchestrator_memory_mb must be at least 10240 MiB for the current governed code snapshot."
+  }
+}
+
 variable "allow_sandbox_internal_cidrs" {
   type        = string
   description = "Comma-separated CIDRs to allow through the sandbox firewall deny list (e.g. 10.0.0.1/32,10.0.0.2/32)"

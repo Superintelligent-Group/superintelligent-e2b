@@ -13,7 +13,16 @@ variable "proxy_port" {
 variable "memory_mb" {
   type        = number
   description = "Nomad memory reservation for the orchestrator process and its Firecracker children. Must include guest RAM plus host/runtime headroom."
-  default     = 4096
+  # The smallest governed code snapshot is currently ~9.2 GiB. 4 GiB lets the
+  # job schedule but guarantees Firecracker's memfd restore will fail inside
+  # the cgroup. Keep a conservative default; deployments with larger guests
+  # should override this alongside the template catalog.
+  default     = 12288
+
+  validation {
+    condition     = var.memory_mb >= 10240
+    error_message = "memory_mb must be at least 10240 MiB so a 9.2 GiB snapshot has restore headroom."
+  }
 }
 
 variable "environment" {
