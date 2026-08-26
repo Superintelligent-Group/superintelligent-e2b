@@ -37,8 +37,10 @@ domain_name = "e2b.superintelligent.group"
 hosted_zone_name    = "e2b.superintelligent.group"
 acm_certificate_arn = "arn:aws:acm:us-east-1:014155356804:certificate/152016f3-f662-42b6-8a99-763d2d991dee"
 
-# DNS — using Cloudflare (leave Route53 disabled)
-create_route53_record = false
+# DNS — external authority remains the default. Enable only after the
+# canonical-ingress probe passes and a Route53 write role is explicitly
+# authorized for this account.
+manage_nomad_route53_record = false
 
 # -----------------------------------------------------------------------------
 # S3 Buckets (already exist from prior setup)
