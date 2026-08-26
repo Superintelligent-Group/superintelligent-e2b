@@ -35,6 +35,16 @@ type SourceTemplateProvider interface {
 	Get(ctx context.Context, templateCache *sbxtemplate.Cache) (sbxtemplate.Template, error)
 }
 
+// BuildIDSourceTemplateProvider identifies a parent layer produced by this
+// builder. The layer executor uses the identifier to wait for an in-process
+// snapshot upload before resolving the parent. Providers that return a
+// template which is already materialized (for example the base layer) do not
+// need to implement this interface.
+type BuildIDSourceTemplateProvider interface {
+	SourceTemplateProvider
+	BuildID() string
+}
+
 // LayerBuildCommand encapsulates all parameters needed for building a layer
 type LayerBuildCommand struct {
 	SourceTemplate SourceTemplateProvider

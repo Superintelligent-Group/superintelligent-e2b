@@ -336,7 +336,10 @@ sequenceDiagram
 Builds are **layered** (`pkg/template/build/phases/`): base → user → one layer per recipe step →
 resize disk → finalize → optimize. Each layer is hashed and cached, so rebuilds only re-run changed
 steps. Resize disk grows the quiescent rootfs on the host; the other non-cached phases run in a real
-Firecracker VM and their pause-diffs become layers. The optimize phase records which memory pages a
+Firecracker VM and their pause-diffs become layers. A derived phase may cache its local snapshot
+before the object upload finishes, but the next derived phase establishes a per-parent upload
+barrier before resolving that layer; this keeps the fast concurrent upload path while preventing a
+cross-cache read of an incomplete parent. The optimize phase records which memory pages a
 fresh resume touches, producing prefetch hints that speed up future sandbox starts.
 
 ## Deployment topology
