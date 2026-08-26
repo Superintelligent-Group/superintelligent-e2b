@@ -15,6 +15,10 @@ type CacheSourceTemplateProvider struct {
 	buildID string
 }
 
+func (cstp *CacheSourceTemplateProvider) BuildID() string {
+	return cstp.buildID
+}
+
 func NewCacheSourceTemplateProvider(
 	buildID string,
 ) *CacheSourceTemplateProvider {

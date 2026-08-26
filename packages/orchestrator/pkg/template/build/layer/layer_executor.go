@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -29,6 +30,10 @@ import (
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/layer")
 
+type uploadWaiter interface {
+	Wait(context.Context) error
+}
+
 type LayerExecutor struct {
 	buildcontext.BuildContext
 
@@ -43,6 +48,8 @@ type LayerExecutor struct {
 	uploads         *sandbox.Uploads
 	compressConfig  storage.CompressConfig
 	ff              *featureflags.Client
+	pendingMu       sync.Mutex
+	pendingUploads  map[string]uploadWaiter
 }
 
 func NewLayerExecutor(
@@ -72,6 +79,7 @@ func NewLayerExecutor(
 		uploads:         uploads,
 		compressConfig:  compressConfig,
 		ff:              ff,
+		pendingUploads:  make(map[string]uploadWaiter),
 	}
 }
 
@@ -83,6 +91,17 @@ func (lb *LayerExecutor) BuildLayer(
 ) (metadata.Template, error) {
 	ctx, childSpan := tracer.Start(ctx, "run-in-sandbox")
 	defer childSpan.End()
+
+	// A derived layer is added to the local cache before its object upload is
+	// complete. Ensure a later layer cannot resolve that parent through a
+	// remote/cache boundary while its artifacts are still in flight. This wait
+	// is limited to a parent upload from this builder; unrelated uploads remain
+	// concurrent and base/direct templates take the existing fast path.
+	if parent, ok := cmd.SourceTemplate.(BuildIDSourceTemplateProvider); ok {
+		if err := lb.waitForParentUpload(ctx, parent.BuildID()); err != nil {
+			return metadata.Template{}, fmt.Errorf("wait for parent layer upload: %w", err)
+		}
+	}
 
 	localTemplate, err := cmd.SourceTemplate.Get(ctx, lb.templateCache)
 	if err != nil {
@@ -314,6 +333,9 @@ func (lb *LayerExecutor) UploadSnapshot(
 	if err != nil {
 		return fmt.Errorf("register upload: %w", err)
 	}
+	lb.pendingMu.Lock()
+	lb.pendingUploads[meta.Template.BuildID] = upload
+	lb.pendingMu.Unlock()
 
 	lb.UploadErrGroup.Go(func() (uploadErr error) {
 		ctx := context.WithoutCancel(ctx)
@@ -372,6 +394,32 @@ func (lb *LayerExecutor) UploadSnapshot(
 
 		return nil
 	})
+
+	return nil
+}
+
+func (lb *LayerExecutor) waitForParentUpload(ctx context.Context, buildID string) error {
+	if buildID == "" {
+		return nil
+	}
+
+	lb.pendingMu.Lock()
+	upload := lb.pendingUploads[buildID]
+	lb.pendingMu.Unlock()
+	if upload == nil {
+		return nil
+	}
+
+	err := upload.Wait(ctx)
+	if err != nil {
+		return err
+	}
+
+	lb.pendingMu.Lock()
+	if lb.pendingUploads[buildID] == upload {
+		delete(lb.pendingUploads, buildID)
+	}
+	lb.pendingMu.Unlock()
 
 	return nil
 }
