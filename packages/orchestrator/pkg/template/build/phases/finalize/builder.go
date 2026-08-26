@@ -215,7 +215,14 @@ func (ppb *PostProcessingBuilder) Build(
 		},
 	)
 	if err != nil {
-		return phases.LayerResult{}, fmt.Errorf("error running start and ready commands in sandbox: %w", err)
+		// Preserve the finalization phase boundary for the build status API. Without
+		// this wrapper, failures while creating or running the final sandbox escape
+		// without PhaseMeta and are reduced to an opaque internal error by the
+		// template server, leaving the caller with no actionable step or logs.
+		return phases.LayerResult{}, phases.NewPhaseBuildError(
+			ppb.Metadata(),
+			fmt.Errorf("error running start and ready commands in sandbox: %w", err),
+		)
 	}
 
 	return phases.LayerResult{
