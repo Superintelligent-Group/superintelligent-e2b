@@ -289,6 +289,7 @@ module "cluster" {
   client_machine_type                 = var.client_server_machine_type
   client_security_group_ids           = [aws_security_group.cluster_node.id]
   client_server_nested_virtualization = var.client_server_nested_virtualization
+  client_base_hugepages_percentage    = var.client_base_hugepages_percentage
   nbd_max_devices                     = var.nbd_max_devices
   client_node_labels                  = var.client_node_labels
 

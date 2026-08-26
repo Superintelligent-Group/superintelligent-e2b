@@ -155,6 +155,10 @@ Key mechanisms (all under `pkg/sandbox/`):
   configured value is at least 10 GiB). A smaller reservation can schedule successfully yet fail
   at `/snapshot/load` with `mmap memfd: cannot allocate memory`; this is a capacity/configuration
   failure, not a missing-template failure.
+- **Hugepage capacity is part of the same invariant**: client nodes preallocate a parameterized
+  75% base hugepage pool, leaving an explicit overcommit reserve. A pool sized exactly to guest RAM
+  can still fail the memfd restore because Firecracker needs mapping headroom; the pool must be
+  sized from the largest guest profile, not from the Nomad task reservation alone.
 - **Copy-on-write rootfs** (`rootfs/`, `nbd/`, `block/`): the template rootfs stays read-only;
   writes go to a per-sandbox COW cache exposed to Firecracker as an NBD block device served by
   an in-process userspace NBD server. On pause, the dirty blocks are exported as a diff.
