@@ -6,6 +6,8 @@ import (
 )
 
 func TestNewMeterExporterWithoutCollectorUsesNoop(t *testing.T) {
+	t.Parallel()
+
 	if otelCollectorGRPCEndpoint != "" {
 		t.Skip("collector endpoint configured in test environment")
 	}
