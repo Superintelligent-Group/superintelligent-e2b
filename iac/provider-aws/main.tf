@@ -155,7 +155,7 @@ locals {
     REDIS_TLS_CA_BASE64 = local.redis_tls_ca_base64
 
 
-    LAUNCH_DARKLY_API_KEY = module.init.launch_darkly_api_key
+    LAUNCH_DARKLY_API_KEY = var.launch_darkly_enabled ? module.init.launch_darkly_api_key : ""
     # This is here just because it is required in some part of our code which is transitively imported
     TEMPLATE_BUCKET_NAME = "skip"
 
@@ -180,7 +180,7 @@ locals {
     REDIS_TLS_CA_BASE64          = local.redis_tls_ca_base64
     # Used by in-cluster client-proxy to call API ResumeSandbox over gRPC.
     API_INTERNAL_GRPC_ADDRESS = "api-internal-grpc.service.consul:${var.api_internal_grpc_port}"
-    LAUNCH_DARKLY_API_KEY     = module.init.launch_darkly_api_key
+    LAUNCH_DARKLY_API_KEY     = var.launch_darkly_enabled ? module.init.launch_darkly_api_key : ""
   }, var.client_proxy_env_vars)
 
   orchestrator_env_vars = merge({
@@ -203,7 +203,7 @@ locals {
     ORCHESTRATOR_SERVICES       = "orchestrator"
     PROVIDER                    = "aws"
     BUILD_CACHE_BUCKET_NAME     = module.init.fc_template_build_cache_bucket_name
-    LAUNCH_DARKLY_API_KEY       = module.init.launch_darkly_api_key
+    LAUNCH_DARKLY_API_KEY       = var.launch_darkly_enabled ? module.init.launch_darkly_api_key : ""
     ARTIFACTS_REGISTRY_PROVIDER = "AWS_ECR"
     STORAGE_PROVIDER            = "AWSBucket"
     S3_USE_PATH_STYLE           = tostring(var.s3_use_path_style)
@@ -231,7 +231,7 @@ locals {
     REDIS_URL                    = local.redis_url
     CLICKHOUSE_CONNECTION_STRING = local.clickhouse_connection_string
     GIN_MODE                     = "release"
-    LAUNCH_DARKLY_API_KEY        = module.init.launch_darkly_api_key
+    LAUNCH_DARKLY_API_KEY        = var.launch_darkly_enabled ? module.init.launch_darkly_api_key : ""
   }, var.template_manager_env_vars)
 }
 

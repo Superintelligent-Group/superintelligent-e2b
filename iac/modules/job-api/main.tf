@@ -1,7 +1,6 @@
 locals {
   job_env_vars = {
     for key, value in var.job_env_vars : key => trimspace(value)
-    if try(trimspace(value), "") != ""
   }
 
   db_migrator_env_vars = {
