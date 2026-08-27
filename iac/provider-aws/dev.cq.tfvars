@@ -43,10 +43,12 @@ create_route53_record = false
 # -----------------------------------------------------------------------------
 # S3 Buckets (already exist from prior setup)
 # -----------------------------------------------------------------------------
-template_bucket_name = "e2b-dev-templates-014155356804"
-snapshot_bucket_name = "e2b-dev-snapshots-014155356804"
-build_bucket_name    = "e2b-dev-builds-014155356804"
-log_bucket_name      = "e2b-dev-logs-014155356804"
+template_bucket_name          = "e2b-dev-templates-014155356804"
+snapshot_bucket_name          = "e2b-dev-snapshots-014155356804"
+build_bucket_name             = "e2b-dev-builds-014155356804"
+orchestrator_artifact_key     = "orchestrator.29da7716"
+template_manager_artifact_key = "template-manager.29da7716"
+log_bucket_name               = "e2b-dev-logs-014155356804"
 
 # -----------------------------------------------------------------------------
 # Control Plane (Nomad server + API)
