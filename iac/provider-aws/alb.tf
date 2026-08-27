@@ -198,7 +198,7 @@ resource "aws_lb_target_group" "client_proxy" {
   deregistration_delay = 30
 
   health_check {
-    path                = "/health"
+    path = "/health"
     # client-proxy exposes its health server on the module's health_port
     # (3001); 3003 is not a listener on this allocation.
     port                = "3001"

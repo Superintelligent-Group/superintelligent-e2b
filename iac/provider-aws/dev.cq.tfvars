@@ -159,7 +159,7 @@ build_server_machine_type  = "m7i.2xlarge" # supported non-metal nested virtuali
 # live CQ control plane and governed E2B catalog. A floating e2b-orch-* selector
 # can silently choose a different Nomad line and strand template-manager
 # allocations on a mixed-version cluster.
-build_image_family_prefix  = "e2b-orch-2026-07-25-16-33-40"
+build_image_family_prefix = "e2b-orch-2026-07-25-16-33-40"
 
 # Firecracker host capacity. Keep the kernel ceiling and warm overlay pool
 # explicit so a replacement worker cannot silently boot with a smaller NBD

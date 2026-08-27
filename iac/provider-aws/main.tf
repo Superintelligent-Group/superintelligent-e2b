@@ -121,9 +121,9 @@ locals {
   # so values that themselves contain `"` characters (like a JSON blob)
   # must have those quotes pre-escaped to produce valid HCL.
   api_env_vars = merge({
-    ENVIRONMENT                    = var.environment
-    GIN_MODE                       = "release"
-    DOMAIN_NAME                    = var.domain_name
+    ENVIRONMENT = var.environment
+    GIN_MODE    = "release"
+    DOMAIN_NAME = var.domain_name
     # Keep API discovery on the same authoritative CQ Nomad endpoint as the
     # Terraform Nomad provider; localhost/global silently selects the legacy
     # control plane and leaves sandbox placement with no nodes.
