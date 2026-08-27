@@ -168,7 +168,17 @@ func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.Tem
 	defer func(ctx context.Context) {
 		switch {
 		case e != nil:
-			l.Error(ctx, fmt.Sprintf("Build failed: %v", builderrors.UnwrapUserError(e).GetMessage()))
+			// Keep the public status fail-closed, but retain the wrapped cause in
+			// the operator log.  The build API intentionally exposes only a
+			// generic internal message; without the cause here, provisioning
+			// failures become impossible to distinguish from capacity or control
+			// plane failures when inspecting the active template-manager.
+			publicReason := builderrors.UnwrapUserError(e)
+			l.Error(ctx, fmt.Sprintf("Build failed: %v", publicReason.GetMessage()),
+				zap.Error(e),
+				zap.String("build_id", paths.BuildID),
+				zap.String("template_id", cfg.TemplateID),
+			)
 		default:
 			l.Info(ctx, fmt.Sprintf("Build finished, took %s",
 				time.Since(startTime).Truncate(time.Second).String()))
