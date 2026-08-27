@@ -111,6 +111,18 @@ variable "template_manager_env_vars" {
   sensitive = true
 }
 
+variable "orchestrator_artifact_key" {
+  type        = string
+  description = "Immutable promoted S3 object key for the orchestrator binary."
+  default     = "orchestrator"
+}
+
+variable "template_manager_artifact_key" {
+  type        = string
+  description = "Immutable promoted S3 object key for the template-manager binary."
+  default     = "template-manager"
+}
+
 variable "s3_use_path_style" {
   type        = bool
   default     = false
