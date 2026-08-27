@@ -111,6 +111,17 @@ job "${job_name}" {
 %{ endfor ~}
       }
 
+      # Resolve the managed Redis service through Nomad service discovery at
+      # allocation time.  Build nodes are deliberately isolated from the API
+      # node's systemd-resolved configuration, so a process-level Consul
+      # template is the portable path (and retries on service changes).
+      template {
+        data = "REDIS_URL={{ with service \"redis\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
+        destination = "local/redis.env"
+        env = true
+        change_mode = "restart"
+      }
+
       config {
         command = "/bin/bash"
         args    = ["-c", " chmod +x local/template-manager && local/template-manager"]

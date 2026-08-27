@@ -100,7 +100,7 @@ module "client_proxy" {
   client_proxy_cpu_count = var.client_proxy_cpu_count
   client_proxy_memory_mb = var.client_proxy_memory_mb
 
-  node_pool = var.api_node_pool
+  node_pool = var.client_proxy_node_pool
 
   image        = data.aws_ecr_image.client_proxy.image_uri
   job_env_vars = var.client_proxy_env_vars

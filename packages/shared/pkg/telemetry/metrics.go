@@ -39,6 +39,14 @@ func (noopMetricExporter) Shutdown(context.Context) error {
 }
 
 func NewMeterExporter(ctx context.Context, extraOption ...otlpmetricgrpc.Option) (sdkmetric.Exporter, error) {
+	// Match New(): an unset collector means telemetry is intentionally disabled.
+	// Do not construct an OTLP exporter with an empty endpoint; the SDK accepts it
+	// initially, then retries an invalid address and turns shutdown into a build
+	// failure for otherwise healthy template builds.
+	if otelCollectorGRPCEndpoint == "" {
+		return noopMetricExporter{}, nil
+	}
+
 	opts := []otlpmetricgrpc.Option{
 		otlpmetricgrpc.WithInsecure(),
 		otlpmetricgrpc.WithEndpoint(otelCollectorGRPCEndpoint),

@@ -77,6 +77,15 @@ resource "random_password" "volume_token_key" {
 }
 
 locals {
+  # Keep the required FinOps dimensions on resources that do not inherit
+  # provider-level default tags (for example ALB listener rules/target groups).
+  # The policy uses title-cased environment values, while Terraform inputs are
+  # conventionally lower-case.
+  finops_tags = {
+    Environment = var.environment == "dev" ? "Dev" : var.environment == "staging" ? "Stage" : var.environment == "prod" ? "Prod" : var.environment
+    Service     = "e2b"
+  }
+
   redis_port            = 6379
   ingress_port          = 8080
   ingress_internal_port = 9435
@@ -86,6 +95,8 @@ locals {
   loki_port             = 3100
   logs_proxy_port       = 30006
   otel_collector_port   = 4317
+
+  client_proxy_target_asg_name = coalesce(var.client_proxy_target_asg_name, "${var.prefix}orch-client")
 
   auth_provider_config = {
     jwt = []
@@ -110,9 +121,14 @@ locals {
   # so values that themselves contain `"` characters (like a JSON blob)
   # must have those quotes pre-escaped to produce valid HCL.
   api_env_vars = merge({
-    ENVIRONMENT                    = var.environment
-    GIN_MODE                       = "release"
-    DOMAIN_NAME                    = var.domain_name
+    ENVIRONMENT = var.environment
+    GIN_MODE    = "release"
+    DOMAIN_NAME = var.domain_name
+    # Keep API discovery on the same authoritative CQ Nomad endpoint as the
+    # Terraform Nomad provider; localhost/global silently selects the legacy
+    # control plane and leaves sandbox placement with no nodes.
+    NOMAD_ADDRESS                  = "https://nomad.${var.domain_name}"
+    NOMAD_REGION                   = var.nomad_region
     NOMAD_TOKEN                    = module.init.cluster.nomad_acl_token
     ORCHESTRATOR_PORT              = tostring(var.orchestrator_port)
     API_INTERNAL_GRPC_PORT         = tostring(var.api_internal_grpc_port)
@@ -134,6 +150,7 @@ locals {
     OTEL_COLLECTOR_GRPC_ENDPOINT = "localhost:${local.otel_collector_port}"
 
     REDIS_POOL_SIZE     = "160"
+    REDIS_URL           = local.redis_url
     REDIS_CLUSTER_URL   = local.redis_cluster_url
     REDIS_TLS_CA_BASE64 = local.redis_tls_ca_base64
 
@@ -158,6 +175,7 @@ locals {
     OTEL_COLLECTOR_GRPC_ENDPOINT = "localhost:${local.otel_collector_port}"
     LOGS_COLLECTOR_ADDRESS       = "http://localhost:${local.logs_proxy_port}"
     REDIS_POOL_SIZE              = "40"
+    REDIS_URL                    = local.redis_url
     REDIS_CLUSTER_URL            = local.redis_cluster_url
     REDIS_TLS_CA_BASE64          = local.redis_tls_ca_base64
     # Used by in-cluster client-proxy to call API ResumeSandbox over gRPC.
@@ -174,6 +192,7 @@ locals {
     ALLOW_SANDBOX_INTERNAL_CIDRS = var.allow_sandbox_internal_cidrs
     CLICKHOUSE_CONNECTION_STRING = local.clickhouse_connection_string
     REDIS_POOL_SIZE              = "10"
+    REDIS_URL                    = local.redis_url
     REDIS_CLUSTER_URL            = local.redis_cluster_url
     REDIS_TLS_CA_BASE64          = local.redis_tls_ca_base64
 
@@ -209,6 +228,7 @@ locals {
     LOGS_COLLECTOR_ADDRESS       = "http://localhost:${local.logs_proxy_port}"
     ORCHESTRATOR_SERVICES        = "template-manager"
     REDIS_POOL_SIZE              = "10"
+    REDIS_URL                    = local.redis_url
     CLICKHOUSE_CONNECTION_STRING = local.clickhouse_connection_string
     GIN_MODE                     = "release"
     LAUNCH_DARKLY_API_KEY        = module.init.launch_darkly_api_key
@@ -278,7 +298,7 @@ module "cluster" {
 
   build_node_pool_name               = local.build_pool_name
   build_cluster_size                 = var.build_cluster_size
-  build_image_family_prefix          = local.ami_family_prefix
+  build_image_family_prefix          = var.build_image_family_prefix != "" ? var.build_image_family_prefix : local.ami_family_prefix
   build_machine_type                 = var.build_server_machine_type
   build_server_nested_virtualization = var.build_server_nested_virtualization
   build_security_group_ids           = [aws_security_group.cluster_node.id]
@@ -305,6 +325,18 @@ module "cluster" {
   clickhouse_job_constraint_prefix = local.clickhouse_jobs_prefix
 }
 
+// Keep the sandbox data-plane registration independent from API launch-template
+// changes. This lets the client proxy follow API ASG scale events without
+// forcing an unrelated AMI/user-data rollout when the proxy route changes.
+data "aws_autoscaling_group" "client_proxy_host" {
+  name = local.client_proxy_target_asg_name
+}
+
+resource "aws_autoscaling_attachment" "client_proxy" {
+  autoscaling_group_name = data.aws_autoscaling_group.client_proxy_host.name
+  lb_target_group_arn    = aws_lb_target_group.client_proxy.arn
+}
+
 module "nomad" {
   source = "./nomad"
 
@@ -320,6 +352,7 @@ module "nomad" {
   grafana_username             = module.init.grafana.username
 
   api_node_pool          = local.api_pool_name
+  client_proxy_node_pool = local.client_pool_name
   clickhouse_node_pool   = local.clickhouse_pool_name
   clickhouse_jobs_prefix = local.clickhouse_jobs_prefix
 
@@ -430,6 +463,16 @@ resource "aws_security_group" "cluster_node" {
     to_port     = local.ingress_port
     protocol    = "TCP"
     description = "Ingress communication from load balancer"
+    security_groups = [
+      aws_security_group.ingress.id
+    ]
+  }
+
+  ingress {
+    from_port   = 3001
+    to_port     = 3002
+    protocol    = "TCP"
+    description = "Sandbox data-plane traffic from load balancer to client proxy"
     security_groups = [
       aws_security_group.ingress.id
     ]

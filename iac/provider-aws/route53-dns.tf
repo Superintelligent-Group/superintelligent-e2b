@@ -84,3 +84,34 @@ resource "aws_route53_record" "e2b_base" {
     evaluate_target_health = true
   }
 }
+
+# The E2B SDK resolves its control API at api.<domain>. Keep that hostname on
+# the same CQ ingress as the base and Nomad endpoints; pointing it at another
+# account's ALB makes the provider appear healthy while bypassing this
+# control-plane's node/catalog state.
+resource "aws_route53_record" "api" {
+  zone_id = data.aws_route53_zone.domain.zone_id
+  name    = "api.${var.domain_name}"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.ingress.dns_name
+    zone_id                = aws_lb.ingress.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# Nomad is part of the CQ E2B control plane. Keep its public endpoint on the
+# same ALB/VPC as the control server so Terraform's Nomad provider and the
+# scheduled client-proxy use one authoritative cluster.
+resource "aws_route53_record" "nomad" {
+  zone_id = data.aws_route53_zone.domain.zone_id
+  name    = "nomad.${var.domain_name}"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.ingress.dns_name
+    zone_id                = aws_lb.ingress.zone_id
+    evaluate_target_health = true
+  }
+}

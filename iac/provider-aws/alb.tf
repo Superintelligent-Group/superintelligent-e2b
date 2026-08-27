@@ -76,8 +76,12 @@ resource "aws_lb_listener" "ingress_wildcard" {
   certificate_arn = aws_acm_certificate_validation.wildcard.certificate_arn
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.ingress.arn
+    type = "forward"
+    # Sandbox hosts are the default data-plane traffic. API and Nomad are
+    # selected explicitly below; sending wildcard traffic to the API target
+    # group creates a sandbox successfully but returns a misleading 502/404
+    # when the SDK connects to the per-sandbox host.
+    target_group_arn = aws_lb_target_group.client_proxy.arn
   }
 }
 
@@ -111,6 +115,26 @@ resource "aws_lb_listener_rule" "nomad" {
     host_header {
       values = [
         "nomad.${var.domain_name}"
+      ]
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "api" {
+  listener_arn = aws_lb_listener.ingress_wildcard.arn
+  priority     = 30
+
+  tags = local.finops_tags
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.ingress.arn
+  }
+
+  condition {
+    host_header {
+      values = [
+        "api.${var.domain_name}"
       ]
     }
   }
@@ -153,6 +177,33 @@ resource "aws_lb_target_group" "ingress_grpc" {
     path                = "/ping"
     protocol            = "HTTP"
     matcher             = "0"
+    interval            = 5
+    timeout             = 2
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+resource "aws_lb_target_group" "client_proxy" {
+  name   = "${var.prefix}client-proxy"
+  port   = 3002
+  vpc_id = module.init.vpc_id
+
+  tags = local.finops_tags
+
+  protocol         = "HTTP"
+  protocol_version = "HTTP1"
+  target_type      = "instance"
+
+  deregistration_delay = 30
+
+  health_check {
+    path = "/health"
+    # client-proxy exposes its health server on the module's health_port
+    # (3001); 3003 is not a listener on this allocation.
+    port                = "3001"
+    protocol            = "HTTP"
+    matcher             = "200"
     interval            = 5
     timeout             = 2
     healthy_threshold   = 2

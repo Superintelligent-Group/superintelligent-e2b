@@ -46,7 +46,11 @@ type Config struct {
 	ServiceDiscoveryProvider string `env:"SERVICE_DISCOVERY_PROVIDER" envDefault:"nomad"`
 
 	NomadAddress string `env:"NOMAD_ADDRESS" envDefault:"http://localhost:4646"`
-	NomadToken   string `env:"NOMAD_TOKEN"`
+	// NomadRegion must match the authoritative Nomad server region. Keeping
+	// this explicit avoids the client silently defaulting to "global" when
+	// the provider cluster uses an AWS-region name (for example us-east-1).
+	NomadRegion string `env:"NOMAD_REGION" envDefault:"global"`
+	NomadToken  string `env:"NOMAD_TOKEN"`
 
 	// NomadOrchestratorServiceNames is the comma-separated list of
 	// Nomad-native service names whose registrations enumerate orchestrator
