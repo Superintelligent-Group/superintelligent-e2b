@@ -229,6 +229,10 @@ under a commit-keyed S3 object (for example `orchestrator.<commit>` and
 inputs and includes the selected object's ETag in the artifact URL; mutable
 compatibility aliases may exist, but a promotion should always pass the
 commit-keyed inputs so a later upload cannot silently change a running job.
+The API, client-proxy, and migrator container images are likewise selected from
+the `latest` ECR tag but rendered into Nomad as `repository@sha256:digest`
+references, so moving the tag cannot leave an allocation running an untracked
+image generation.
 
 A template and a paused-sandbox snapshot have the **same artifact shape** — a snapshot is just a
 new build whose memfile/rootfs are stored as diffs against the template it came from (diff chains

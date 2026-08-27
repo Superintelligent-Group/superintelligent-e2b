@@ -22,6 +22,17 @@ data "aws_ecr_image" "clickhouse_migrator" {
   image_tag       = "latest"
 }
 
+# ECR tags are mutable. Render the resolved digest in every Nomad job so a
+# healthy allocation cannot silently keep running an older image after `latest`
+# moves. The data source still uses the tag as the deployment selector; the
+# rendered image reference is immutable.
+locals {
+  api_image                 = "${trimsuffix(data.aws_ecr_image.api.image_uri, ":latest")}@${data.aws_ecr_image.api.image_digest}"
+  db_migrator_image         = "${trimsuffix(data.aws_ecr_image.db_migrator.image_uri, ":latest")}@${data.aws_ecr_image.db_migrator.image_digest}"
+  client_proxy_image        = "${trimsuffix(data.aws_ecr_image.client_proxy.image_uri, ":latest")}@${data.aws_ecr_image.client_proxy.image_digest}"
+  clickhouse_migrator_image = "${trimsuffix(data.aws_ecr_image.clickhouse_migrator.image_uri, ":latest")}@${data.aws_ecr_image.clickhouse_migrator.image_digest}"
+}
+
 // Its already set up in Nomad server config, but from there its taked only for newly created clusters so we need to make sure its apply here to existing.
 resource "nomad_scheduler_config" "config" {
   memory_oversubscription_enabled = true
@@ -102,7 +113,7 @@ module "client_proxy" {
 
   node_pool = var.client_proxy_node_pool
 
-  image        = data.aws_ecr_image.client_proxy.image_uri
+  image        = local.client_proxy_image
   job_env_vars = var.client_proxy_env_vars
 }
 
@@ -122,8 +133,8 @@ module "api" {
   port_name                = "api"
   port_number              = var.api_port
   api_internal_grpc_port   = var.api_internal_grpc_port
-  api_docker_image         = data.aws_ecr_image.api.image_uri
-  db_migrator_docker_image = data.aws_ecr_image.db_migrator.image_uri
+  api_docker_image         = local.api_image
+  db_migrator_docker_image = local.db_migrator_image
   job_env_vars             = var.api_env_vars
   db_migrator_env_vars     = var.api_db_migrator_env_vars
 }
@@ -252,5 +263,5 @@ module "clickhouse" {
   aws_region    = var.aws_region
   backup_bucket = var.clickhouse_backups_bucket_name
 
-  clickhouse_migrator_image = data.aws_ecr_image.clickhouse_migrator.image_uri
+  clickhouse_migrator_image = local.clickhouse_migrator_image
 }
