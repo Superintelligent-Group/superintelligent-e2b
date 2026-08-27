@@ -33,7 +33,7 @@ single_nat_gateway   = true # Save ~$66/month in dev
 # Domain & TLS
 # -----------------------------------------------------------------------------
 domain_name  = "e2b.superintelligent.group"
-nomad_region = "global"
+nomad_region = "us-east-1"
 # Delegated subdomain zone in CQ; apex stays SIG-owned (COST-00 P3).
 hosted_zone_name    = "e2b.superintelligent.group"
 acm_certificate_arn = "arn:aws:acm:us-east-1:014155356804:certificate/152016f3-f662-42b6-8a99-763d2d991dee"
@@ -109,7 +109,7 @@ tags = {
 # -----------------------------------------------------------------------------
 control_server_cluster_size = 1
 api_cluster_size            = 0
-client_cluster_size         = 0
+client_cluster_size         = 1
 build_cluster_size          = 0
 clickhouse_cluster_size     = 0
 
@@ -155,6 +155,11 @@ clickhouse_cluster_size     = 0
 client_server_machine_type = "m7i.2xlarge" # supported non-metal nested virtualization shape
 api_server_machine_type    = "t3.large"    # was t3.xlarge default; matches api_spot_instance_types
 build_server_machine_type  = "m7i.2xlarge" # supported non-metal nested virtualization shape
+# Pin the build image to the verified Nomad 1.8.4 runtime used by the
+# live CQ control plane and governed E2B catalog. A floating e2b-orch-* selector
+# can silently choose a different Nomad line and strand template-manager
+# allocations on a mixed-version cluster.
+build_image_family_prefix  = "e2b-orch-2026-07-25-16-33-40"
 
 # Firecracker host capacity. Keep the kernel ceiling and warm overlay pool
 # explicit so a replacement worker cannot silently boot with a smaller NBD

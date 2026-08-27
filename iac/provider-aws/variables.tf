@@ -2,9 +2,15 @@ variable "domain_name" {
   type = string
 }
 
+variable "client_proxy_target_asg_name" {
+  type        = string
+  default     = ""
+  description = "Auto Scaling Group hosting the Nomad client-proxy allocation. Empty derives the CQ orch-client ASG from prefix."
+}
+
 variable "nomad_region" {
   type        = string
-  description = "Nomad control-plane region. E2B AWS clusters use the global Nomad region; this is separate from the AWS region."
+  description = "Nomad control-plane region. Set to the authoritative provider cluster region (for CQ E2B, us-east-1); this is separate from the AWS region."
   default     = "global"
 }
 
@@ -256,6 +262,12 @@ variable "client_node_labels" {
 variable "client_image_family_prefix" {
   type    = string
   default = ""
+}
+
+variable "build_image_family_prefix" {
+  type        = string
+  default     = ""
+  description = "AMI name prefix for build/template-manager nodes. Pin this to a Nomad-compatible image family when the control plane is not yet upgraded."
 }
 
 variable "control_server_machine_type" {

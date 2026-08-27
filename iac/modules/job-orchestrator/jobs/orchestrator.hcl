@@ -33,6 +33,11 @@ job "orchestrator-${latest_orchestrator_job_id}" {
     service {
       name = "orchestrator"
       port = "${port}"
+      address = "$${attr.unique.network.ip-address}"
+      # The task binds a static host-network port. Explicitly publish the
+      # node address so Nomad discovery never returns an unroutable blank
+      # service address to the API placement loop.
+      address_mode = "auto"
 
       provider = "nomad"
 
@@ -48,6 +53,8 @@ job "orchestrator-${latest_orchestrator_job_id}" {
     service {
       name = "orchestrator-proxy"
       port = "${proxy_port}"
+      address = "$${attr.unique.network.ip-address}"
+      address_mode = "auto"
 
       provider = "nomad"
 

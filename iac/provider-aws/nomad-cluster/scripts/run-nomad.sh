@@ -216,14 +216,13 @@ function generate_nomad_config {
   job_constraint=$(get_instance_tag_value "job-constraint" || true)
 
   if [[ "$client" == "true" ]]; then
-    agent_acl_config=$(cat <<EOF
-  tokens {
-    # Client agents authenticate their RPC heartbeats to ACL-enabled servers.
-    # The token is resolved from the cluster secret at boot.
-    agent = "$nomad_token"
-  }
-EOF
-)
+    # Nomad 1.8.x (the compatibility line used by the CQ control server)
+    # rejects the newer acl.tokens agent block.  Client RPC membership is
+    # authenticated by the server's ACL-enabled control plane; keeping the
+    # client stanza limited to the 1.8 schema lets mixed-version pools join
+    # without a fatal config parse.  The token remains available to the
+    # server-side bootstrap and job CLI paths below.
+    agent_acl_config=""
   fi
 
   local server_config=""

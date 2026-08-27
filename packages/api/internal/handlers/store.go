@@ -192,6 +192,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 	default: // ServiceDiscoveryProviderNomad
 		nomadClient, nomadErr := nomadapi.NewClient(&nomadapi.Config{
 			Address:  config.NomadAddress,
+			Region:   config.NomadRegion,
 			SecretID: config.NomadToken,
 		})
 		if nomadErr != nil {

@@ -27,6 +27,11 @@ variable "api_node_pool" {
   type = string
 }
 
+variable "client_proxy_node_pool" {
+  type        = string
+  description = "Nomad node pool for the sandbox client-proxy data plane."
+}
+
 variable "clickhouse_node_pool" {
   type = string
 }
