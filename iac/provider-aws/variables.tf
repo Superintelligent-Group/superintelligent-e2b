@@ -2,6 +2,12 @@ variable "domain_name" {
   type = string
 }
 
+variable "nomad_region" {
+  type        = string
+  description = "Nomad control-plane region. E2B AWS clusters use the global Nomad region; this is separate from the AWS region."
+  default     = "global"
+}
+
 variable "allow_force_destroy" {
   default = false
 }

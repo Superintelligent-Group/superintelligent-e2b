@@ -36,6 +36,7 @@ provider "aws" {}
 
 provider "nomad" {
   address      = "https://nomad.${var.domain_name}"
+  region       = var.nomad_region
   secret_id    = module.init.cluster.nomad_acl_token
   consul_token = module.init.cluster.consul_acl_token
 }

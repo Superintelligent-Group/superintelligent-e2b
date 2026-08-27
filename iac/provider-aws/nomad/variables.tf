@@ -245,6 +245,12 @@ variable "template_manager_artifact_key" {
   default     = "template-manager"
 }
 
+variable "template_manager_job_name" {
+  type        = string
+  description = "Nomad job identity for the AWS template manager."
+  default     = "e2b-template-manager"
+}
+
 variable "template_bucket_name" {
   type = string
 }

@@ -32,7 +32,8 @@ single_nat_gateway   = true # Save ~$66/month in dev
 # -----------------------------------------------------------------------------
 # Domain & TLS
 # -----------------------------------------------------------------------------
-domain_name = "e2b.superintelligent.group"
+domain_name  = "e2b.superintelligent.group"
+nomad_region = "global"
 # Delegated subdomain zone in CQ; apex stays SIG-owned (COST-00 P3).
 hosted_zone_name    = "e2b.superintelligent.group"
 acm_certificate_arn = "arn:aws:acm:us-east-1:014155356804:certificate/152016f3-f662-42b6-8a99-763d2d991dee"
