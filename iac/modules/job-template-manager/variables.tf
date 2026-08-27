@@ -2,6 +2,12 @@ variable "node_pool" {
   type = string
 }
 
+variable "job_name" {
+  type        = string
+  description = "Nomad job identity for the template manager."
+  default     = "template-manager"
+}
+
 variable "port" {
   type = number
 }

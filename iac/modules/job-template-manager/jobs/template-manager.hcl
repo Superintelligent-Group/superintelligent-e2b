@@ -1,4 +1,4 @@
-job "template-manager" {
+job "${job_name}" {
   type = "service"
   node_pool  = "${node_pool}"
   priority = 75

@@ -165,6 +165,7 @@ module "template_manager" {
 
   update_stanza = var.build_cluster_size > 1
   node_pool     = var.build_node_pool
+  job_name      = var.template_manager_job_name
 
   port = var.template_manager_port
 

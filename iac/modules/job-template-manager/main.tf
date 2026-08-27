@@ -7,7 +7,7 @@ data "external" "template_manager_count" {
   query = {
     nomad_addr  = var.nomad_addr
     nomad_token = var.nomad_token
-    job_name    = "template-manager"
+    job_name    = var.job_name
     min_count   = var.update_stanza ? "2" : "1"
   }
 }
@@ -23,6 +23,7 @@ resource "nomad_job" "template_manager" {
   jobspec = templatefile("${path.module}/jobs/template-manager.hcl", {
     update_stanza = var.update_stanza
     node_pool     = var.node_pool
+    job_name      = var.job_name
     current_count = tonumber(data.external.template_manager_count.result.count)
 
     port            = var.port
