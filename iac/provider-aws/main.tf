@@ -77,6 +77,15 @@ resource "random_password" "volume_token_key" {
 }
 
 locals {
+  # Keep the required FinOps dimensions on resources that do not inherit
+  # provider-level default tags (for example ALB listener rules/target groups).
+  # The policy uses title-cased environment values, while Terraform inputs are
+  # conventionally lower-case.
+  finops_tags = {
+    Environment = var.environment == "dev" ? "Dev" : var.environment == "staging" ? "Stage" : var.environment == "prod" ? "Prod" : var.environment
+    Service     = "e2b"
+  }
+
   redis_port            = 6379
   ingress_port          = 8080
   ingress_internal_port = 9435

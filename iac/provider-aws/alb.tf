@@ -124,6 +124,8 @@ resource "aws_lb_listener_rule" "api" {
   listener_arn = aws_lb_listener.ingress_wildcard.arn
   priority     = 30
 
+  tags = local.finops_tags
+
   action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.ingress.arn
@@ -186,6 +188,8 @@ resource "aws_lb_target_group" "client_proxy" {
   name   = "${var.prefix}client-proxy"
   port   = 3002
   vpc_id = module.init.vpc_id
+
+  tags = local.finops_tags
 
   protocol         = "HTTP"
   protocol_version = "HTTP1"
