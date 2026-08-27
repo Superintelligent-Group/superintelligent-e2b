@@ -305,6 +305,18 @@ module "cluster" {
   clickhouse_job_constraint_prefix = local.clickhouse_jobs_prefix
 }
 
+// Keep the sandbox data-plane registration independent from API launch-template
+// changes. This lets the client proxy follow API ASG scale events without
+// forcing an unrelated AMI/user-data rollout when the proxy route changes.
+data "aws_autoscaling_group" "api" {
+  name = "${var.prefix}api"
+}
+
+resource "aws_autoscaling_attachment" "client_proxy" {
+  autoscaling_group_name = data.aws_autoscaling_group.api.name
+  lb_target_group_arn    = aws_lb_target_group.client_proxy.arn
+}
+
 module "nomad" {
   source = "./nomad"
 
@@ -430,6 +442,16 @@ resource "aws_security_group" "cluster_node" {
     to_port     = local.ingress_port
     protocol    = "TCP"
     description = "Ingress communication from load balancer"
+    security_groups = [
+      aws_security_group.ingress.id
+    ]
+  }
+
+  ingress {
+    from_port   = 3002
+    to_port     = 3003
+    protocol    = "TCP"
+    description = "Sandbox data-plane traffic from load balancer to client proxy"
     security_groups = [
       aws_security_group.ingress.id
     ]
