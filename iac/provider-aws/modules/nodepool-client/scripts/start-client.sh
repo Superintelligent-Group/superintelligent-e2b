@@ -154,11 +154,17 @@ touch /etc/systemd/resolved.conf.d/consul.conf
 cat <<EOF >/etc/systemd/resolved.conf.d/consul.conf
 [Resolve]
 DNS=127.0.0.1#8600
+Domains=~consul
 DNSSEC=false
 DNSStubListener=yes
 DNSStubListenerExtra=172.17.0.1
 EOF
 sync  # Ensure file is written to disk
+
+# Keep the host resolver pointed at systemd-resolved. Some Ubuntu images leave
+# /etc/resolv.conf on the cloud-init resolver; in that mode the Consul route
+# above is silently ignored and service.consul names fail inside Nomad tasks.
+ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 # Set up huge pages
 # We are not enabling Transparent Huge Pages for now, as they are not swappable and may result in slowdowns + we are not using swap right now.
@@ -281,6 +287,21 @@ for i in {1..60}; do
 done
 echo "- Flushing DNS caches"
 resolvectl flush-caches
+
+# Verify the resolver path that Nomad workloads will use, not just public DNS.
+# Fail closed during boot if Consul names are not reachable; otherwise the
+# node can register as healthy while every service.consul dependency fails.
+for i in {1..30}; do
+  if resolvectl query consul.service.consul >/dev/null 2>&1; then
+    echo "- Consul DNS is reachable through systemd-resolved (attempt $i/30)"
+    break
+  fi
+  if [ $i -eq 30 ]; then
+    echo "- ERROR: Consul DNS route is not usable through systemd-resolved"
+    exit 1
+  fi
+  sleep 1
+done
 
 set +x
 /opt/nomad/bin/run-nomad.sh --client --consul-token "$${CONSUL_TOKEN}" --nomad-token "$${NOMAD_ACL_TOKEN}" --node-pool "${NODE_POOL}" --node-type "${NODE_TYPE}" --node-labels "${NODE_LABELS}" &

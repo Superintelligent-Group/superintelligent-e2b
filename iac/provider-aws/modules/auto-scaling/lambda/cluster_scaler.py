@@ -89,6 +89,36 @@ def _scale_asg(name, desired, max_size=None):
     )
 
 
+def _scale_asg_on_demand(name, desired, max_size=None):
+    """Switch an ASG to its launch-template capacity without Spot."""
+    if max_size is None:
+        max_size = max(desired, 1)
+    asg = _get_asg(name)
+    mixed = (asg or {}).get("MixedInstancesPolicy", {})
+    launch = mixed.get("LaunchTemplate", {})
+    spec = launch.get("LaunchTemplateSpecification")
+    if not spec:
+        _scale_asg(name, desired, max_size)
+        return
+    overrides = launch.get("Overrides", [])
+    autoscaling.update_auto_scaling_group(
+        AutoScalingGroupName=name,
+        MinSize=0,
+        MaxSize=max_size,
+        DesiredCapacity=desired,
+        MixedInstancesPolicy={
+            "LaunchTemplate": {
+                "LaunchTemplateSpecification": spec,
+                "Overrides": overrides,
+            },
+            "InstancesDistribution": {
+                "OnDemandBaseCapacity": desired,
+                "OnDemandPercentageAboveBaseCapacity": 100,
+            },
+        },
+    )
+
+
 def _scale_asg_spot(name, desired, spot_types, max_size=None):
     """Scale ASG with spot mixed instances policy for cost savings."""
     if max_size is None:
@@ -181,6 +211,49 @@ def _wait_for_healthy(asg_name, timeout_seconds=300):
             ]
             if healthy:
                 return True
+        time.sleep(10)
+    return False
+
+
+def _wait_for_healthy_with_spot_fallback(asg_name, timeout_seconds=300, max_size=None):
+    """Wait for Spot capacity, falling back promptly when AWS rejects it.
+
+    ASG accepts a mixed-instances update before capacity is actually placed, so
+    ``update_auto_scaling_group`` cannot report ``InsufficientInstanceCapacity``
+    synchronously. Without this bounded check wake waits the full five minutes
+    and leaves the caller with no worker. The fallback uses the launch
+    template's ordinary (non-metal) instance type and remains scale-to-zero.
+    """
+    started_at = time.time()
+    deadline = started_at + timeout_seconds
+    while time.time() < deadline:
+        asg = _get_asg(asg_name)
+        if asg:
+            healthy = [
+                i
+                for i in asg.get("Instances", [])
+                if i["LifecycleState"] == "InService"
+            ]
+            if healthy:
+                return True
+
+            activities = autoscaling.describe_scaling_activities(
+                AutoScalingGroupName=asg_name, MaxRecords=5
+            ).get("Activities", [])
+            for activity in activities:
+                activity_time = activity.get("StartTime")
+                if activity_time and activity_time.timestamp() < started_at:
+                    continue
+                if activity.get("StatusCode") == "Failed" and (
+                    "InsufficientInstanceCapacity" in activity.get("Description", "")
+                    or "InsufficientInstanceCapacity" in activity.get("Cause", "")
+                ):
+                    print(
+                        f"WARN: Spot capacity unavailable for {asg_name}; "
+                        "falling back to the launch template on-demand instance"
+                    )
+                    _scale_asg_on_demand(asg_name, 1, max_size=max_size)
+                    return _wait_for_healthy(asg_name, max(30, int(deadline - time.time())))
         time.sleep(10)
     return False
 
@@ -356,8 +429,12 @@ def wake_handler(event, context):
         # API and client boot independently; wait in parallel so one slow pool
         # cannot consume the entire readiness budget before the other is checked.
         with ThreadPoolExecutor(max_workers=2) as pool:
-            api_future = pool.submit(_wait_for_healthy, API_ASG, 300)
-            client_future = pool.submit(_wait_for_healthy, CLIENT_ASG, 300)
+            api_future = pool.submit(
+                _wait_for_healthy_with_spot_fallback, API_ASG, 300, 2
+            )
+            client_future = pool.submit(
+                _wait_for_healthy_with_spot_fallback, CLIENT_ASG, 300, 3
+            )
             api_ready = api_future.result()
             client_ready = client_future.result()
         print(f"API node healthy: {api_ready}")
