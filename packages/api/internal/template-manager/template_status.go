@@ -159,6 +159,7 @@ func (c *PollBuildStatus) poll(ctx context.Context) {
 				failure := c.buildFailure(err)
 				if failure == nil {
 					c.logger.Warn(ctx, "Build status polling received a transient error, keeping the build alive", zap.Error(err))
+
 					continue
 				}
 
@@ -185,9 +186,10 @@ func (c *PollBuildStatus) buildFailure(err error) error {
 	if c.transientErrorsSince.IsZero() {
 		c.transientErrorsSince = time.Now()
 	}
-	if time.Since(c.transientErrorsSince) >= transientErrorGracePeriod {
+		if time.Since(c.transientErrorsSince) >= transientErrorGracePeriod {
 		return fmt.Errorf("polling kept failing for %s: %w", transientErrorGracePeriod, err)
 	}
+
 	return nil
 }
 
