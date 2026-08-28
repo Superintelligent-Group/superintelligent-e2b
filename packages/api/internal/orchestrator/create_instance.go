@@ -255,18 +255,13 @@ func (o *Orchestrator) CreateSandbox(
 	hasHugePages := fcSemver.HasHugePages()
 	telemetry.ReportEvent(ctx, "Got FC info")
 
-	var sbxDomain *string
-	if team.ClusterID != nil {
-		cluster, ok := o.clusters.GetClusterById(*team.ClusterID)
-		if !ok {
-			return sandbox.Sandbox{}, &api.APIError{
-				Code:      http.StatusInternalServerError,
-				ClientMsg: "Error while looking for sandbox cluster information",
-				Err:       fmt.Errorf("cannot access cluster %s associated with team id %s that spawned sandbox %s", *team.ClusterID, team.ID, sandboxID),
-			}
+	sbxDomain, clusterFound := o.clusters.GetSandboxDomain(team.ClusterID)
+	if team.ClusterID != nil && !clusterFound {
+		return sandbox.Sandbox{}, &api.APIError{
+			Code:      http.StatusInternalServerError,
+			ClientMsg: "Error while looking for sandbox cluster information",
+			Err:       fmt.Errorf("cannot access cluster %s associated with team id %s that spawned sandbox %s", *team.ClusterID, team.ID, sandboxID),
 		}
-
-		sbxDomain = cluster.SandboxDomain
 	}
 
 	var trafficAccessToken *string = nil

@@ -106,17 +106,12 @@ func (a *APIStore) GetSandboxesSandboxID(c *gin.Context, id string) {
 		return
 	}
 
-	var sbxDomain *string
-	if team.ClusterID != nil {
-		cluster, ok := a.clusters.GetClusterById(*team.ClusterID)
-		if !ok {
-			telemetry.ReportCriticalError(ctx, fmt.Sprintf("cluster with ID '%s' not found", *team.ClusterID), nil)
-			a.sendAPIStoreError(c, http.StatusInternalServerError, fmt.Sprintf("cluster with id %s not found", *team.ClusterID))
+	sbxDomain, clusterFound := a.clusters.GetSandboxDomain(team.ClusterID)
+	if team.ClusterID != nil && !clusterFound {
+		telemetry.ReportCriticalError(ctx, fmt.Sprintf("cluster with ID '%s' not found", *team.ClusterID), nil)
+		a.sendAPIStoreError(c, http.StatusInternalServerError, fmt.Sprintf("cluster with id %s not found", *team.ClusterID))
 
-			return
-		}
-
-		sbxDomain = cluster.SandboxDomain
+		return
 	}
 
 	// Try to get the running sandbox first

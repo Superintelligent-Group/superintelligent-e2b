@@ -121,6 +121,10 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
 - **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and the
   sandbox→node **routing catalog** in Redis that client-proxy reads. Persistent entities
   (templates, builds, snapshots, teams) live in Postgres.
+- **Sandbox host authority**: remote BYOC clusters project their
+  `clusters.sandbox_proxy_domain` value from Postgres; the local Nomad cluster has no database
+  row, so its sandbox domain is supplied by the API's explicit `DOMAIN_NAME` configuration.
+  Teams without a remote cluster use that local value for SDK traffic URLs.
 - **Extra listeners**: internal gRPC :5009 and edge gRPC :5109 expose `ResumeSandbox` so
   client-proxy can wake paused sandboxes on incoming traffic.
 - Reads ClickHouse for sandbox/team metrics endpoints. Sandbox and template-build logs default to
