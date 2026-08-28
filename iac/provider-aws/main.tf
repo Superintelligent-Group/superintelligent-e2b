@@ -94,7 +94,11 @@ locals {
   clickhouse_database   = "default"
   loki_port             = 3100
   logs_proxy_port       = 30006
-  otel_collector_port   = 4317
+  # The collector is a Nomad/Consul service on the control-plane node.  Worker
+  # tasks must not use localhost: workers have no collector sidecar, and a
+  # localhost value silently turns log forwarding into connection refusals.
+  logs_collector_service_name = "logs-collector.service.consul"
+  otel_collector_port         = 4317
 
   client_proxy_target_asg_name = coalesce(var.client_proxy_target_asg_name, "${var.prefix}orch-client")
 
@@ -146,7 +150,7 @@ locals {
     LOKI_URL                     = "http://loki.service.consul:${local.loki_port}"
     CLICKHOUSE_CONNECTION_STRING = local.clickhouse_connection_string
 
-    LOGS_COLLECTOR_ADDRESS       = "http://localhost:${local.logs_proxy_port}"
+    LOGS_COLLECTOR_ADDRESS       = "http://${local.logs_collector_service_name}:${local.logs_proxy_port}"
     OTEL_COLLECTOR_GRPC_ENDPOINT = "localhost:${local.otel_collector_port}"
 
     REDIS_POOL_SIZE     = "160"
@@ -173,7 +177,7 @@ locals {
   client_proxy_env_vars = merge({
     ENVIRONMENT                  = var.environment
     OTEL_COLLECTOR_GRPC_ENDPOINT = "localhost:${local.otel_collector_port}"
-    LOGS_COLLECTOR_ADDRESS       = "http://localhost:${local.logs_proxy_port}"
+    LOGS_COLLECTOR_ADDRESS       = "http://${local.logs_collector_service_name}:${local.logs_proxy_port}"
     REDIS_POOL_SIZE              = "40"
     REDIS_URL                    = local.redis_url
     REDIS_CLUSTER_URL            = local.redis_cluster_url
@@ -184,7 +188,7 @@ locals {
   }, var.client_proxy_env_vars)
 
   orchestrator_env_vars = merge({
-    LOGS_COLLECTOR_ADDRESS       = "http://localhost:${local.logs_proxy_port}"
+    LOGS_COLLECTOR_ADDRESS       = "http://${local.logs_collector_service_name}:${local.logs_proxy_port}"
     ENVIRONMENT                  = var.environment
     ENVD_TIMEOUT                 = var.envd_timeout
     TEMPLATE_BUCKET_NAME         = module.init.fc_template_bucket_name
@@ -225,7 +229,7 @@ locals {
     TEMPLATE_BUCKET_NAME         = module.init.fc_template_bucket_name
     BUILD_CACHE_BUCKET_NAME      = module.init.fc_template_build_cache_bucket_name
     OTEL_COLLECTOR_GRPC_ENDPOINT = "localhost:${local.otel_collector_port}"
-    LOGS_COLLECTOR_ADDRESS       = "http://localhost:${local.logs_proxy_port}"
+    LOGS_COLLECTOR_ADDRESS       = "http://${local.logs_collector_service_name}:${local.logs_proxy_port}"
     ORCHESTRATOR_SERVICES        = "template-manager"
     REDIS_POOL_SIZE              = "10"
     REDIS_URL                    = local.redis_url
