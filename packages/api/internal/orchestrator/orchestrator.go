@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -66,6 +67,9 @@ type Orchestrator struct {
 
 	snapshotUpsertSem *utils.AdjustableSemaphore
 	redisStorage      *redisbackend.Storage
+	// sandboxDomain is also carried on local discovery: nodes can connect
+	// before the cluster registry's first sync.
+	sandboxDomain *string
 
 	// localClusterOwnsOrchestrators makes connectToClusterNode register
 	// local-cluster instances that report the Orchestrator role as nodes.
@@ -112,6 +116,10 @@ func New(
 	snapshotCache SnapshotCacheInvalidator,
 	snapshotUpsertSem *utils.AdjustableSemaphore,
 ) (*Orchestrator, error) {
+	var sandboxDomain *string
+	if domain := strings.TrimSpace(config.DomainName); domain != "" {
+		sandboxDomain = &domain
+	}
 	analyticsInstance, err := analyticscollector.NewAnalytics(
 		config.AnalyticsCollectorHost,
 		config.AnalyticsCollectorAPIToken,
@@ -167,6 +175,7 @@ func New(
 		tel:                  tel,
 		clusters:             clusters,
 		redisStorage:         redisStorage,
+		sandboxDomain:        sandboxDomain,
 
 		createdCounter: createdCounter,
 

@@ -64,6 +64,7 @@ func New(
 	meterProvider metric.MeterProvider,
 	discoveredNode NomadServiceDiscovery,
 	ff *featureflags.Client,
+	sandboxDomain *string,
 ) (*Node, error) {
 	client, err := NewClient(tracerProvider, meterProvider, discoveredNode.OrchestratorAddress)
 	if err != nil {
@@ -100,7 +101,7 @@ func New(
 		ClusterID:        consts.LocalClusterID,
 		ID:               nodeInfo.GetNodeId(),
 		IPAddress:        discoveredNode.IPAddress,
-		SandboxDomain:    nil,
+		SandboxDomain:    sandboxDomain,
 
 		client: client,
 		status: StatusInfo{Status: nodeStatus, ChangedAt: nodeStatusChangedAt},
