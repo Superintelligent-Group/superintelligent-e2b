@@ -186,7 +186,7 @@ func (c *PollBuildStatus) buildFailure(err error) error {
 	if c.transientErrorsSince.IsZero() {
 		c.transientErrorsSince = time.Now()
 	}
-		if time.Since(c.transientErrorsSince) >= transientErrorGracePeriod {
+	if time.Since(c.transientErrorsSince) >= transientErrorGracePeriod {
 		return fmt.Errorf("polling kept failing for %s: %w", transientErrorGracePeriod, err)
 	}
 
