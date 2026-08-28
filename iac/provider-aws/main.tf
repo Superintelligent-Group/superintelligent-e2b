@@ -474,7 +474,7 @@ resource "aws_security_group" "cluster_node" {
 
   ingress {
     from_port   = 3001
-    to_port     = 3002
+    to_port     = 3003
     protocol    = "TCP"
     description = "Sandbox data-plane traffic from load balancer to client proxy"
     security_groups = [

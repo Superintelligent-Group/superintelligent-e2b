@@ -16,6 +16,10 @@ aws_region = "us-east-1"
 # reconciled back into tracked config.
 prefix      = "e2b-"
 environment = "dev"
+# SUP-704: the canonical SIG Nomad topology schedules client-proxy on the
+# always-on control-plane pool (node_pool=default), not the legacy orch-client
+# ASG. Keep the ALB attachment aligned with that authoritative placement.
+client_proxy_target_asg_name = "e2b-dev-control-plane"
 # Required by module.init bucket names; reviewed instead of synthesized through
 # a higher-precedence TF_VAR_bucket_prefix environment value.
 bucket_prefix = "e2b-014155356804-"
