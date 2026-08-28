@@ -32,6 +32,11 @@ type Pool struct {
 	db  *client.Client
 	tel *telemetry.Client
 
+	// localSandboxDomain is seeded synchronously from configuration. The local
+	// cluster registry is refreshed asynchronously, so routing must not depend
+	// on its first sync having completed.
+	localSandboxDomain *string
+
 	clusters        *smap.Map[*Cluster]
 	synchronization *synchronization.Synchronize[queries.Cluster, *Cluster]
 }
@@ -69,9 +74,10 @@ func NewPool(
 	localCluster := localClusterConfig(config.DomainName)
 
 	p := &Pool{
-		db:       db,
-		tel:      tel,
-		clusters: clusters,
+		db:                 db,
+		tel:                tel,
+		localSandboxDomain: localCluster.SandboxProxyDomain,
+		clusters:           clusters,
 		synchronization: synchronization.NewSynchronize(
 			"clusters-pool",
 			"Clusters pool",
@@ -108,12 +114,18 @@ func (p *Pool) GetSandboxDomain(clusterID *uuid.UUID) (*string, bool) {
 		if cluster, ok := p.GetClusterById(*clusterID); ok {
 			return cluster.SandboxDomain, true
 		}
+		if *clusterID == consts.LocalClusterID {
+			return p.localSandboxDomain, p.localSandboxDomain != nil
+		}
 
 		return nil, false
 	}
 
 	if cluster, ok := p.GetClusterById(consts.LocalClusterID); ok {
 		return cluster.SandboxDomain, true
+	}
+	if p.localSandboxDomain != nil {
+		return p.localSandboxDomain, true
 	}
 
 	return nil, false

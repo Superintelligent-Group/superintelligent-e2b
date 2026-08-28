@@ -41,3 +41,15 @@ func TestGetSandboxDomainFallsBackToLocalCluster(t *testing.T) {
 	}
 
 }
+
+func TestGetSandboxDomainUsesConfiguredDomainBeforeFirstSync(t *testing.T) {
+	domain := "e2b.example.test"
+	p := &Pool{clusters: smap.New[*Cluster](), localSandboxDomain: &domain}
+
+	if got, ok := p.GetSandboxDomain(nil); !ok || got == nil || *got != domain {
+		t.Fatalf("pre-sync fallback = %v, want %q", got, domain)
+	}
+	if got, ok := p.GetSandboxDomain(&consts.LocalClusterID); !ok || got == nil || *got != domain {
+		t.Fatalf("explicit local pre-sync fallback = %v, want %q", got, domain)
+	}
+}
