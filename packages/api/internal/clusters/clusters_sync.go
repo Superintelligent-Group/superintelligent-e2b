@@ -2,6 +2,7 @@ package clusters
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,11 +36,20 @@ type Pool struct {
 	synchronization *synchronization.Synchronize[queries.Cluster, *Cluster]
 }
 
-func localClusterConfig() *queries.Cluster {
+func configuredSandboxDomain(domain string) *string {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return nil
+	}
+
+	return &domain
+}
+
+func localClusterConfig(domain string) *queries.Cluster {
 	return &queries.Cluster{
 		ID:                 consts.LocalClusterID,
 		EndpointTls:        false,
-		SandboxProxyDomain: nil,
+		SandboxProxyDomain: configuredSandboxDomain(domain),
 	}
 }
 
@@ -56,7 +66,7 @@ func NewPool(
 ) (*Pool, error) {
 	clusters := smap.New[*Cluster]()
 
-	localCluster := localClusterConfig()
+	localCluster := localClusterConfig(config.DomainName)
 
 	p := &Pool{
 		db:       db,
@@ -84,6 +94,29 @@ func NewPool(
 	go p.synchronization.Start(ctx, clustersSyncInterval, clusterSyncTimeout, true)
 
 	return p, nil
+}
+
+// GetSandboxDomain resolves the traffic suffix for a team. Teams without an
+// explicit remote cluster use the local Nomad cluster, whose domain comes from
+// the same authoritative DOMAIN_NAME configuration passed to the API.
+func (p *Pool) GetSandboxDomain(clusterID *uuid.UUID) (*string, bool) {
+	if p == nil {
+		return nil, false
+	}
+
+	if clusterID != nil {
+		if cluster, ok := p.GetClusterById(*clusterID); ok {
+			return cluster.SandboxDomain, true
+		}
+
+		return nil, false
+	}
+
+	if cluster, ok := p.GetClusterById(consts.LocalClusterID); ok {
+		return cluster.SandboxDomain, true
+	}
+
+	return nil, false
 }
 
 func (p *Pool) GetClusterById(id uuid.UUID) (*Cluster, bool) {

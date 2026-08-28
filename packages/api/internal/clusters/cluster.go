@@ -92,7 +92,7 @@ func newLocalCluster(
 
 	c := NewCluster(
 		clusterID,
-		nil,
+		configuredSandboxDomain(config.DomainName),
 		"",
 		instances,
 		synchronization.NewSynchronize("cluster-instances", "Cluster instances", store),
