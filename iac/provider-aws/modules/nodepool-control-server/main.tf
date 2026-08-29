@@ -123,6 +123,20 @@ resource "aws_autoscaling_group" "control_server" {
     version = aws_launch_template.control_server.latest_version
   }
 
+  # Keep a control-server bootstrap change from stopping at the launch-template
+  # pointer: the single-node CQ dev pool must actually replace its instance.
+  # Allow the brief handoff and roll back automatically if the new server is
+  # unhealthy.
+  instance_refresh {
+    strategy = "Rolling"
+
+    preferences {
+      min_healthy_percentage = 0
+      instance_warmup        = 180
+      auto_rollback          = true
+    }
+  }
+
   // Automatically register instances in the target group for load balancing
   target_group_arns = var.target_group_arns
 
