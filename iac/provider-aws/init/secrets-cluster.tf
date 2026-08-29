@@ -10,6 +10,13 @@ resource "random_id" "consul_gossip_encryption_key" {
 
 resource "aws_secretsmanager_secret" "cluster" {
   name = "${var.prefix}cluster"
+
+  # Keep the cluster credential in the same FinOps taxonomy as the rest of the
+  # E2B control plane. This is explicit because provider default tags may be
+  # absent during a targeted recovery plan.
+  tags = {
+    Project = "e2b"
+  }
 }
 
 resource "aws_secretsmanager_secret_version" "cluster" {
