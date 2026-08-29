@@ -40,6 +40,7 @@ endif
 override EXPECTED_TF_PLAN_FILE := $(if $(filter cq,$(SIG_AWS_ACCOUNT_TARGET)),.tfplan.dev.cq,.tfplan.${ENV}.${SIG_AWS_ACCOUNT_TARGET})
 override TF_PLAN_FILE := $(EXPECTED_TF_PLAN_FILE)
 override TF_VAR_FILE_ARG := $(if $(wildcard $(TF_VAR_FILE)),-var-file=$(TF_VAR_FILE))
+RECONCILE_TARGET ?=
 # Terraform loads these names without a CLI argument. Rejecting them is the
 # only way the reviewed explicit file can remain the complete configuration.
 override IMPLICIT_TF_VAR_FILES := $(sort $(wildcard terraform.tfvars terraform.tfvars.json *.auto.tfvars *.auto.tfvars.json))
@@ -207,6 +208,26 @@ plan: aws-account-guard
 	@ printf "Planning Terraform for env: `tput setaf 2``tput bold`$(ENV)`tput sgr0`\n\n"
 	@ $(call tf_fmt)
 	@ $(tf_vars) $(TF) plan $(TF_VAR_FILE_ARG) -out=$(TF_PLAN_FILE) -input=false -compact-warnings -parallelism=20
+
+# Narrow, reviewed reconciliation for content-addressed bootstrap artifacts.
+# Keep this separate from the normal plan: the CQ state may contain unrelated
+# historical drift, and a broad apply must never repair one setup object.
+.PHONY: plan-reconcile
+plan-reconcile: aws-account-guard
+	@if [ -z "$(RECONCILE_TARGET)" ]; then \
+		printf "RECONCILE_TARGET is required.\n" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(RECONCILE_TARGET)" != "module.cluster.aws_s3_object.setup_config" ]; then \
+		printf "Unsupported reconciliation target: %s\n" "$(RECONCILE_TARGET)" >&2; \
+		printf "Allowed target: module.cluster.aws_s3_object.setup_config\n" >&2; \
+		exit 1; \
+	fi
+	@ $(tf_vars) $(TF) plan $(TF_VAR_FILE_ARG) -target=$(RECONCILE_TARGET) -out=$(TF_PLAN_FILE) -input=false -compact-warnings -parallelism=20
+
+.PHONY: apply-reconcile
+apply-reconcile: plan-reconcile
+	@ $(tf_vars) $(TF) apply -input=false -compact-warnings $(TF_PLAN_FILE)
 
 plan_only_jobs_moved_targets = -target="random_password.volume_token_key" -target="module.nomad.random_password.volume_token_key"
 
