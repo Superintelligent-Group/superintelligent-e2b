@@ -385,6 +385,10 @@ flowchart TB
 - **Nomad client nodes** resolve the cluster's Nomad ACL agent token from the instance-scoped
   cluster secret at boot and place it only in the generated local agent config; this authenticates
   RPC heartbeats without embedding credentials in launch-template user-data.
+- **AWS cluster discovery** uses an explicit, environment/account-scoped
+  `cluster-discovery-name` tag value for Consul/Nomad `retry_join`. It must not be inferred only
+  from the resource prefix: legacy and canonical clusters can coexist in one account, and a
+  shared tag would allow a client to discover the wrong control plane.
 - **API nodes** host every control-plane container and are the only LB backend.
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`
   (it needs root for Firecracker, namespaces, NBD, cgroups). Its Nomad memory reservation is
