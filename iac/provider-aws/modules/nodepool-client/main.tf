@@ -206,6 +206,21 @@ resource "aws_autoscaling_group" "client" {
     version = aws_launch_template.client.latest_version
   }
 
+  # A launch-template pointer update alone leaves existing clients on the old
+  # user-data and discovery tag. Refresh deliberately so topology changes reach
+  # the running pool; 0% minimum health is required for the reviewed one-node
+  # CQ dev pool, while auto-rollback prevents a bad bootstrap from persisting.
+  instance_refresh {
+    strategy = "Rolling"
+    triggers = ["launch_template"]
+
+    preferences {
+      min_healthy_percentage = 0
+      instance_warmup        = 180
+      auto_rollback          = true
+    }
+  }
+
   // Do not wait for slow EC2 Metal instance to terminate before detaching from ASG
   force_delete           = true
   force_delete_warm_pool = true
