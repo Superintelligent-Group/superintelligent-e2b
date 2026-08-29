@@ -3,6 +3,7 @@
 // ---
 resource "aws_secretsmanager_secret" "clickhouse" {
   name = "${var.prefix}clickhouse"
+  tags = local.resource_tags
 }
 
 resource "random_string" "clickhouse_password" {
@@ -51,6 +52,7 @@ output "clickhouse" {
 // ---
 resource "aws_secretsmanager_secret" "grafana" {
   name = "${var.prefix}grafana"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "grafana" {
@@ -100,6 +102,7 @@ resource "random_string" "api_secret" {
 
 resource "aws_secretsmanager_secret" "api_secret" {
   name = "${var.prefix}api-secret"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "api_secret" {
@@ -127,6 +130,7 @@ output "api_secret" {
 // ---
 resource "aws_secretsmanager_secret" "launch_darkly_api_key" {
   name = "${var.prefix}launch-darkly-api-key"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "launch_darkly_api_key" {
@@ -154,6 +158,7 @@ output "launch_darkly_api_key" {
 // ---
 resource "aws_secretsmanager_secret" "postgres_connection_string" {
   name = "${var.prefix}postgres-connection-string"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "postgres_connection_string" {
@@ -191,6 +196,7 @@ resource "random_string" "admin_token" {
 
 resource "aws_secretsmanager_secret" "admin_token" {
   name = "${var.prefix}admin-token"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "admin_token" {
@@ -223,6 +229,7 @@ resource "random_string" "sandbox_access_token_hash_seed" {
 
 resource "aws_secretsmanager_secret" "sandbox_access_token_hash_seed" {
   name = "${var.prefix}sandbox-access-token-hash-seed"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "sandbox_access_token_hash_seed" {
@@ -250,6 +257,7 @@ output "sandbox_access_token_hash_seed" {
 // ---
 resource "aws_secretsmanager_secret" "redis_cluster_url" {
   name = "${var.prefix}redis-cluster-url"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "redis_cluster_url" {
@@ -269,6 +277,7 @@ data "aws_secretsmanager_secret_version" "redis_cluster_url" {
 
 resource "aws_secretsmanager_secret" "redis_tls_ca_base64" {
   name = "${var.prefix}redis-tls-ca-base64"
+  tags = local.resource_tags
 }
 
 resource "aws_secretsmanager_secret_version" "redis_tls_ca_base64" {

@@ -15,3 +15,12 @@ module "cloudflare" {
 
   prefix = var.prefix
 }
+locals {
+  # Keep provider-side cost attribution on every durable E2B artifact. The
+  # prefix is the environment's canonical namespace (for example `e2b-`),
+  # so this remains parameterized instead of baking the dev project name into
+  # each resource.
+  resource_tags = {
+    Project = trimsuffix(var.prefix, "-")
+  }
+}
