@@ -157,17 +157,10 @@ job "api" {
         cpu        = ${cpu_count * 1000}
       }
 
-      # Resolve the live Redis allocation through Nomad/Consul before starting
-      # the API. This avoids relying on the Docker container's 127.0.0.53 stub,
-      # which can return SERVFAIL while systemd-resolved is converging after a
-      # node bootstrap. The lookup is intentionally a short-lived startup gate;
-      # once rendered, REDIS_URL follows the healthy allocation address.
-      template {
-        data        = "REDIS_URL={{ with service \"redis|passing\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
-        destination = "local/redis.env"
-        env         = true
-        change_mode = "restart"
-      }
+      # REDIS_URL is the canonical Consul-DNS name supplied by the environment.
+      # The task-level resolver below points directly at the node-local Consul
+      # listener, avoiding the ACL-incompatible systemd stub without adding a
+      # Nomad template startup gate.
       env {
         NODE_ID                        = "$${node.unique.id}"
         API_EDGE_GRPC_PORT             = "$${NOMAD_PORT_grpc_api}"
@@ -179,6 +172,11 @@ job "api" {
 
       config {
         network_mode = "host"
+        # Host-networked tasks inherit the systemd stub (127.0.0.53), which
+        # cannot forward ACL-protected Consul DNS requests reliably. Point the
+        # container resolver at the node-local Consul listener instead; service
+        # names remain governed by the node's Consul ACL configuration.
+        dns_servers = ["172.17.0.1"]
         image        = "${api_docker_image}"
         ports        = ["${port_name}", "grpc_api"]
         args         = [
