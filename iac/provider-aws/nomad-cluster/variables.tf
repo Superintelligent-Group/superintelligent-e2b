@@ -2,6 +2,11 @@ variable "prefix" {
   type = string
 }
 
+variable "cluster_discovery_tag_value" {
+  type        = string
+  description = "Unique AWS discovery tag value for this Nomad/Consul cluster."
+}
+
 variable "aws_account_id" {
   type = string
 }

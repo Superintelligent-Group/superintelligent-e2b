@@ -112,6 +112,11 @@ locals {
   clickhouse_pool_name   = "clickhouse"
   clickhouse_jobs_prefix = "clickhouse"
 
+  # Discovery is an account/environment boundary, not merely a resource-name
+  # convention. The explicit override prevents a client from joining a legacy
+  # cluster that happens to retain the historical e2b-nomad-cluster tag.
+  nomad_cluster_discovery_tag_value = var.nomad_cluster_discovery_tag_value != "" ? var.nomad_cluster_discovery_tag_value : "${var.prefix}${var.environment}-nomad-cluster"
+
   # AMI name prefix must match what Packer produces: "${var.prefix}orch-<timestamp>"
   ami_family_prefix = "${var.prefix}orch-"
 
@@ -258,9 +263,10 @@ module "redis" {
 module "cluster" {
   source = "./nomad-cluster"
 
-  prefix         = var.prefix
-  aws_account_id = data.aws_caller_identity.current.account_id
-  aws_region     = data.aws_region.current.id
+  prefix                      = var.prefix
+  cluster_discovery_tag_value = local.nomad_cluster_discovery_tag_value
+  aws_account_id              = data.aws_caller_identity.current.account_id
+  aws_region                  = data.aws_region.current.id
 
   nomad_acl_token_secret          = module.init.cluster.nomad_acl_token
   nomad_acl_token_secret_arn      = "arn:aws:secretsmanager:us-east-1:014155356804:secret:e2b-dev/nomad-acl-token-j8mc4t"

@@ -14,8 +14,9 @@ aws_region = "us-east-1"
 # first commit and dev.sig.tfvars.reference already lacked the dash) --
 # whatever created the live resources used a different value that was never
 # reconciled back into tracked config.
-prefix      = "e2b-"
-environment = "dev"
+prefix                            = "e2b-"
+environment                       = "dev"
+nomad_cluster_discovery_tag_value = "e2b-cq-dev-nomad-cluster"
 # SUP-704: the canonical SIG Nomad topology schedules client-proxy on the
 # always-on control-plane pool (node_pool=default), not the legacy orch-client
 # ASG. Keep the ALB attachment aligned with that authoritative placement.

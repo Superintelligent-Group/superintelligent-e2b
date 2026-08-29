@@ -23,6 +23,12 @@ variable "prefix" {
   description = "Name prefix for all resources"
 }
 
+variable "nomad_cluster_discovery_tag_value" {
+  type        = string
+  default     = ""
+  description = "Optional AWS tag value used by Consul/Nomad retry_join. Set this per account/environment to prevent clients discovering a different cluster with the same resource prefix."
+}
+
 variable "bucket_prefix" {
   type = string
 }

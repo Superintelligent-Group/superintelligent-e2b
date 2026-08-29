@@ -11,7 +11,7 @@ locals {
 
   // The tag name the Compute Instances will look for to automatically discover each other and form a cluster.
   cluster_tag_name  = "cluster-discovery-name"
-  cluster_tag_value = "${var.prefix}nomad-cluster"
+  cluster_tag_value = var.cluster_discovery_tag_value
 
   aws_ecr_account_repository_domain = "${var.aws_account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
 }
