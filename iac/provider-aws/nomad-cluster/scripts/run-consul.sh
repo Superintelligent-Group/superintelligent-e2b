@@ -475,6 +475,12 @@ EOF
 
     touch register-service-policy.hcl
     cat <<EOF >register-service-policy.hcl
+node_prefix "" {
+  # Nomad clients must publish their own node/coordinate records before
+  # services can be scheduled. Keep this in the shared bootstrap policy so
+  # replacement clients converge without a manual ACL repair.
+  policy = "write"
+}
 service_prefix "" {
   policy = "write"
 }

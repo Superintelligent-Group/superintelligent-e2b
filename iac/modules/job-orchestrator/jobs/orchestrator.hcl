@@ -98,14 +98,6 @@ job "orchestrator-${latest_orchestrator_job_id}" {
         memory_max = -1
       }
 
-      # Resolve Redis through Nomad/Consul at allocation time so cold wakes do
-      # not depend on systemd-resolved being ready on the client node.
-      template {
-        data = "REDIS_URL={{ with service \"redis\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
-        destination = "local/redis.env"
-        env = true
-        change_mode = "restart"
-      }
       env {
         NODE_ID     = "$${node.unique.name}"
         NODE_IP     = "$${attr.unique.network.ip-address}"
