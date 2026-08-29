@@ -75,6 +75,10 @@ resource "aws_iam_role_policy_attachment" "api" {
   for_each = {
     "cluster-node" = var.cluster_node_policy_arn
     "api-node"     = aws_iam_policy.api_node_policy.arn
+    # Keep API bootstrap observable through the same outbound-only Session
+    # Manager seam as client and control nodes. This is diagnostic access only;
+    # it does not grant inbound SSH or alter workload permissions.
+    "ssm-core" = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
   }
 
   role       = aws_iam_role.api.name

@@ -157,13 +157,15 @@ job "api" {
         cpu        = ${cpu_count * 1000}
       }
 
-      # Resolve Redis through Nomad/Consul at allocation time instead of relying on
-      # the host stub resolver during node bootstrap. This keeps API startup
-      # deterministic while still following Redis replacements.
+      # Resolve the live Redis allocation through Nomad/Consul before starting
+      # the API. This avoids relying on the Docker container's 127.0.0.53 stub,
+      # which can return SERVFAIL while systemd-resolved is converging after a
+      # node bootstrap. The lookup is intentionally a short-lived startup gate;
+      # once rendered, REDIS_URL follows the healthy allocation address.
       template {
-        data = "REDIS_URL={{ with service \"redis\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
+        data        = "REDIS_URL={{ with service \"redis|passing\" }}{{ (index . 0).Address }}:{{ (index . 0).Port }}{{ end }}"
         destination = "local/redis.env"
-        env = true
+        env         = true
         change_mode = "restart"
       }
       env {
