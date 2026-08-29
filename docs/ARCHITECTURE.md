@@ -398,6 +398,9 @@ flowchart TB
   together in Terraform; node bootstrap persists and verifies the kernel ceiling before Nomad is
   started, so a worker cannot silently run with fewer overlay devices than its configured pool.
   Autoscaled.
+  Launch-template changes are propagated through an explicit Auto Scaling instance refresh;
+  single-node development pools allow a brief zero-capacity interval and automatically roll back
+  if the replacement fails health checks.
 - **Build nodes** run the same binary in template-manager mode, are explicitly classified as
   `meta.node_type=build`, and never run the sandbox orchestrator; the `nomad-nodepool-apm`
   autoscaler plugin scales the job with the node pool.
