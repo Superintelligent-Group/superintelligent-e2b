@@ -153,7 +153,7 @@ mkdir -p /etc/systemd/resolved.conf.d/
 touch /etc/systemd/resolved.conf.d/consul.conf
 cat <<EOF >/etc/systemd/resolved.conf.d/consul.conf
 [Resolve]
-DNS=127.0.0.1#8600
+DNS=127.0.0.1:8600
 Domains=~consul
 DNSSEC=false
 DNSStubListener=yes
