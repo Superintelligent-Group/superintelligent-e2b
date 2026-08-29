@@ -212,7 +212,6 @@ resource "aws_autoscaling_group" "client" {
   # CQ dev pool, while auto-rollback prevents a bad bootstrap from persisting.
   instance_refresh {
     strategy = "Rolling"
-    triggers = ["launch_template"]
 
     preferences {
       min_healthy_percentage = 0
