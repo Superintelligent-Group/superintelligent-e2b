@@ -107,6 +107,10 @@ resource "aws_iam_role_policy_attachment" "client" {
   for_each = {
     "cluster-node" = var.cluster_node_policy_arn
     "client-node"  = aws_iam_policy.client_node_policy.arn
+    # Client nodes have no inbound admin path.  Keep Session Manager as the
+    # auditable, outbound-only diagnostic seam so a failed Nomad bootstrap can
+    # be inspected and repaired without opening SSH or broadening the SG.
+    "ssm-core" = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
   }
 
   role       = aws_iam_role.client.name

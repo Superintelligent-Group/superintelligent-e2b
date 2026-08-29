@@ -296,6 +296,14 @@ for i in {1..30}; do
     echo "- Consul DNS is reachable through systemd-resolved (attempt $i/30)"
     break
   fi
+  # systemd-resolved can retain a transient SERVFAIL/connection-refused
+  # feature probe for a non-default DNS port even while the Consul listener is
+  # healthy.  Verify the same local Consul authority directly before failing
+  # closed; this avoids abandoning a usable Nomad client during that probe.
+  if command -v dig >/dev/null 2>&1 && dig +time=1 +tries=1 +short @127.0.0.1 -p 8600 consul.service.consul | grep -q .; then
+    echo "- Consul DNS listener is reachable directly; continuing (resolver probe attempt $i/30)"
+    break
+  fi
   if [ $i -eq 30 ]; then
     echo "- ERROR: Consul DNS route is not usable through systemd-resolved"
     exit 1

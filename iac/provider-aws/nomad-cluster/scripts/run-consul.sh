@@ -460,7 +460,6 @@ function setup_dns_resolving {
 
   if (($(consul acl policy read -name="dns-request-policy" -token="${consul_token}" -format=json | jq '.ID' | wc -l) > 0)); then
     log_info "DNS Request Policy already exists"
-    return
   else
     # Based on https://developer.hashicorp.com/consul/tutorials/security/access-control-setup-production#token-for-dns
     # Token is created on the leader node, so there's no problem with duplication
@@ -487,7 +486,10 @@ EOF
       rm register-service-policy.hcl
   fi
 
-
+  # The policy is cluster-scoped, but the agent token is node-local.  Every
+  # client must bind the supplied DNS token even when another node created the
+  # policy first; returning above left fresh clients with SERVFAIL from
+  # systemd-resolved and prevented Nomad from starting.
   consul acl set-agent-token -token="${consul_token}" default "${dns_request_token}"
   log_info "Client token set"
 }
