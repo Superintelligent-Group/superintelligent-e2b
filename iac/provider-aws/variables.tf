@@ -259,6 +259,17 @@ variable "client_server_nested_virtualization" {
   default = true
 }
 
+variable "client_base_hugepages_percentage" {
+  type        = number
+  description = "Percentage of client-node hugepage capacity preallocated for Firecracker restores. Keep enough headroom for the largest guest snapshot."
+  default     = 75
+
+  validation {
+    condition     = var.client_base_hugepages_percentage >= 50 && var.client_base_hugepages_percentage <= 95
+    error_message = "client_base_hugepages_percentage must be between 50 and 95."
+  }
+}
+
 variable "client_node_labels" {
   description = "Labels to assign to client nodes for scheduling purposes"
   type        = list(string)
@@ -294,6 +305,17 @@ variable "orchestrator_port" {
 variable "orchestrator_proxy_port" {
   type    = number
   default = 5007
+}
+
+variable "orchestrator_memory_mb" {
+  type        = number
+  description = "Nomad memory reservation for the orchestrator and Firecracker children. Must cover the largest promoted snapshot plus restore headroom."
+  default     = 12288
+
+  validation {
+    condition     = var.orchestrator_memory_mb >= 10240
+    error_message = "orchestrator_memory_mb must be at least 10240 MiB for the current governed code snapshot."
+  }
 }
 
 variable "allow_sandbox_internal_cidrs" {

@@ -153,6 +153,16 @@ Key mechanisms (all under `pkg/sandbox/`):
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
+- **Memory reservation is a restore invariant**: the Nomad orchestrator cgroup must be sized for
+  the largest promoted snapshot plus UFFD/Firecracker overhead. The current governed code snapshot
+  is about 9.2 GiB, so the AWS provider defaults to a 12 GiB reservation (and validates that the
+  configured value is at least 10 GiB). A smaller reservation can schedule successfully yet fail
+  at `/snapshot/load` with `mmap memfd: cannot allocate memory`; this is a capacity/configuration
+  failure, not a missing-template failure.
+- **Hugepage capacity is part of the same invariant**: client nodes preallocate a parameterized
+  75% base hugepage pool, leaving an explicit overcommit reserve. A pool sized exactly to guest RAM
+  can still fail the memfd restore because Firecracker needs mapping headroom; the pool must be
+  sized from the largest guest profile, not from the Nomad task reservation alone.
 - **Copy-on-write rootfs** (`rootfs/`, `nbd/`, `block/`): the template rootfs stays read-only;
   writes go to a per-sandbox COW cache exposed to Firecracker as an NBD block device served by
   an in-process userspace NBD server. On pause, the dirty blocks are exported as a diff.

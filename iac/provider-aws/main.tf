@@ -320,6 +320,7 @@ module "cluster" {
   client_machine_type                 = var.client_server_machine_type
   client_security_group_ids           = [aws_security_group.cluster_node.id]
   client_server_nested_virtualization = var.client_server_nested_virtualization
+  client_base_hugepages_percentage    = var.client_base_hugepages_percentage
   nbd_max_devices                     = var.nbd_max_devices
   client_node_labels                  = var.client_node_labels
 
@@ -387,6 +388,7 @@ module "nomad" {
   orchestrator_node_pool              = local.client_pool_name
   orchestrator_port                   = var.orchestrator_port
   orchestrator_proxy_port             = var.orchestrator_proxy_port
+  orchestrator_memory_mb              = var.orchestrator_memory_mb
   fc_env_pipeline_bucket_name         = module.init.fc_env_pipeline_bucket_name
   orchestrator_artifact_key           = var.orchestrator_artifact_key
   template_manager_artifact_key       = var.template_manager_artifact_key
