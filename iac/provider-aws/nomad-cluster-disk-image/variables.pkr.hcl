@@ -16,8 +16,11 @@ variable "prefix" {
 }
 
 variable "consul_version" {
-  type    = string
-  default = "1.17.3"
+  type = string
+  # Keep the client image on the same line as the CQ control plane. Leaving
+  # this stale forces worker userdata to reinstall Consul during every cold
+  # scale-up and defeats the immutable-image contract.
+  default = "2.0.3"
 }
 
 variable "nomad_version" {
@@ -39,6 +42,24 @@ variable "clickhouse_client_version" {
 variable "cni_plugin_version" {
   type    = string
   default = "v1.6.2"
+}
+
+variable "firecracker_host_version" {
+  type        = string
+  description = "Exact Firecracker and jailer release baked into the worker host image."
+  default     = "v1.5.0"
+}
+
+variable "cloudwatch_agent_version" {
+  type        = string
+  description = "Exact Amazon CloudWatch agent package version baked into the worker host image."
+  default     = "1.300072.0b1766"
+}
+
+variable "cloudwatch_agent_sha256" {
+  type        = string
+  description = "SHA-256 of the pinned CloudWatch agent Debian package."
+  default     = "05baeadca96c4bb8e43906ed09cf0bebd0f321ff6d41987bdc46ce681de0978d"
 }
 
 variable "base_instance_type" {

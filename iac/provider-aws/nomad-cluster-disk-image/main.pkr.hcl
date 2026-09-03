@@ -45,11 +45,15 @@ source "amazon-ebs" "ubuntu" {
   # 1.8.4 for months — surfacing only when upstream jobspecs using
   # memory_max = -1 (Nomad 1.7+) started returning 500.
   tags = {
-    Name          = "${var.prefix}orch-${formatdate("YYYY-MM-DD-hh-mm-ss", timestamp())}"
-    NomadVersion  = var.nomad_version
-    ConsulVersion = var.consul_version
-    BuiltAt       = formatdate("YYYY-MM-DD'T'hh:mm:ssZ", timestamp())
-    SourceAMI     = "{{ .SourceAMI }}"
+    Name                       = "${var.prefix}orch-${formatdate("YYYY-MM-DD-hh-mm-ss", timestamp())}"
+    NomadVersion               = var.nomad_version
+    ConsulVersion              = var.consul_version
+    FirecrackerHostVersion     = var.firecracker_host_version
+    CloudWatchAgentVersion     = var.cloudwatch_agent_version
+    WorkerDependenciesPrebaked = "true"
+    WorkerImageContract        = "sig-e2b-worker-v1"
+    BuiltAt                    = formatdate("YYYY-MM-DD'T'hh:mm:ssZ", timestamp())
+    SourceAMI                  = "{{ .SourceAMI }}"
   }
 
   launch_block_device_mappings {
@@ -100,7 +104,7 @@ build {
   provisioner "shell" {
     inline = [
       "sudo apt-get update",
-      "sudo apt-get install -y nvme-cli unzip jq net-tools qemu-utils make build-essential openssh-client openssh-server", # TODO: openssh-server is updated to prevent security vulnerabilities
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https bridge-utils ca-certificates curl gnupg iproute2 iptables jq lsb-release nbd-client net-tools nvme-cli qemu-utils software-properties-common unzip wget make build-essential openssh-client openssh-server", # TODO: openssh-server is updated to prevent security vulnerabilities
     ]
   }
 
@@ -178,6 +182,36 @@ build {
   provisioner "shell" {
     inline = [
       "sudo apt-get install -y s3fs",
+    ]
+  }
+
+  # Firecracker and jailer are stable host dependencies. Verify the upstream
+  # release checksum and bake them once instead of downloading them during
+  # every paid worker scale-up.
+  provisioner "shell" {
+    inline = [
+      "cd /tmp",
+      "curl -fsSLO https://github.com/firecracker-microvm/firecracker/releases/download/${var.firecracker_host_version}/firecracker-${var.firecracker_host_version}-x86_64.tgz",
+      "curl -fsSLO https://github.com/firecracker-microvm/firecracker/releases/download/${var.firecracker_host_version}/firecracker-${var.firecracker_host_version}-x86_64.tgz.sha256.txt",
+      "sha256sum -c firecracker-${var.firecracker_host_version}-x86_64.tgz.sha256.txt",
+      "tar -xzf firecracker-${var.firecracker_host_version}-x86_64.tgz",
+      "sudo install -m 0755 release-${var.firecracker_host_version}-x86_64/firecracker-${var.firecracker_host_version}-x86_64 /usr/local/bin/firecracker",
+      "sudo install -m 0755 release-${var.firecracker_host_version}-x86_64/jailer-${var.firecracker_host_version}-x86_64 /usr/local/bin/jailer",
+      "rm -rf firecracker-${var.firecracker_host_version}-x86_64.tgz firecracker-${var.firecracker_host_version}-x86_64.tgz.sha256.txt release-${var.firecracker_host_version}-x86_64",
+      "/usr/local/bin/firecracker --version",
+    ]
+  }
+
+  # Observability must never sit on the cold-start critical path. Pin and
+  # verify the package here; userdata only writes runtime configuration and
+  # starts the already-installed agent.
+  provisioner "shell" {
+    inline = [
+      "curl -fsSLo /tmp/amazon-cloudwatch-agent.deb https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/${var.cloudwatch_agent_version}/amazon-cloudwatch-agent.deb",
+      "echo '${var.cloudwatch_agent_sha256}  /tmp/amazon-cloudwatch-agent.deb' | sha256sum -c -",
+      "sudo DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/amazon-cloudwatch-agent.deb",
+      "rm -f /tmp/amazon-cloudwatch-agent.deb",
+      "test -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl",
     ]
   }
 

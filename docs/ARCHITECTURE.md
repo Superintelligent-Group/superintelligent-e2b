@@ -404,6 +404,13 @@ flowchart TB
   together in Terraform; node bootstrap persists and verifies the kernel ceiling before Nomad is
   started, so a worker cannot silently run with fewer overlay devices than its configured pool.
   Autoscaled.
+  The immutable AWS client AMI carries the stable host dependency layer:
+  Docker, AWS CLI, Nomad, Consul, Firecracker/jailer, CNI tooling, and the
+  CloudWatch agent. Each image is tagged with the exact component versions and
+  `WorkerImageContract=sig-e2b-worker-v1`. Instance userdata remains the
+  authority for instance identity, cluster state reset, credentials, service
+  discovery, runtime artifact selection, kernel capacity, and service startup;
+  secrets and scheduler membership are never baked into the image.
   Launch-template changes are propagated through an explicit Auto Scaling instance refresh;
   single-node development pools allow a brief zero-capacity interval and automatically roll back
   if the replacement fails health checks.
