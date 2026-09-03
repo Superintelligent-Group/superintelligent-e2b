@@ -163,6 +163,16 @@ dry_run_plan="$(
 [[ "${dry_run_plan}" != *"unreviewed"* ]] ||
   fail 'caller-defined recipe fragments overrode reviewed CQ configuration'
 
+dry_run_api_job="$(make "${common_args[@]}" -n plan-only-jobs/api)"
+[[ "${dry_run_api_job}" == *'-target="module.nomad.module.api"'* ]] ||
+  fail 'single-job plan did not target only the requested Nomad job module'
+
+if make "${common_args[@]}" -n plan-only-jobs/not_a_job >"${fixture_dir}/unknown-job.log" 2>&1; then
+  fail 'single-job plan accepted an unknown Nomad job module'
+fi
+grep -q "Unsupported Nomad job module 'not_a_job'" "${fixture_dir}/unknown-job.log" ||
+  fail 'unknown Nomad job rejection was not explicit'
+
 dry_run_apply="$(make "${common_args[@]}" -n apply)"
 [[ "${dry_run_apply}" == *".tfplan.dev.cq"* ]] ||
   fail 'apply did not use the CQ-bound plan path'

@@ -209,12 +209,25 @@ plan: aws-account-guard
 	@ $(tf_vars) $(TF) plan $(TF_VAR_FILE_ARG) -out=$(TF_PLAN_FILE) -input=false -compact-warnings -parallelism=20
 
 plan_only_jobs_moved_targets = -target="random_password.volume_token_key" -target="module.nomad.random_password.volume_token_key"
+nomad_job_modules := api clickhouse client_proxy ingress logs_collector loki orchestrator otel_collector otel_collector_nomad_server redis template_manager template_manager_autoscaler
 
 .PHONY: plan-only-jobs
 plan-only-jobs: aws-account-guard
 	@ printf "Planning Terraform for env: `tput setaf 2``tput bold`$(ENV)`tput sgr0`\n\n"
 	$(call tf_fmt)
 	@ $(tf_vars) $(TF) plan $(TF_VAR_FILE_ARG) -out=$(TF_PLAN_FILE) -input=false -compact-warnings -parallelism=20 -target=module.nomad $(plan_only_jobs_moved_targets)
+
+# Resolve and deploy a single Nomad job module. The repository root has long
+# exposed plan-only-jobs/<name>; keeping the implementation here prevents a
+# caller from falling back to the whole module.nomad target when that narrow
+# target is requested. Hyphenated job names are normalized by the root
+# Makefile before reaching this target.
+.PHONY: plan-only-jobs/%
+plan-only-jobs/%: aws-account-guard
+	$(if $(filter $*,$(nomad_job_modules)),,$(error Unsupported Nomad job module '$*'; expected one of: $(nomad_job_modules)))
+	@ printf "Planning Nomad job %s for env: `tput setaf 2``tput bold`$(ENV)`tput sgr0`\n\n" "$*"
+	$(call tf_fmt)
+	@ $(tf_vars) $(TF) plan $(TF_VAR_FILE_ARG) -out=$(TF_PLAN_FILE) -input=false -compact-warnings -parallelism=20 -target="module.nomad.module.$*" $(plan_only_jobs_moved_targets)
 
 .PHONY: plan-without-jobs
 plan-without-jobs: aws-account-guard

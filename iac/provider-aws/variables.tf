@@ -10,7 +10,7 @@ variable "client_proxy_target_asg_name" {
 
 variable "nomad_region" {
   type        = string
-  description = "Nomad control-plane region. Set to the authoritative provider cluster region (for CQ E2B, us-east-1); this is separate from the AWS region."
+  description = "Nomad scheduler region advertised by the selected control plane; this is independent of the AWS region."
   default     = "global"
 }
 
