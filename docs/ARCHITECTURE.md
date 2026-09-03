@@ -117,7 +117,10 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
 - **Placement**: keeps a live map of orchestrator nodes (discovered via Nomad, Kubernetes, or a
   static list). Chooses a node per sandbox with a **best-of-K** algorithm
   (`internal/orchestrator/placement/`): sample K ready nodes, score by CPU
-  commitment/usage, pick the lowest; retry on exhausted nodes. Tunable live via feature flags.
+  commitment/usage, pick the lowest; retry on exhausted nodes. When a cold wake has produced a
+  healthy scheduler allocation but the periodic API cache is still empty, the create path runs one
+  singleflight, bounded discovery pass before placement instead of waiting for the next cache tick.
+  Tunable live via feature flags.
 - **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and the
   sandbox→node **routing catalog** in Redis that client-proxy reads. Persistent entities
   (templates, builds, snapshots, teams) live in Postgres.

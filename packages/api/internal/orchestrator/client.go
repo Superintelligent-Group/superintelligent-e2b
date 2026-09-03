@@ -198,6 +198,37 @@ func (o *Orchestrator) getOrConnectNode(ctx context.Context, clusterID uuid.UUID
 	return o.GetNode(clusterID, nodeID)
 }
 
+// getOrDiscoverClusterNodes returns the current placement candidates, forcing
+// one bounded discovery pass when the API cache is still empty. This closes
+// the cold-wake gap where Nomad has a healthy orchestrator allocation but the
+// API's periodic cache has not reached its next sync tick yet.
+func (o *Orchestrator) getOrDiscoverClusterNodes(ctx context.Context, clusterID uuid.UUID) []*nodemanager.Node {
+	nodes := o.GetClusterNodes(clusterID)
+	if len(nodes) > 0 {
+		return nodes
+	}
+
+	discoveryKey := "cluster-capacity:" + clusterID.String()
+	o.discoveryGroup.Do(discoveryKey, func() (any, error) { //nolint:errcheck
+		if len(o.GetClusterNodes(clusterID)) > 0 {
+			return nil, nil
+		}
+
+		discoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheSyncTime)
+		defer cancel()
+
+		if clusterID == consts.LocalClusterID {
+			o.discoverNomadNodes(discoveryCtx)
+		} else {
+			o.discoverClusterNode(discoveryCtx, clusterID)
+		}
+
+		return nil, nil
+	})
+
+	return o.GetClusterNodes(clusterID)
+}
+
 // discoverNomadNodes lists all ready Nomad nodes and connects any that are not yet in the pool.
 // Once a new node is connected its orchestrator ID becomes the map key, making subsequent GetNode calls succeed.
 func (o *Orchestrator) discoverNomadNodes(ctx context.Context) {
