@@ -336,7 +336,7 @@ func (o *Orchestrator) CreateSandbox(
 	}
 
 	nodeClusterID := clusters.WithClusterFallback(team.ClusterID)
-	clusterNodes := o.GetClusterNodes(nodeClusterID)
+	clusterNodes := o.getOrDiscoverClusterNodes(ctx, nodeClusterID)
 
 	allLabels, labelFilteringEnabled := o.generateRequiredNodeLabels(ctx, sandboxID, team, sbxData)
 

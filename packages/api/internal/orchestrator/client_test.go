@@ -81,7 +81,7 @@ func (s *fakeInfoServer) ServiceInfo(context.Context, *emptypb.Empty) (*infogrpc
 // startFakeOrchestratorGRPC starts a gRPC server that responds to ServiceInfo
 // requests. When addr is empty it listens on an ephemeral port; otherwise it
 // binds to the given address (e.g. "127.0.0.1:5008").
-func startFakeOrchestratorGRPC(t *testing.T, nodeID string, addr string) {
+func startFakeOrchestratorGRPC(t *testing.T, nodeID string, addr string) string {
 	t.Helper()
 
 	if addr == "" {
@@ -96,6 +96,8 @@ func startFakeOrchestratorGRPC(t *testing.T, nodeID string, addr string) {
 
 	go srv.Serve(lis)
 	t.Cleanup(srv.GracefulStop)
+
+	return lis.Addr().String()
 }
 
 // TestGetOrConnectNode_CacheHit verifies that when a node is already in the
@@ -128,6 +130,86 @@ func TestGetOrConnectNode_CacheHit_LocalCluster(t *testing.T) {
 	got := o.getOrConnectNode(t.Context(), consts.LocalClusterID, "local-node")
 	require.NotNil(t, got)
 	assert.Equal(t, "local-node", got.ID)
+}
+
+func TestGetOrDiscoverClusterNodes_CacheMiss_DiscoversCapacity(t *testing.T) {
+	t.Parallel()
+
+	orchestratorNodeID := "cold-wake-node"
+	grpcAddress := startFakeOrchestratorGRPC(t, orchestratorNodeID, "")
+	host, portValue, err := net.SplitHostPort(grpcAddress)
+	require.NoError(t, err)
+	port, err := net.LookupPort("tcp", portValue)
+	require.NoError(t, err)
+
+	nomadClient := newNomadMock(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/service/orchestrator" {
+			http.NotFound(w, r)
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]*nomadapi.ServiceRegistration{{
+			ID:          "_nomad-task-cold-wake-orchestrator",
+			ServiceName: "orchestrator",
+			NodeID:      "c0ffee0011223344c0ffee0011223344c0ffee00",
+			Address:     host,
+			Port:        port,
+		}})
+	})
+
+	o := newTestOrchestrator(t, nomadClient)
+	require.Empty(t, o.GetClusterNodes(consts.LocalClusterID))
+
+	nodes := o.getOrDiscoverClusterNodes(t.Context(), consts.LocalClusterID)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, orchestratorNodeID, nodes[0].ID)
+}
+
+func TestGetOrDiscoverClusterNodes_CacheHit_SkipsDiscovery(t *testing.T) {
+	t.Parallel()
+
+	o := newTestOrchestrator(t, nil)
+	node := nodemanager.NewTestNode("already-cached", api.NodeStatusReady, 0, 4)
+	node.ClusterID = consts.LocalClusterID
+	o.registerNode(node)
+
+	nodes := o.getOrDiscoverClusterNodes(t.Context(), consts.LocalClusterID)
+	require.Len(t, nodes, 1)
+	assert.Same(t, node, nodes[0])
+}
+
+func TestGetOrDiscoverClusterNodes_ConcurrentMiss_SharesDiscovery(t *testing.T) {
+	t.Parallel()
+
+	var discoveryAttempts atomic.Int32
+	nomadClient := newNomadMock(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/service/orchestrator" {
+			http.NotFound(w, r)
+
+			return
+		}
+
+		discoveryAttempts.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]*nomadapi.ServiceRegistration{})
+	})
+
+	o := newTestOrchestrator(t, nomadClient)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			<-start
+			o.getOrDiscoverClusterNodes(t.Context(), consts.LocalClusterID)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), discoveryAttempts.Load(), "concurrent cold creates must share one discovery pass")
 }
 
 // TestGetOrConnectNode_CacheMiss_TriggersNomadDiscovery verifies that when a Nomad node is NOT
