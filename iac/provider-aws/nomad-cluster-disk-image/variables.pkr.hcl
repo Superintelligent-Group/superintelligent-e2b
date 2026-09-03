@@ -50,6 +50,18 @@ variable "firecracker_host_version" {
   default     = "v1.5.0"
 }
 
+variable "firecracker_runtime_version" {
+  type        = string
+  description = "Exact E2B Firecracker build baked into the versioned runtime path selected by template metadata."
+  default     = "v1.14.1_431f1fc"
+}
+
+variable "firecracker_runtime_sha256" {
+  type        = string
+  description = "SHA-256 of the pinned amd64 E2B Firecracker runtime binary."
+  default     = "d81fd733be7e027406b4d5241442c447a2b5878b06dfa63dc236e68f3536d689"
+}
+
 variable "cloudwatch_agent_version" {
   type        = string
   description = "Exact Amazon CloudWatch agent package version baked into the worker host image."

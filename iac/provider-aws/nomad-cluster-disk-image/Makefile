@@ -18,6 +18,8 @@ build: aws-write-account-guard
 		$(if $(PACKER_CONSUL_VERSION),-var "consul_version=$(PACKER_CONSUL_VERSION)") \
 		$(if $(PACKER_NOMAD_VERSION),-var "nomad_version=$(PACKER_NOMAD_VERSION)") \
 		$(if $(PACKER_FIRECRACKER_HOST_VERSION),-var "firecracker_host_version=$(PACKER_FIRECRACKER_HOST_VERSION)") \
+		$(if $(PACKER_FIRECRACKER_RUNTIME_VERSION),-var "firecracker_runtime_version=$(PACKER_FIRECRACKER_RUNTIME_VERSION)") \
+		$(if $(PACKER_FIRECRACKER_RUNTIME_SHA256),-var "firecracker_runtime_sha256=$(PACKER_FIRECRACKER_RUNTIME_SHA256)") \
 		$(if $(PACKER_CLOUDWATCH_AGENT_VERSION),-var "cloudwatch_agent_version=$(PACKER_CLOUDWATCH_AGENT_VERSION)") \
 		$(if $(PACKER_CLOUDWATCH_AGENT_SHA256),-var "cloudwatch_agent_sha256=$(PACKER_CLOUDWATCH_AGENT_SHA256)") \
 		$(if $(PACKER_VPC_ID),-var "vpc_id=$(PACKER_VPC_ID)") \

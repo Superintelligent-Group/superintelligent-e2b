@@ -405,9 +405,10 @@ flowchart TB
   started, so a worker cannot silently run with fewer overlay devices than its configured pool.
   Autoscaled.
   The immutable AWS client AMI carries the stable host dependency layer:
-  Docker, AWS CLI, Nomad, Consul, Firecracker/jailer, CNI tooling, and the
+  Docker, AWS CLI, Nomad, Consul, the host Firecracker/jailer pair, the exact
+  E2B Firecracker runtime selected by template metadata, CNI tooling, and the
   CloudWatch agent. Each image is tagged with the exact component versions and
-  `WorkerImageContract=sig-e2b-worker-v1`. Instance userdata remains the
+  `WorkerImageContract=sig-e2b-worker-v2`. Instance userdata remains the
   authority for instance identity, cluster state reset, credentials, service
   discovery, runtime artifact selection, kernel capacity, and service startup;
   secrets and scheduler membership are never baked into the image.

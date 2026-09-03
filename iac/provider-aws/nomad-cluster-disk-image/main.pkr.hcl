@@ -49,9 +49,10 @@ source "amazon-ebs" "ubuntu" {
     NomadVersion               = var.nomad_version
     ConsulVersion              = var.consul_version
     FirecrackerHostVersion     = var.firecracker_host_version
+    FirecrackerRuntimeVersion  = var.firecracker_runtime_version
     CloudWatchAgentVersion     = var.cloudwatch_agent_version
     WorkerDependenciesPrebaked = "true"
-    WorkerImageContract        = "sig-e2b-worker-v1"
+    WorkerImageContract        = "sig-e2b-worker-v2"
     BuiltAt                    = formatdate("YYYY-MM-DD'T'hh:mm:ssZ", timestamp())
     SourceAMI                  = "{{ .SourceAMI }}"
   }
@@ -199,6 +200,21 @@ build {
       "sudo install -m 0755 release-${var.firecracker_host_version}-x86_64/jailer-${var.firecracker_host_version}-x86_64 /usr/local/bin/jailer",
       "rm -rf firecracker-${var.firecracker_host_version}-x86_64.tgz firecracker-${var.firecracker_host_version}-x86_64.tgz.sha256.txt release-${var.firecracker_host_version}-x86_64",
       "/usr/local/bin/firecracker --version",
+    ]
+  }
+
+  # Templates select a patched E2B Firecracker build independently of the
+  # host-level firecracker/jailer pair. Bake that exact binary into the path
+  # resolved by the orchestrator so the first sandbox does not depend on a
+  # mutable download and cannot discover a version mismatch at placement.
+  provisioner "shell" {
+    inline = [
+      "curl -fsSLo /tmp/firecracker-runtime https://github.com/e2b-dev/fc-versions/releases/download/${var.firecracker_runtime_version}/firecracker-amd64",
+      "echo '${var.firecracker_runtime_sha256}  /tmp/firecracker-runtime' | sha256sum -c -",
+      "sudo install -d -m 0755 /opt/e2b/firecracker/${var.firecracker_runtime_version}/amd64",
+      "sudo install -m 0755 /tmp/firecracker-runtime /opt/e2b/firecracker/${var.firecracker_runtime_version}/amd64/firecracker",
+      "rm -f /tmp/firecracker-runtime",
+      "test -x /opt/e2b/firecracker/${var.firecracker_runtime_version}/amd64/firecracker",
     ]
   }
 
