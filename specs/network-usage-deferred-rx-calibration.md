@@ -36,7 +36,9 @@ The real `Process.FinalizeMeasurement` action produces the exact terminal fence.
 The test-only accessor checks the ending/terminal latches and matched reference
 under the action gate. A second production finalization exercises replay. D is
 injected after that response while both tracing and capture remain active. There
-must be no subsequent TAP I/O, producer emission or controlled reply. The fixture
+must be no subsequent successful TAP byte operation, producer emission or
+controlled reply. The parser excludes allowed EAGAIN reads, so it does not prove
+that no read syscall was attempted. The fixture
 never pauses/snapshots while B is held: pinned `Net::prepare_save` explicitly
 finishes deferred RX and would change the state under test.
 

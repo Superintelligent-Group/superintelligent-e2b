@@ -215,7 +215,7 @@ def verify_deferred(base):
     assert terminal['FrameSequence'] == max(frames), 'frame after terminal'
     fds, events, emitted, positions, trace_hashes = trace_evidence(directory, [start, held, terminal])
     lo, mid, hi = positions
-    assert not any(e['fd'] == fds['tap'] for e in events[hi+1:]), 'TAP IO after cutoff'
+    assert not any(e['fd'] == fds['tap'] for e in events[hi+1:]), 'successful TAP byte operation after cutoff'
     assert not any(i > hi for i, _ in emitted), 'producer emission after cutoff'
     packets = json.loads((directory/'packets.json').read_text())
     packet_frames, identities = packet_evidence(packets)
