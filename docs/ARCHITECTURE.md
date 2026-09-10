@@ -177,6 +177,11 @@ Key mechanisms (all under `pkg/sandbox/`):
   inactive pending approved identity/retention configuration and live negative
   authorization tests. Runtime closing barriers and scheduled delivery remain
   separate requirements for a complete measured window.
+  A [pinned Firecracker producer patch](../third_party/firecracker-measurement/README.md)
+  adds opt-in correlated flush receipts and sticky emission loss. Its local build
+  recipe preserves source, patch and binary provenance; it does not change runtime
+  binary selection. Emission acknowledgment is distinct from collector persistence
+  and terminal device cutoff. Device counters are not provider-billable bytes.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
