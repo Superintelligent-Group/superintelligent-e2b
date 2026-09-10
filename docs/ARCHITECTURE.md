@@ -215,6 +215,10 @@ Key mechanisms (all under `pkg/sandbox/`):
   raw or inventory exhaustion fails closed. The option is disabled by default,
   and approved protected infrastructure plus live negative authorization tests
   remain required before activation.
+  The orchestrator [Nomad environment boundary](../iac/modules/job-orchestrator/README.md)
+  accepts logical strings, including structured JSON, and escapes them for jobspec
+  parsing. It preserves existing whitespace filtering and later Nomad runtime
+  interpolation; it does not activate protected configuration by itself.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
