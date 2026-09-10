@@ -224,6 +224,11 @@ Key mechanisms (all under `pkg/sandbox/`):
   checking protected metadata and hashing the actual body before returning it.
   This per-object capability does not discover manifests, map SIG sessions or
   authorize monetary usage; consumers must separately bound traversal.
+  An optional [explicit retained-evidence consumer](../specs/network-usage-evidence-consumer.md)
+  traverses supplied terminal claims through the distinct authenticated reader,
+  replays bounded raw evidence, and durably stores immutable nonmonetary receipts.
+  Device totals stop at the first gap; complete-window and SIG session mapping
+  remain unresolved. It adds no scheduled handoff, database or pricing operation.
   The orchestrator [Nomad environment boundary](../iac/modules/job-orchestrator/README.md)
   accepts logical strings, including structured JSON, and escapes them for jobspec
   parsing. It preserves existing whitespace filtering and later Nomad runtime
