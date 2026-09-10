@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 
+	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
@@ -141,7 +142,7 @@ func (n *Node) GetSandboxes(ctx context.Context) ([]sandbox.Sandbox, error) {
 				networkTrafficAccessToken,
 				volumeMounts,
 				iamFromProto(config.GetIam()),
-			),
+			).WithAllocationIdentity(api.SandboxAllocationIdentityProvenanceOrchestratorResync),
 		)
 	}
 

@@ -121,6 +121,14 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
   healthy scheduler allocation but the periodic API cache is still empty, the create path runs one
   singleflight, bounded discovery pass before placement instead of waiting for the next cache tick.
   Tunable live via feature flags.
+- **Allocation response identity**: successful public Create/Resume/Fork and Connect
+  responses include optional, versioned `allocationIdentity` from the server-owned sandbox
+  model. Successful placement and the existing trusted orchestrator resync record an explicit
+  context marker with selected cluster ID; known local placement uses the zero UUID. Historical
+  records without that context, or invalid/incomplete identity, report `unavailable` rather than
+  taking IDs from caller metadata. Live Connect preserves the current execution; external resume
+  starts a new execution. This is a server response boundary, not signed provenance, provider
+  account identity or SIG session mapping. See the [response contract](../specs/sandbox-allocation-identity.md).
 - **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and the
   sandbox→node **routing catalog** in Redis that client-proxy reads. Persistent entities
   (templates, builds, snapshots, teams) live in Postgres.

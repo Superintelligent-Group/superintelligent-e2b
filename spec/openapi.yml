@@ -572,6 +572,8 @@ components:
         - clientID
         - envdVersion
       properties:
+        allocationIdentity:
+          $ref: "#/components/schemas/SandboxAllocationIdentity"
         templateID:
           type: string
           description: Identifier of the template from which is the sandbox created
@@ -598,6 +600,50 @@ components:
           type: string
           nullable: true
           description: Base domain where the sandbox traffic is accessible
+
+    SandboxAllocationIdentity:
+      type: object
+      description: >-
+        Server-owned allocation context for successful Create, Resume, Fork and
+        Connect responses. This is a server response boundary, not a signed
+        attestation, provider account identity or SIG session association.
+        Available responses include every identity and clusterKind field.
+        Unavailable responses omit those fields; caller metadata cannot supply
+        missing context. An omitted allocationIdentity property means an older
+        server does not implement this contract.
+      required:
+        - schema
+        - status
+        - provenance
+      properties:
+        schema:
+          type: string
+          enum: ["e2b.allocation.v1"]
+        status:
+          type: string
+          enum: [available, unavailable]
+        provenance:
+          type: string
+          enum: [server_allocation, orchestrator_resync, unavailable]
+          description: Origin of retained server context; unavailable includes historical state without an explicit provenance marker.
+        sandboxID:
+          type: string
+          pattern: "^[a-z0-9]+$"
+        executionID:
+          type: string
+          format: uuid
+          description: Server-created execution; external resume creates a new execution, internal checkpoint preserves it.
+        teamID:
+          type: string
+          format: uuid
+          description: Authenticated owning team, never caller metadata.
+        clusterID:
+          type: string
+          format: uuid
+          description: Server-selected cluster; the zero UUID is valid only as explicitly known local placement.
+        clusterKind:
+          type: string
+          enum: [local, cluster]
 
     SandboxDetail:
       required:

@@ -7,6 +7,8 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 )
 
@@ -104,7 +106,10 @@ type Sandbox struct {
 	AllowInternetAccess *bool             `json:"allowInternetAccess,omitempty"`
 	NodeID              string            `json:"nodeID"`
 	ClusterID           uuid.UUID         `json:"clusterID"`
-	AutoPause           bool              `json:"autoPause"`
+	// Set only after successful server placement or trusted orchestrator resync.
+	// Missing historical JSON must not turn a zero ClusterID into known local placement.
+	AllocationIdentityContext *AllocationIdentityContext `json:"allocationIdentityContext,omitempty"`
+	AutoPause                 bool                       `json:"autoPause"`
 	// AutoPauseFilesystemOnly makes a timeout auto-pause take a filesystem-only
 	// snapshot (no memory) instead of a full memory snapshot. Only consulted when
 	// AutoPause is true; read by the evictor at pause time.
@@ -119,8 +124,16 @@ type Sandbox struct {
 	State State `json:"state"`
 }
 
+// ClusterID is a pointer so missing historical or partial context cannot be
+// confused with the explicitly selected zero UUID used by the local cluster.
+type AllocationIdentityContext struct {
+	Provenance api.SandboxAllocationIdentityProvenance `json:"provenance"`
+	ClusterID  *uuid.UUID                              `json:"clusterID"`
+}
+
 func (s Sandbox) ToAPISandbox() *api.Sandbox {
 	return &api.Sandbox{
+		AllocationIdentity: s.allocationIdentity(),
 		SandboxID:          s.SandboxID,
 		TemplateID:         s.BaseTemplateID,
 		ClientID:           s.ClientID,
@@ -130,6 +143,45 @@ func (s Sandbox) ToAPISandbox() *api.Sandbox {
 		TrafficAccessToken: s.TrafficAccessToken,
 		Domain:             s.Domain,
 	}
+}
+
+// WithAllocationIdentity marks context established by the API's successful
+// placement or existing trusted node-resync boundary. Never use caller Metadata.
+// This marker is persisted with the server model, not inferred on JSON recovery.
+func (s Sandbox) WithAllocationIdentity(provenance api.SandboxAllocationIdentityProvenance) Sandbox {
+	cluster := s.ClusterID
+	s.AllocationIdentityContext = &AllocationIdentityContext{Provenance: provenance, ClusterID: &cluster}
+	return s
+}
+
+func (s Sandbox) allocationIdentity() *api.SandboxAllocationIdentity {
+	identity := &api.SandboxAllocationIdentity{
+		Schema:     api.E2bAllocationV1,
+		Status:     api.SandboxAllocationIdentityStatusUnavailable,
+		Provenance: api.SandboxAllocationIdentityProvenanceUnavailable,
+	}
+	context := s.AllocationIdentityContext
+	if context == nil || context.ClusterID == nil || *context.ClusterID != s.ClusterID ||
+		(context.Provenance != api.SandboxAllocationIdentityProvenanceServerAllocation &&
+			context.Provenance != api.SandboxAllocationIdentityProvenanceOrchestratorResync) {
+		return identity
+	}
+	execution, err := uuid.Parse(s.ExecutionID)
+	if err != nil || execution == uuid.Nil || execution.String() != s.ExecutionID || s.TeamID == uuid.Nil || s.NodeID == "" || id.ValidateSandboxID(s.SandboxID) != nil {
+		return identity
+	}
+	clusterKind := api.Cluster
+	if s.ClusterID == consts.LocalClusterID {
+		clusterKind = api.Local
+	}
+	identity.Status = api.SandboxAllocationIdentityStatusAvailable
+	identity.Provenance = context.Provenance
+	identity.SandboxID = &s.SandboxID
+	identity.ExecutionID = &execution
+	identity.TeamID = &s.TeamID
+	identity.ClusterID = &s.ClusterID
+	identity.ClusterKind = &clusterKind
+	return identity
 }
 
 func (s Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
