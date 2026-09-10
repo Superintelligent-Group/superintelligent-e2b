@@ -211,8 +211,13 @@ Key mechanisms (all under `pkg/sandbox/`):
   host scheduler and a durable original-producer binding. Exact-version custody
   inventory is synced before raw segment reclaim and retained across restart.
   Shutdown joins delivery after writers drain. Inventory has its own bounded
-  capacity and is not reclaimed until a later retained-manifest implementation;
-  raw or inventory exhaustion fails closed. The option is disabled by default,
+  capacity. Explicit optional [retained closing manifests](../specs/network-usage-closing-manifest.md)
+  persist collector registration, close intent and sealing outcome before releasing
+  writer ownership. Bounded summaries survive raw reclaim; frozen manifest parts
+  and a verified exact final version permit inventory retirement while retaining
+  a terminal claim. Remote latency does not hold the collector lifecycle mutex,
+  and canceled or incomplete shutdown cannot claim a successful drain. Raw,
+  inventory and closing-control exhaustion fail closed. The option is disabled by default,
   and approved protected infrastructure plus live negative authorization tests
   remain required before activation.
   The orchestrator [Nomad environment boundary](../iac/modules/job-orchestrator/README.md)
