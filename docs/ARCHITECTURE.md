@@ -220,6 +220,10 @@ Key mechanisms (all under `pkg/sandbox/`):
   inventory and closing-control exhaustion fail closed. The option is disabled by default,
   and approved protected infrastructure plus live negative authorization tests
   remain required before activation.
+  The distinct protected reader supports [bounded exact-version byte reads](../specs/protected-evidence-read.md),
+  checking protected metadata and hashing the actual body before returning it.
+  This per-object capability does not discover manifests, map SIG sessions or
+  authorize monetary usage; consumers must separately bound traversal.
   The orchestrator [Nomad environment boundary](../iac/modules/job-orchestrator/README.md)
   accepts logical strings, including structured JSON, and escapes them for jobspec
   parsing. It preserves existing whitespace filtering and later Nomad runtime
