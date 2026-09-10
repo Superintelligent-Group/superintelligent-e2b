@@ -20,6 +20,9 @@ func (c BuilderConfig) NetworkUsageSpoolOptions() networkusage.SpoolOptions {
 // ValidateNetworkUsage runs before path normalization: a relative spool path
 // must not accidentally select evidence storage from the process working dir.
 func (c BuilderConfig) ValidateNetworkUsage() error {
+	if _, err := c.ProtectedDeliveryOptions(); err != nil {
+		return err
+	}
 	if !c.NetworkUsageCorrelated {
 		return nil
 	}
@@ -38,4 +41,23 @@ func (c BuilderConfig) ValidateNetworkUsage() error {
 		return errors.New("invalid correlated network usage spool budget: segment must hold a full encoded frame")
 	}
 	return nil
+}
+
+// Empty configuration is disabled. Account, policy, roles, retention and resource
+// limits must be supplied together; parsing never invents operator approval.
+func (c BuilderConfig) ProtectedDeliveryOptions() (*networkusage.ProtectedDeliveryConfig, error) {
+	if c.NetworkUsageProtectedDelivery == "" {
+		return nil, nil
+	}
+	if !c.NetworkUsageCorrelated {
+		return nil, errors.New("protected delivery requires correlated runtime")
+	}
+	options, err := networkusage.ParseProtectedDeliveryConfig(c.NetworkUsageProtectedDelivery)
+	if err != nil {
+		return nil, err
+	}
+	if options.Custody.Destination.MaxObjectBytes < c.NetworkUsageSegmentBytes {
+		return nil, errors.New("custody object limit smaller than segment")
+	}
+	return &options, nil
 }

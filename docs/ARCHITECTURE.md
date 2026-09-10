@@ -206,8 +206,15 @@ Key mechanisms (all under `pkg/sandbox/`):
   precedes finalization; the snapshot lock is released before rootfs export can
   call Stop. Session failures stop the affected process; shared spool IO failures
   stop admission, stop affected processes, and trigger host shutdown. Spool closure
-  waits for collector closure. There is no scheduled remote delivery or automatic
-  reclaim in this runtime, so a full spool fails closed.
+  waits for collector closure. Optional explicitly configured
+  [protected delivery](../specs/network-usage-delivery-inventory.md) adds one
+  host scheduler and a durable original-producer binding. Exact-version custody
+  inventory is synced before raw segment reclaim and retained across restart.
+  Shutdown joins delivery after writers drain. Inventory has its own bounded
+  capacity and is not reclaimed until a later retained-manifest implementation;
+  raw or inventory exhaustion fails closed. The option is disabled by default,
+  and approved protected infrastructure plus live negative authorization tests
+  remain required before activation.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.

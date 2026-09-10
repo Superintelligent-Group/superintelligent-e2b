@@ -736,7 +736,15 @@ func run(config cfg.Config, opts Options) (success bool) {
 	var measurementService *networkusage.Service
 	var measurementFailed <-chan struct{}
 	if config.NetworkUsageCorrelated {
-		measurementService, err = networkusage.OpenService(config.NetworkUsageSpoolDir, config.NetworkUsageSpoolOptions())
+		deliveryOptions, configErr := config.ProtectedDeliveryOptions()
+		if configErr != nil {
+			logger.L().Fatal(ctx, "invalid protected delivery configuration", zap.Error(configErr))
+		}
+		if deliveryOptions != nil {
+			measurementService, err = networkusage.OpenProtectedService(ctx, config.NetworkUsageSpoolDir, config.NetworkUsageSpoolOptions(), *deliveryOptions)
+		} else {
+			measurementService, err = networkusage.OpenService(config.NetworkUsageSpoolDir, config.NetworkUsageSpoolOptions())
+		}
 		if err != nil {
 			logger.L().Fatal(ctx, "failed to open network measurement spool", zap.Error(err))
 		}

@@ -14,6 +14,32 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
+// cooperativeCancellation marks a checked pass cancellation at a point where
+// no new mutation is performed. An OS read/fsync timeout has no such marker.
+type cooperativeCancellation struct{ cause error }
+
+func (e cooperativeCancellation) Error() string { return e.cause.Error() }
+func (e cooperativeCancellation) Unwrap() error { return e.cause }
+
+func onlyCooperativeCancellation(err error) bool {
+	if _, ok := err.(cooperativeCancellation); ok {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyCooperativeCancellation(child) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // DeliverOnce is an explicit bounded pass, not a background process or an
 // authorization gate. The operator must authorize the store and protect its
 // prefix before using remote custody to reclaim local evidence.
@@ -40,7 +66,7 @@ func (s *Spool) deliverOnce(ctx context.Context, store storage.ImmutableCustodyS
 			break
 		}
 		if err = ctx.Err(); err != nil {
-			return delivered, err
+			return delivered, cooperativeCancellation{err}
 		}
 		data, err := read(ctx, segment, destination.MaxObjectBytes)
 		if err != nil {
@@ -77,7 +103,7 @@ func (s *Spool) deliveryCandidates(ctx context.Context, limit int, maxBytes int6
 		return nil, errors.New("spool unavailable")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, cooperativeCancellation{err}
 	}
 	dir, err := os.Open(s.dir)
 	if err != nil {
@@ -87,12 +113,12 @@ func (s *Spool) deliveryCandidates(ctx context.Context, limit int, maxBytes int6
 	out := []Segment{}
 	for len(out) < limit {
 		if err = ctx.Err(); err != nil {
-			return nil, err
+			return nil, cooperativeCancellation{err}
 		}
 		entries, readErr := dir.ReadDir(16)
 		for _, entry := range entries {
 			if err = ctx.Err(); err != nil {
-				return nil, err
+				return nil, cooperativeCancellation{err}
 			}
 			name := entry.Name()
 			if !segmentName(name) || strings.HasSuffix(name, ".active") {
@@ -127,7 +153,7 @@ type contextReader struct {
 
 func (r contextReader) Read(p []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
-		return 0, err
+		return 0, cooperativeCancellation{err}
 	}
 	if len(p) > 32*1024 {
 		p = p[:32*1024]
