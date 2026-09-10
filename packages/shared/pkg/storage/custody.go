@@ -21,6 +21,7 @@ type CustodyClaim struct {
 }
 type CustodyDestination struct {
 	AccountID, Region, Bucket, Prefix, ClaimedHostID string
+	ProducerUserID                                   string // derived only by the protected constructor; not a host claim
 	MaxObjectBytes                                   int64
 }
 type CustodyReceipt struct {
@@ -38,7 +39,11 @@ var custodyToken = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 var custodyHash = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 func (d CustodyDestination) Validate() error {
-	if !custodyAccount.MatchString(d.AccountID) || !custodyRegion.MatchString(d.Region) || !custodyBucket.MatchString(d.Bucket) || strings.Contains(d.Bucket, "..") || !custodyToken.MatchString(d.ClaimedHostID) || d.MaxObjectBytes < 1 || d.MaxObjectBytes > MaxCustodyObjectBytes {
+	identityValid := custodyToken.MatchString(d.ClaimedHostID) && d.ProducerUserID == ""
+	if d.ProducerUserID != "" {
+		identityValid = d.ClaimedHostID == "" && ec2ProducerUserID.MatchString(d.ProducerUserID)
+	}
+	if !custodyAccount.MatchString(d.AccountID) || !custodyRegion.MatchString(d.Region) || !custodyBucket.MatchString(d.Bucket) || strings.Contains(d.Bucket, "..") || !identityValid || d.MaxObjectBytes < 1 || d.MaxObjectBytes > MaxCustodyObjectBytes {
 		return errors.New("invalid custody destination")
 	}
 	if !strings.HasPrefix(d.Prefix, "network-usage/v1/") || len(d.Prefix) > 256 {
@@ -58,7 +63,11 @@ func (d CustodyDestination) ObjectKey(c CustodyClaim) (string, error) {
 	if !custodyToken.MatchString(c.Name) || c.Name == "." || c.Name == ".." || !custodyHash.MatchString(c.SHA256) || c.Bytes < 0 || c.Bytes > d.MaxObjectBytes {
 		return "", errors.New("invalid custody claim")
 	}
-	return d.Prefix + "/" + d.AccountID + "/" + d.ClaimedHostID + "/" + c.Name, nil
+	identity := d.ClaimedHostID
+	if d.ProducerUserID != "" {
+		identity = d.ProducerUserID
+	}
+	return d.Prefix + "/" + d.AccountID + "/" + identity + "/" + c.Name, nil
 }
 func (r CustodyReceipt) Matches(d CustodyDestination, c CustodyClaim) bool {
 	key, err := d.ObjectKey(c)

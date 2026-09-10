@@ -171,6 +171,12 @@ Key mechanisms (all under `pkg/sandbox/`):
   acknowledgment. It is not wired into startup or scheduled delivery. Existing
   host claims and bucket permissions do not establish authenticated per-host
   provenance or protected evidence retention; those remain activation gates.
+  The [protected custody prerequisite](../specs/network-usage-producer-retention.md)
+  adds optional EC2 credential-origin namespace enforcement, explicit versioned
+  retention infrastructure, and a separate exact-version reader role. It remains
+  inactive pending approved identity/retention configuration and live negative
+  authorization tests. Runtime closing barriers and scheduled delivery remain
+  separate requirements for a complete measured window.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.

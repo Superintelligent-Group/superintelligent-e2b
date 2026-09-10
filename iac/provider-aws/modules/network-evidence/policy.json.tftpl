@@ -1,0 +1,22 @@
+{
+ "Version":"2012-10-17",
+ "Statement":[
+  {"Sid":"ConfigurationEvidence","Effect":"Allow","Principal":"*","Action":["s3:GetBucketPolicy","s3:GetBucketVersioning","s3:GetBucketObjectLockConfiguration"],"Resource":"arn:aws:s3:::${bucket}","Condition":{"ArnEquals":{"aws:PrincipalArn":["${producer}","${reader}"]}}},
+  {"Sid":"ProducerOwnNamespace","Effect":"Allow","Principal":"*","Action":["s3:PutObject","s3:GetObject","s3:GetObjectVersion","s3:GetObjectRetention"],"Resource":"arn:aws:s3:::${bucket}/${prefix}/${account}/$${aws:userid}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${producer}"},"Null":{"ec2:SourceInstanceARN":"false"}}},
+  {"Sid":"IndependentExactVersionReader","Effect":"Allow","Principal":"*","Action":"s3:GetObjectVersion","Resource":"arn:aws:s3:::${bucket}/${prefix}/${account}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${reader}"},"Null":{"s3:VersionId":"false"}}},
+  {"Sid":"IndependentRetentionMetadata","Effect":"Allow","Principal":"*","Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::${bucket}/${prefix}/${account}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${reader}"}}},
+  {"Sid":"DenyUnapprovedObjectPrincipals","Effect":"Deny","Principal":"*","Action":"s3:*Object*","Resource":"arn:aws:s3:::${bucket}/*","Condition":{"ArnNotEquals":{"aws:PrincipalArn":["${producer}","${reader}"]}}},
+  {"Sid":"DenyProducerOtherNamespaces","Effect":"Deny","Principal":"*","Action":["s3:PutObject","s3:GetObject","s3:GetObjectVersion","s3:GetObjectRetention"],"NotResource":"arn:aws:s3:::${bucket}/${prefix}/${account}/$${aws:userid}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${producer}"}}},
+  {"Sid":"DenyNonEC2Producer","Effect":"Deny","Principal":"*","Action":"s3:*Object*","Resource":"arn:aws:s3:::${bucket}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${producer}"},"Null":{"ec2:SourceInstanceARN":"true"}}},
+  {"Sid":"DenyEvidenceMutation","Effect":"Deny","Principal":"*","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:PutObjectRetention","s3:PutObjectLegalHold","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::${bucket}/*"},
+  {"Sid":"DenyMissingConditionalCreate","Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::${bucket}/*","Condition":{"Null":{"s3:if-none-match":"true"}}},
+  {"Sid":"DenyWrongConditionalCreate","Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::${bucket}/*","Condition":{"StringNotEquals":{"s3:if-none-match":"*"}}},
+  {"Sid":"DenyReaderWritesAndLatest","Effect":"Deny","Principal":"*","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::${bucket}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${reader}"}}},
+  {"Sid":"DenyReaderNullVersion","Effect":"Deny","Principal":"*","Action":"s3:GetObjectVersion","Resource":"arn:aws:s3:::${bucket}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${reader}"},"StringEquals":{"s3:VersionId":"null"}}},
+  {"Sid":"DenyReaderMissingVersion","Effect":"Deny","Principal":"*","Action":"s3:GetObjectVersion","Resource":"arn:aws:s3:::${bucket}/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"${reader}"},"Null":{"s3:VersionId":"true"}}},
+  {"Sid":"DenyReaderUnexpectedActions","Effect":"Deny","Principal":"*","NotAction":["s3:GetObjectVersion","s3:GetObjectRetention","s3:GetBucketPolicy","s3:GetBucketVersioning","s3:GetBucketObjectLockConfiguration"],"Resource":["arn:aws:s3:::${bucket}","arn:aws:s3:::${bucket}/*"],"Condition":{"ArnEquals":{"aws:PrincipalArn":"${reader}"}}},
+  {"Sid":"DenyProducerUnexpectedActions","Effect":"Deny","Principal":"*","NotAction":["s3:PutObject","s3:GetObject","s3:GetObjectVersion","s3:GetObjectRetention","s3:GetBucketPolicy","s3:GetBucketVersioning","s3:GetBucketObjectLockConfiguration"],"Resource":["arn:aws:s3:::${bucket}","arn:aws:s3:::${bucket}/*"],"Condition":{"ArnEquals":{"aws:PrincipalArn":"${producer}"}}},
+  {"Sid":"DenyProducerReaderPolicyChanges","Effect":"Deny","Principal":"*","Action":["s3:PutBucketPolicy","s3:DeleteBucketPolicy","s3:PutBucketVersioning","s3:PutBucketObjectLockConfiguration","s3:PutLifecycleConfiguration","s3:DeleteBucket"],"Resource":"arn:aws:s3:::${bucket}","Condition":{"ArnEquals":{"aws:PrincipalArn":["${producer}","${reader}"]}}},
+  {"Sid":"DenyInsecureTransport","Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::${bucket}","arn:aws:s3:::${bucket}/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}
+ ]
+}
