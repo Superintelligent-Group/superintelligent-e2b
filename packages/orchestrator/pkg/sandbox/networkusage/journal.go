@@ -43,15 +43,19 @@ type durableFile interface {
 // Journal serializes the reader and flusher's evidence into one process epoch.
 // A failed write or sync is latched: no later record can hide a partial tail.
 type Journal struct {
-	workload   *WorkloadBinding
-	mu         sync.Mutex
-	file       durableFile
-	last       Record
-	lastAt     time.Time
-	now        func() time.Time
-	failed     error
-	closed     bool
-	correlated bool // exclusive correlated evidence owner; legacy mutation is rejected
+	beforeSeal                           func(Record, *CorrelationReference, *CorrelationReference) error
+	afterSeal                            func(Record, error) error
+	onClosed                             func(error)
+	baselineReference, terminalReference *CorrelationReference
+	workload                             *WorkloadBinding
+	mu                                   sync.Mutex
+	file                                 durableFile
+	last                                 Record
+	lastAt                               time.Time
+	now                                  func() time.Time
+	failed                               error
+	closed                               bool
+	correlated                           bool // exclusive correlated evidence owner; legacy mutation is rejected
 }
 
 // Open is disabled for an empty directory. A configured directory must already
@@ -121,6 +125,13 @@ func (j *Journal) append(record Record) error {
 		return j.failed
 	}
 	j.last = record
+	if reference := correlationReference(record); reference != nil {
+		if reference.Scope == BaselineScope {
+			j.baselineReference = reference
+		} else {
+			j.terminalReference = reference
+		}
+	}
 	j.lastAt = now
 	return nil
 }
@@ -195,6 +206,9 @@ func (j *Journal) Close() error {
 	if j.closed {
 		return j.failed
 	}
+	if j.beforeSeal != nil {
+		j.failed = errors.Join(j.failed, j.beforeSeal(j.last, j.baselineReference, j.terminalReference))
+	}
 	r, err := j.next("closed")
 	if err == nil {
 		r.Reason = "terminal_coverage_unverified"
@@ -202,5 +216,11 @@ func (j *Journal) Close() error {
 	}
 	j.closed = true
 	j.failed = errors.Join(err, j.file.Close())
+	if j.afterSeal != nil {
+		j.failed = errors.Join(j.failed, j.afterSeal(j.last, j.failed))
+	}
+	if j.onClosed != nil {
+		j.onClosed(j.failed)
+	}
 	return j.failed
 }

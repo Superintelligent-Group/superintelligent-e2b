@@ -45,6 +45,7 @@ func (w WorkloadBinding) validate(sandbox string) error {
 
 // All values are explicit operator configuration; zero values enable nothing.
 type ProtectedDeliveryConfig struct {
+	Closing                                         ClosingOptions
 	Custody                                         storage.ProtectedCustodyConfig
 	MaxInventoryBytes                               int64
 	MaxInventoryEntries, IntervalSeconds, PassLimit int
@@ -67,8 +68,14 @@ func ParseProtectedDeliveryConfig(raw string) (ProtectedDeliveryConfig, error) {
 }
 
 func (c ProtectedDeliveryConfig) Validate() error {
+	if err := c.Closing.validate(); err != nil {
+		return err
+	}
 	if err := c.Custody.Validate(); err != nil {
 		return err
+	}
+	if c.Closing.enabled() && int64(c.Closing.PartBytes) > c.Custody.Destination.MaxObjectBytes {
+		return errors.New("closing control limit exceeds protected object limit")
 	}
 	if c.MaxInventoryBytes < 8192 || c.MaxInventoryEntries < 1 || c.MaxInventoryEntries > 100000 || c.IntervalSeconds < 1 || c.IntervalSeconds > 3600 || c.PassLimit < 1 || c.PassLimit > 100 {
 		return errors.New("explicit bounded delivery and inventory budgets required")
@@ -97,6 +104,8 @@ type custodyBinding struct {
 // CustodyInventory is immutable membership for SUP-914, including incomplete or
 // unidentified segments. Never infer lifecycle order from randomized filenames.
 type CustodyInventory struct {
+	SummaryVersion              int
+	Baseline, Terminal          *CorrelationReference
 	Schema                      int
 	Receipt                     storage.CustodyReceipt
 	JournalIncarnation          string
@@ -105,6 +114,7 @@ type CustodyInventory struct {
 	Incomplete, Unidentified    bool
 }
 type protectedDelivery struct {
+	closing       *closingLedger
 	syncDirectory func() error // injectable directory durability boundary
 	service       *Service
 	store         protectedStore
@@ -143,6 +153,15 @@ func openProtectedService(dir string, options SpoolOptions, config ProtectedDeli
 	if err = d.recover(); err != nil {
 		return nil, errors.Join(err, spool.Close())
 	}
+	if config.Closing.enabled() {
+		d.closing, err = openClosingLedger(d)
+		if err != nil {
+			return nil, errors.Join(err, spool.Close())
+		}
+		if err = d.closing.recoverOwners(); err != nil {
+			return nil, errors.Join(err, spool.Close())
+		}
+	}
 	s.delivery = d
 	go d.run()
 	return s, nil
@@ -173,11 +192,18 @@ func (d *protectedDelivery) recover() error {
 	if err != nil && err != io.EOF {
 		return err
 	}
-	if len(entries) > d.config.MaxInventoryEntries+2 {
+	allowance := 2
+	if d.config.Closing.enabled() {
+		allowance++
+	}
+	if len(entries) > d.config.MaxInventoryEntries+allowance {
 		return ErrSpoolBudget
 	}
 	for _, entry := range entries {
 		name := entry.Name()
+		if name == "closing" && d.config.Closing.enabled() {
+			continue
+		}
 		base := strings.TrimSuffix(name, ".tmp")
 		if base != "binding.json" && !inventoryName(base) {
 			return errors.New("unexpected custody control file")
@@ -292,10 +318,19 @@ func (d *protectedDelivery) validateInventory(name string, inv CustodyInventory)
 	if inv.Schema != 1 || name != inv.Receipt.Claim.Name+".receipt" || !inv.Receipt.Matches(d.store.Destination(), inv.Receipt.Claim) || inv.Receipt.VersionID == "" || inv.Receipt.VersionID == "null" {
 		return errors.New("invalid protected inventory identity/version")
 	}
+	if inv.SummaryVersion < 0 || inv.SummaryVersion > 1 || inv.LastSequence < inv.FirstSequence {
+		return errors.New("invalid inventory summary")
+	}
+	if err := validateFencePair(inv.Baseline, inv.Terminal); err != nil {
+		return err
+	}
 	return nil
 }
 func describeSegment(data []byte, incomplete bool) (CustodyInventory, error) {
-	inv := CustodyInventory{Schema: 1, Incomplete: incomplete}
+	inv := CustodyInventory{Schema: 1, SummaryVersion: 1, Incomplete: incomplete}
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		inv.Incomplete = true
+	}
 	scan := bufio.NewScanner(bytes.NewReader(data))
 	scan.Buffer(make([]byte, 4096), 2*1024*1024)
 	seen := false
@@ -306,6 +341,9 @@ func describeSegment(data []byte, incomplete bool) (CustodyInventory, error) {
 			inv.Unidentified = true
 			break
 		}
+		if seen && (inv.LastSequence == ^uint64(0) || r.Sequence != inv.LastSequence+1) {
+			inv.Incomplete = true
+		}
 		if !seen {
 			inv.JournalIncarnation = r.Incarnation
 			inv.FirstSequence = r.Sequence
@@ -315,6 +353,16 @@ func describeSegment(data []byte, incomplete bool) (CustodyInventory, error) {
 			return inv, errors.New("segment contains mixed journal identities")
 		}
 		inv.LastSequence = r.Sequence
+		if reference := correlationReference(r); reference != nil {
+			target := &inv.Baseline
+			if reference.Scope == TerminalScope {
+				target = &inv.Terminal
+			}
+			if *target != nil {
+				return inv, errors.New("duplicate bounded correlation summary")
+			}
+			*target = reference
+		}
 		if !r.Valid {
 			inv.Incomplete = true
 		}
@@ -400,9 +448,15 @@ func (d *protectedDelivery) pass(ctx context.Context) error {
 			return err
 		}
 	}
+	if d.closing != nil {
+		return d.closing.pass(ctx)
+	}
 	return nil
 }
 func transientDelivery(err error) bool {
+	if err == ErrClosingPending {
+		return true
+	}
 	if onlyCooperativeCancellation(err) {
 		return true
 	}
@@ -450,7 +504,7 @@ func (d *protectedDelivery) run() {
 		select {
 		case <-timer.C:
 			d.attempt()
-			if d.service.DeliveryError() != nil {
+			if d.service.DeliveryError() != nil && d.service.DeliveryError() != ErrClosingPending {
 				delay = min(delay*2, time.Hour)
 			} else {
 				delay = base

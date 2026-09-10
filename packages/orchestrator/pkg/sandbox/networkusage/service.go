@@ -91,11 +91,18 @@ func (s *Service) NewCollector(sandboxID string, context ...WorkloadBinding) (*C
 	}
 	// Correlator.Close -> Journal.Close -> wrapper.Close seals the writer first.
 	// Failure broadcasts only notify; they never join a collector from its callback.
-	journal.file = &serviceFile{durableFile: journal.file, service: s}
+	journal.file = &serviceFile{durableFile: journal.file, service: s, holdRelease: true}
+	journal.onClosed = func(error) { s.release() }
 	incarnation := rand.Text()
 	if workload != nil {
 		workload.ProducerIncarnation = incarnation
 		journal.workload = workload
+	}
+	if s.delivery != nil && s.delivery.closing != nil {
+		if err := s.delivery.closing.register(journal, *workload); err != nil {
+			s.Fail(err)
+			return nil, errors.Join(err, journal.Close())
+		}
 	}
 	collector, err := NewCorrelator(journal, incarnation)
 	if err != nil {
@@ -195,6 +202,7 @@ func (s *Service) Close(ctx context.Context) error {
 }
 
 type serviceFile struct {
+	holdRelease bool
 	durableFile
 	service   *Service
 	closeOnce sync.Once
@@ -228,7 +236,9 @@ func (f *serviceFile) Close() error {
 			f.service.Fail(f.closeErr)
 		}
 		f.closeErr = errors.Join(f.closeErr, f.service.Err())
-		f.service.release()
+		if !f.holdRelease {
+			f.service.release()
+		}
 	})
 	return f.closeErr
 }
