@@ -192,6 +192,12 @@ Key mechanisms (all under `pkg/sandbox/`):
   joins journal closure after process/cgroup termination before slot return.
   Startup abort does not depend on process exit. Interrupted joins and partial
   FIFO tails remain incomplete; this does not activate the correlated producer.
+  The inactive [durable correlation API](../specs/network-usage-correlation.md)
+  binds exact producer frames and receipts to the journal/spool durability path.
+  A single owner persists baseline, activity intent and matched frame references;
+  producer sequence and local journal sequence remain separate. It accepts the
+  opt-in envelope without activating it in the existing telemetry reader, and
+  never upgrades a local fence to complete coverage or remote custody.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.

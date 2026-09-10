@@ -17,19 +17,20 @@ import (
 )
 
 type Record struct {
-	SchemaVersion int    `json:"schemaVersion"`
-	Kind          string `json:"kind"`
-	SandboxID     string `json:"sandboxId"`
-	Incarnation   string `json:"incarnation"`
-	Sequence      uint64 `json:"sequence,string"`
-	ObservedAt    string `json:"observedAt"`
-	TxBytes       uint64 `json:"txBytes,string"`
-	RxBytes       uint64 `json:"rxBytes,string"`
-	DeltaTxBytes  uint64 `json:"deltaTxBytes,string"`
-	DeltaRxBytes  uint64 `json:"deltaRxBytes,string"`
-	Valid         bool   `json:"valid"`
-	Complete      bool   `json:"complete"`
-	Reason        string `json:"reason,omitempty"`
+	Producer      *ProducerEvidence `json:"producer,omitempty"`
+	SchemaVersion int               `json:"schemaVersion"`
+	Kind          string            `json:"kind"`
+	SandboxID     string            `json:"sandboxId"`
+	Incarnation   string            `json:"incarnation"`
+	Sequence      uint64            `json:"sequence,string"`
+	ObservedAt    string            `json:"observedAt"`
+	TxBytes       uint64            `json:"txBytes,string"`
+	RxBytes       uint64            `json:"rxBytes,string"`
+	DeltaTxBytes  uint64            `json:"deltaTxBytes,string"`
+	DeltaRxBytes  uint64            `json:"deltaRxBytes,string"`
+	Valid         bool              `json:"valid"`
+	Complete      bool              `json:"complete"`
+	Reason        string            `json:"reason,omitempty"`
 }
 
 type durableFile interface {
@@ -41,13 +42,14 @@ type durableFile interface {
 // Journal serializes the reader and flusher's evidence into one process epoch.
 // A failed write or sync is latched: no later record can hide a partial tail.
 type Journal struct {
-	mu     sync.Mutex
-	file   durableFile
-	last   Record
-	lastAt time.Time
-	now    func() time.Time
-	failed error
-	closed bool
+	mu         sync.Mutex
+	file       durableFile
+	last       Record
+	lastAt     time.Time
+	now        func() time.Time
+	failed     error
+	closed     bool
+	correlated bool // exclusive correlated evidence owner; legacy mutation is rejected
 }
 
 // Open is disabled for an empty directory. A configured directory must already
@@ -128,6 +130,7 @@ func (j *Journal) next(kind string) (Record, error) {
 	r := j.last
 	r.Sequence++
 	r.Kind, r.Reason = kind, ""
+	r.Producer = nil
 	r.DeltaTxBytes, r.DeltaRxBytes = 0, 0
 	return r, nil
 }
@@ -140,6 +143,9 @@ func (j *Journal) Observe(tx, rx uint64) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.correlated {
+		return errors.New("journal owned by producer correlator")
+	}
 	r, err := j.next("sample")
 	if err != nil {
 		return err
@@ -161,6 +167,9 @@ func (j *Journal) Gap(reason string) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.correlated {
+		return errors.New("journal owned by producer correlator")
+	}
 	if len(reason) == 0 || len(reason) > 80 {
 		return errors.New("network journal gap reason must be bounded")
 	}

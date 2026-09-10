@@ -1,0 +1,12 @@
+{
+  "source": "SUP909 boot-final local KVM/TAP run",
+  "upstreamBase": "431f1fc7d47f4cfe1dfe42437b9394f20972b65d",
+  "rawSourceSHA256": "20e257cfb300eaee8e75fa07b2ebf05bfd6a66732fe291aece2705011fbd84c5",
+  "apiRecordSHA256": "6666d3757fc96cdd2f3488176ebd6356ca53ad20f491b80352cc6b0759f275b4",
+  "rawFrames": "Byte-for-byte metrics.raw; receipts extracted without value changes from successful api.json responses and re-encoded compact JSON; no claim original HTTP formatting.",
+  "binary_sha256": "bfe0e5276dcdc8614316335887d7c8555eb6544d707b359070e420f67f33f9f7",
+  "harness_sha256": "582d98fa8a998393ad296fbc9ca6ee346a013af77ca0a9b0bb132325f7479854",
+  "started_at": 1789059999.1510284,
+  "finished_at": 1789060008.5500906,
+  "producerPatchSHA256": "33bedb92e62a523dc24981748f5d72c9fab7d776da7cd38da871c054b1273020"
+}

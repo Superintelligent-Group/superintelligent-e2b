@@ -1,0 +1,3 @@
+{"schema":"sig.fc-measurement.v1","incarnation":"sup909_local_boot","attempt_sequence":1,"request_sequence":1,"request_id":"baseline","loss_detected":false}
+{"schema":"sig.fc-measurement.v1","incarnation":"sup909_local_boot","attempt_sequence":3,"request_sequence":2,"request_id":"traffic","loss_detected":false}
+{"schema":"sig.fc-terminal-measurement.v1","cutoff":"last_completed_device_operation","measurement":{"schema":"sig.fc-measurement.v1","incarnation":"sup909_local_boot","attempt_sequence":4,"request_sequence":3,"request_id":"terminal","loss_detected":false}}
