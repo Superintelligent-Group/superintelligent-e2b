@@ -28,6 +28,32 @@ import (
 //go:embed measurement_deferred_rx_test.py
 var deferredRXPython string
 
+//go:embed measurement_deferred_rx_ipv6_test.py
+var deferredRXIPv6Python string
+
+func disableDeferredRXHostIPv6(t *testing.T, ctx context.Context, base string) {
+	t.Helper()
+	netNS, err := os.Readlink("/proc/self/ns/net")
+	require.NoError(t, err)
+	mountNS, err := os.Readlink("/proc/self/ns/mnt")
+	require.NoError(t, err)
+	report := filepath.Join(base, "host-tap-ipv6.json")
+	output, err := exec.CommandContext(ctx, "ip", "netns", "exec", "ns-912", "python3", "-c", deferredRXIPv6Python,
+		"ns-912", "tap0", netNS, mountNS, report).CombinedOutput()
+	require.NoError(t, err, "owned TAP IPv6 setup: %s", output)
+	raw, err := os.ReadFile(report)
+	require.NoError(t, err)
+	var evidence struct {
+		Passed   bool   `json:"passed"`
+		Readback string `json:"readback"`
+		Cleaned  bool   `json:"mount_cleanup_complete"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &evidence))
+	require.True(t, evidence.Passed)
+	require.True(t, evidence.Cleaned)
+	require.Equal(t, "1", evidence.Readback)
+}
+
 func deferredRXProgram() string {
 	// Reuse the frozen completion-aware trace parser and control-frame decoder.
 	return strings.Replace(calibrationPython, "if __name__=='__main__':", "if False:", 1) + "\n" + deferredRXPython

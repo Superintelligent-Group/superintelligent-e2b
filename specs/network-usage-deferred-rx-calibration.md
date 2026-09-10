@@ -52,6 +52,17 @@ matching and interpreted using pinned `virtio_net_hdr_v1` source, not independen
 read back as a negotiated ioctl value. TX includes A's reply and every observed
 control frame. Journal bytes and syscall totals must agree exactly.
 
+Only this deferred-RX fixture disables IPv6 on its owned host `tap0`, before
+the first link-up. Native diagnostic attempts 1–3 showed host MLD traffic taking
+the second counted RX slot before B; these failed attempts remain preserved.
+The test checks the exact named network namespace, separation from the parent
+network and mount namespaces, and a down TAP before writing only its per-interface
+setting. Readback must be `1`. If ordinary proc is read-only, a fresh proc mount
+is confined to the child mount namespace and unmounted in `finally`; no host
+proc remount or `all`/`default` setting is changed. The helper records readback,
+namespace identity and cleanup. The guest image, producer and A/B/C/terminal
+oracle stay unchanged; other fixture modes do not call this setup.
+
 All evidence remains `complete=false`. This child does not close unsent TX, MMDS,
 transport loss, custody/manifest integration, cloud authorization, provider-billed
 traffic or broad SUP-916 acceptance. SUP-920 run 5's unexplained guest kernel panic

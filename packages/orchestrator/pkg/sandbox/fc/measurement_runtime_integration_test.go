@@ -97,6 +97,9 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 	t.Cleanup(func() { require.NoError(t, exec.Command("ip", "netns", "del", "ns-912").Run()) })
 	run("netns", "exec", "ns-912", "ip", "link", "set", "lo", "up")
 	run("netns", "exec", "ns-912", "ip", "tuntap", "add", "tap0", "mode", "tap")
+	if mode == "deferred-rx" {
+		disableDeferredRXHostIPv6(t, ctx, base)
+	}
 	run("netns", "exec", "ns-912", "ip", "addr", "add", "169.254.0.22/30", "dev", "tap0")
 	run("netns", "exec", "ns-912", "ip", "link", "set", "tap0", "up")
 	for _, dir := range []string{"cache", "spool", "vm"} {
