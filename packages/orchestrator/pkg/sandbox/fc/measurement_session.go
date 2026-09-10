@@ -207,7 +207,7 @@ func (s *measurementSession) sample(ctx context.Context) error {
 		return err
 	}
 	defer s.unlock()
-	return s.sampleLocked(ctx)
+	return s.sampleLocked(ctx, false)
 }
 
 // A periodic tick must not time out behind a slow snapshot load or another
@@ -225,13 +225,16 @@ func (s *measurementSession) periodicSample(ctx context.Context) error {
 	if s.ending.Load() {
 		return nil
 	}
-	return s.sampleLocked(ctx)
+	return s.sampleLocked(ctx, true)
 }
-func (s *measurementSession) sampleLocked(ctx context.Context) error {
+func (s *measurementSession) sampleLocked(ctx context.Context, periodic bool) error {
 	if err := errors.Join(ctx.Err(), s.Err()); err != nil {
 		return err
 	}
 	if !s.active.Load() || s.ending.Load() {
+		if periodic {
+			return nil
+		}
 		return errors.New("fresh measurement unavailable before activity or during shutdown")
 	}
 	s.sequence++

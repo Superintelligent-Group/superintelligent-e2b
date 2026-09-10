@@ -280,6 +280,59 @@ func TestMeasurementPeriodicTickSkipsBusyActivityGate(t *testing.T) {
 	}
 }
 
+func TestMeasurementPeriodicShutdownTransitionDoesNotCreateGap(t *testing.T) {
+	service, err := networkusage.OpenService(t.TempDir(), networkusage.SpoolOptions{MaxBytes: 8 << 20, SegmentBytes: 2 << 20, MaxSegments: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := newMeasurementSession(service, "periodic-shutdown", "unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close(); _ = service.Close(context.Background()) }()
+	session.active.Store(true)
+	// A periodic tick has passed its optimistic ending check and acquired the
+	// gate. Pause at that boundary while a concurrent finalizer sets ending.
+	if session.ending.Load() {
+		t.Fatal("unexpected initial shutdown")
+	}
+	if err := session.lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer session.unlock()
+	finalCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	finalDone := make(chan error, 1)
+	go func() { finalDone <- session.finalize(finalCtx) }()
+	deadline := time.Now().Add(time.Second)
+	for !session.ending.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !session.ending.Load() {
+		t.Fatal("finalizer did not reach the gate")
+	}
+	if err := session.sampleLocked(t.Context(), true); err != nil {
+		t.Fatal("periodic shutdown created a false flush failure", err)
+	}
+	if err := session.sampleLocked(t.Context(), false); err == nil {
+		t.Fatal("explicit freshness claimed during shutdown")
+	}
+	if err := session.Err(); err != nil {
+		t.Fatal("normal shutdown poisoned measurement", err)
+	}
+	// End the waiting finalizer without needing a producer in this scheduling
+	// regression. It must not execute a request while the sample owns the gate.
+	cancel()
+	select {
+	case err := <-finalDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled finalizer did not return")
+	}
+}
+
 func TestMeasurementNoDeviceFrameAtActivityBoundaryFailsLocally(t *testing.T) {
 	service, err := networkusage.OpenService(t.TempDir(), networkusage.SpoolOptions{MaxBytes: 8 << 20, SegmentBytes: 2 << 20, MaxSegments: 16})
 	if err != nil {
