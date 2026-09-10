@@ -160,6 +160,12 @@ Key mechanisms (all under `pkg/sandbox/`):
   invalid. This is local evidence only: no remote delivery, retention service, or
   complete terminal billing receipt is implied. Default configuration is disabled.
   See the [specification, Dafny model, and linked tests](../specs/network-usage-journal.md).
+  An additional [host-local spool API](../specs/network-usage-spool.md) can segment
+  the same journal records under byte/file-count budgets, preserve crash tails,
+  and reclaim exact immutable segments after a trusted adapter acknowledges them.
+  It is not yet wired into orchestrator configuration or remote delivery; active
+  journal configuration still uses the original single-file producer. The spool
+  never upgrades observations to complete terminal coverage or provider pricing.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
