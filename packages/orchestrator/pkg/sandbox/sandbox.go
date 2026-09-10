@@ -28,6 +28,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/networkusage"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd"
@@ -261,7 +262,9 @@ type Sandbox struct {
 	*Resources
 	*Metadata
 
-	updateMu sync.Mutex
+	updateMu             sync.Mutex
+	measurementLifecycle sync.Mutex
+	measurementStopping  bool
 
 	// LifecycleID is a unique identifier for each Firecracker process.
 	// It is used internally by the orchestrator for map eviction guards
@@ -347,15 +350,21 @@ func (m *Metadata) SetStartedAt(t time.Time) {
 }
 
 type Factory struct {
-	Sandboxes         *Map
-	config            cfg.BuilderConfig
-	networkPool       *network.Pool
-	devicePool        *nbd.DevicePool
-	featureFlags      *featureflags.Client
-	hostStatsDelivery hoststats.Delivery
-	cgroupManager     cgroup.Manager
-	egressProxy       network.EgressProxy
-	networkAssignHook NetworkAssignHook
+	networkUsageService *networkusage.Service
+	Sandboxes           *Map
+	config              cfg.BuilderConfig
+	networkPool         *network.Pool
+	devicePool          *nbd.DevicePool
+	featureFlags        *featureflags.Client
+	hostStatsDelivery   hoststats.Delivery
+	cgroupManager       cgroup.Manager
+	egressProxy         network.EgressProxy
+	networkAssignHook   NetworkAssignHook
+}
+
+// SetNetworkUsageService is called once before the factory serves requests.
+func (f *Factory) SetNetworkUsageService(service *networkusage.Service) {
+	f.networkUsageService = service
 }
 
 func NewFactory(
@@ -574,6 +583,7 @@ func (f *Factory) CreateSandbox(
 		return nil, fmt.Errorf("failed to init FC: %w", err)
 	}
 
+	fcHandle.SetNetworkUsageService(f.networkUsageService)
 	throttleConfig := featureflags.GetTCPFirewallEgressThrottleConfig(ctx, f.featureFlags)
 	driveThrottleConfig := featureflags.GetBlockDriveThrottleConfig(ctx, f.featureFlags)
 
@@ -682,6 +692,7 @@ func (f *Factory) CreateSandbox(
 
 	// Stop the sandbox first if it is still running, otherwise do nothing
 	cleanup.AddPriority(ctx, sbx.Stop)
+	sbx.superviseMeasurement(execCtx, f.networkUsageService)
 
 	go func() {
 		defer execSpan.End()
@@ -977,6 +988,7 @@ func (f *Factory) ResumeSandbox(
 		return nil, fmt.Errorf("failed to create FC: %w", fcErr)
 	}
 
+	fcHandle.SetNetworkUsageService(f.networkUsageService)
 	resumeThrottleConfig := featureflags.GetTCPFirewallEgressThrottleConfig(ctx, f.featureFlags)
 	resumeDriveThrottleConfig := featureflags.GetBlockDriveThrottleConfig(ctx, f.featureFlags)
 
@@ -1121,6 +1133,7 @@ func (f *Factory) ResumeSandbox(
 		return nil, fmt.Errorf("failed to start FC: %w", fcStartErr)
 	}
 
+	sbx.superviseMeasurement(execCtx, f.networkUsageService)
 	telemetry.ReportEvent(ctx, "initialized FC")
 
 	if config.SkipEnvdWait {
@@ -1225,6 +1238,9 @@ func (s *Sandbox) doStop(ctx context.Context) error {
 	// Stop the health checks before stopping the sandbox
 	s.Checks.Stop()
 
+	if err := s.finalizeMeasurementBeforeStop(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("terminal measurement incomplete: %w", err))
+	}
 	fcStopErr := s.process.Stop(ctx)
 	if fcStopErr != nil {
 		errs = append(errs, fmt.Errorf("failed to stop FC: %w", fcStopErr))
@@ -1265,10 +1281,6 @@ func (s *Sandbox) Shutdown(ctx context.Context) error {
 	// Stop the health check before pausing the VM
 	s.Checks.Stop()
 
-	if err := s.process.Pause(ctx); err != nil {
-		return fmt.Errorf("failed to pause VM: %w", err)
-	}
-
 	// This is required because the FC API doesn't support passing /dev/null
 	cachePaths, err := storage.Paths{
 		BuildID: uuid.New().String(),
@@ -1282,7 +1294,7 @@ func (s *Sandbox) Shutdown(ctx context.Context) error {
 	snapfile := template.NewLocalFileLink(cachePaths.CacheSnapfile())
 	defer snapfile.Close()
 
-	err = s.process.CreateSnapshot(ctx, snapfile.Path())
+	err = s.snapshotBeforeMeasurementTerminal(ctx, snapfile.Path())
 	if err != nil {
 		return fmt.Errorf("error creating snapshot: %w", err)
 	}
@@ -1410,14 +1422,6 @@ func (s *Sandbox) Pause(
 		cancel()
 	}
 
-	if err := s.process.Pause(ctx); err != nil {
-		return nil, fmt.Errorf("failed to pause VM: %w", err)
-	}
-
-	// Best-effort flush before the rootfs export goroutine closes the FC API
-	// socket. Non-blocking on the reader; trades precision for pause latency.
-	_ = s.process.FlushMetrics(ctx)
-
 	// Snapfile is not closed as it's returned and cached for later use (like resume)
 	snapfile := template.NewLocalFileLink(cachePaths.CacheSnapfile())
 	cleanup.AddNoContext(ctx, snapfile.Close)
@@ -1425,7 +1429,7 @@ func (s *Sandbox) Pause(
 	// CreateSnapshot also drains and flushes the virtio disk in our custom FC, so
 	// it runs even for a filesystem-only pause (which needs the disk flush); the
 	// resulting snapfile is just not uploaded in that case.
-	err = s.process.CreateSnapshot(ctx, snapfile.Path())
+	err = s.snapshotBeforeMeasurementTerminal(ctx, snapfile.Path())
 	if err != nil {
 		return nil, fmt.Errorf("error creating snapshot: %w", err)
 	}
@@ -1999,4 +2003,50 @@ func (f *Factory) GetEnvdTimeout(ctx context.Context) time.Duration {
 	envdTimeoutMs := f.featureFlags.IntFlag(ctx, featureflags.EnvdTimeoutMilliseconds)
 
 	return time.Duration(envdTimeoutMs) * time.Millisecond
+}
+
+// The lock covers only VM pause/snapshot API operations. ExportDiff may call
+// Stop itself, so it must never execute while this lifecycle lock is held.
+func (s *Sandbox) finalizeMeasurementBeforeStop(ctx context.Context) error {
+	s.measurementLifecycle.Lock()
+	defer s.measurementLifecycle.Unlock()
+	s.measurementStopping = true
+	return s.process.FinalizeMeasurement(ctx)
+}
+
+func (s *Sandbox) snapshotBeforeMeasurementTerminal(ctx context.Context, path string) error {
+	s.measurementLifecycle.Lock()
+	defer s.measurementLifecycle.Unlock()
+	if s.measurementStopping {
+		return errors.New("snapshot rejected: sandbox stopping")
+	}
+	if err := s.process.Pause(ctx); err != nil {
+		return err
+	}
+	if err := s.process.FlushMetrics(ctx); err != nil && s.config.NetworkUsageCorrelated {
+		return err
+	}
+	return s.process.CreateSnapshot(ctx, path)
+}
+
+// This separate goroutine may join the FIFO reader; reader callbacks never do.
+func (s *Sandbox) superviseMeasurement(ctx context.Context, service *networkusage.Service) {
+	if !s.config.NetworkUsageCorrelated || service == nil {
+		return
+	}
+	go func() {
+		select {
+		case <-service.Failed():
+		case <-s.process.MeasurementFailed():
+		case <-s.process.Exit.Done():
+			if s.process.MeasurementError() == nil {
+				return
+			}
+		}
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := s.Stop(stopCtx); err != nil {
+			telemetry.ReportError(stopCtx, "measurement failure forced sandbox stop", err)
+		}
+	}()
 }

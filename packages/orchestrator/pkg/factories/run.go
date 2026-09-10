@@ -48,6 +48,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/networkusage"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/peerclient"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/server"
@@ -732,7 +733,20 @@ func run(config cfg.Config, opts Options) (success bool) {
 	if networkAssignHook == nil {
 		networkAssignHook = sandbox.NoopNetworkAssignHook{}
 	}
+	var measurementService *networkusage.Service
+	var measurementFailed <-chan struct{}
+	if config.NetworkUsageCorrelated {
+		measurementService, err = networkusage.OpenService(config.NetworkUsageSpoolDir, config.NetworkUsageSpoolOptions())
+		if err != nil {
+			logger.L().Fatal(ctx, "failed to open network measurement spool", zap.Error(err))
+		}
+		// Closers run in reverse order. Sandbox/template servers registered below
+		// must drain their Process readers before the host spool releases its lock.
+		closers = append(closers, closer{"network measurement spool", measurementService.Close})
+		measurementFailed = measurementService.Failed()
+	}
 	sandboxFactory := sandbox.NewFactory(config.BuilderConfig, networkPool, devicePool, featureFlags, hostStatsDelivery, cgroupManager, egressSetup.Proxy, networkAssignHook, sandboxes)
+	sandboxFactory.SetNetworkUsageService(measurementService)
 
 	// isolated filesystems cache (for nfs proxy)
 	builder := chrooted.NewBuilder(config)
@@ -942,6 +956,11 @@ func run(config cfg.Config, opts Options) (success bool) {
 		logger.L().Info(ctx, "Shutdown signal received")
 	case serviceErr := <-serviceError:
 		logger.L().Error(ctx, "Service error", zap.Error(serviceErr))
+	case <-measurementFailed:
+		// A closed failure channel preserves errors that happen before this
+		// receive begins, unlike the transient startup serviceError send.
+		logger.L().Error(ctx, "Network measurement integrity failed", zap.Error(measurementService.Err()))
+		success = false
 	}
 
 	closeCtx, cancelCloseCtx := context.WithCancel(context.Background())
