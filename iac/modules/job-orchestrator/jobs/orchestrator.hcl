@@ -115,7 +115,7 @@ job "orchestrator-${latest_orchestrator_job_id}" {
         PROXY_PORT                   = "${proxy_port}"
 
 %{ for key, value in job_env_vars ~}
-        ${key} = "${value}"
+        ${key} = ${replace(replace(jsonencode(value), "$${", "$$${"), "%%{", "%%%{")}
 %{ endfor ~}
 
       }

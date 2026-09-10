@@ -1,0 +1,19 @@
+{
+  "Custody": {
+    "Destination": {
+      "AccountID": "123456789012",
+      "Region": "us-east-1",
+      "Bucket": "test-only-evidence",
+      "Prefix": "network-usage/v1/test-only",
+      "MaxObjectBytes": 4194304
+    },
+    "ProducerRoleARN": "arn:aws:iam::123456789012:role/test-only",
+    "ProducerRoleID": "AROAAAAAAAAAAAAAAAAAA",
+    "PolicySHA256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "RetentionDays": 1
+  },
+  "MaxInventoryBytes": 32768,
+  "MaxInventoryEntries": 10,
+  "IntervalSeconds": 1,
+  "PassLimit": 1
+}

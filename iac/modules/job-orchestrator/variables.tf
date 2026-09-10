@@ -31,7 +31,8 @@ variable "orchestrator_checksum" {
 }
 
 variable "job_env_vars" {
-  type      = map(string)
-  default   = {}
-  sensitive = true
+  description = "Logical environment strings, not pre-escaped HCL. Null/blank values are omitted and surrounding whitespace is trimmed. Template-looking text is preserved for Nomad runtime interpolation."
+  type        = map(string)
+  default     = {}
+  sensitive   = true
 }
