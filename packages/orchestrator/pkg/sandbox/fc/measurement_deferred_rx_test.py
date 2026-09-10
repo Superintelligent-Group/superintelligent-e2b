@@ -200,7 +200,10 @@ def verify_deferred(base):
         raw_hashes[file.name] = sha(raw)
         records.extend(json.loads(line) for line in raw.splitlines())
     assert records and all(r['valid'] and not r['complete'] for r in records)
-    assert [int(r['sequence']) for r in records] == list(range(1, len(records)+1)), 'journal sequence discontinuity'
+    # Journal.Open and the independent consumer require a start record at zero.
+    assert records[0]['kind'] == 'start' and records[-1]['kind'] == 'closed', 'journal lifecycle incomplete'
+    assert sum(r['kind'] == 'start' for r in records) == sum(r['kind'] == 'closed' for r in records) == 1, 'duplicate journal lifecycle'
+    assert [int(r['sequence']) for r in records] == list(range(len(records))), 'journal sequence discontinuity'
     frames = {int(r['sequence']): r for r in records if r['kind'] == 'producer_frame'}
     assert all(r['producer']['incarnation'] == inc for r in frames.values())
     for fence in (start, held, terminal):
@@ -290,7 +293,7 @@ def selftest_deferred():
         save(directory/'fds.json', {'tap': '14', 'metrics': '15'})
         save(directory/'limiter.json', {'method': 'PATCH', 'path': '/network-interfaces/eth0', 'request': {'iface_id': 'eth0', 'rx_rate_limiter': {'ops': {'size': 1, 'one_time_burst': 0, 'refill_time': 3600000}}}, 'status': 204, 'response': ''})
         metric['metrics']['net']['rx_rate_limiter_throttled'] = 1
-        records = []; producer_raw = []
+        records = [{'sequence': '0', 'kind': 'start', 'valid': True, 'complete': False}]; producer_raw = []
         for index, name in enumerate(('start', 'held', 'terminal')):
             header = {'schema': 'sig.fc-measurement.v1', 'incarnation': 'fixture', 'attempt_sequence': index+1, 'request_sequence': index+1, 'request_id': name, 'loss_detected': False}
             value = {'measurement': header, **metric}
@@ -300,6 +303,7 @@ def selftest_deferred():
             fence = {'Scope': 'terminal_device_cutoff' if name == 'terminal' else 'device_sample', 'Request': {'request_id': name}, 'Header': header, 'FrameSequence': sequence, 'CorrelationSequence': sequence+1, 'FrameSHA256': sha(frame_raw), 'FrameBytes': len(frame_raw), 'Cutoff': 'last_completed_device_operation' if name == 'terminal' else ''}
             save(directory/(name+'.json'), fence)
             records.extend([{'sequence': str(sequence), 'kind': 'producer_frame', 'valid': True, 'complete': False, 'deltaRxBytes': '236' if name == 'held' else '0', 'deltaTxBytes': '118' if name == 'held' else '0', 'producer': {'incarnation': 'fixture', 'raw': base64.b64encode(frame_raw).decode()}}, {'sequence': str(sequence+1), 'kind': 'producer_correlation', 'valid': True, 'complete': False, 'producer': {'frameSha256': sha(frame_raw)}}])
+        records.append({'sequence': '7', 'kind': 'closed', 'valid': True, 'complete': False})
         (base/'spool'/'fixture.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
         def call(op, fd, data):
             encoded = ''.join('\\x%02x' % byte for byte in data)
@@ -316,7 +320,21 @@ def selftest_deferred():
     def change_json(path, mutate):
         value = json.loads(path.read_text()); mutate(value); save(path, value)
 
+    def change_journal(directory, mutate):
+        path = directory.parent/'spool'/'fixture.jsonl'
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        mutate(records)
+        path.write_text(''.join(json.dumps(record)+'\n' for record in records))
+
     mutations = [
+        lambda d: change_journal(d, lambda rows: rows.pop(0)),
+        lambda d: change_journal(d, lambda rows: [row.update(sequence=str(int(row['sequence'])+1)) for row in rows]),
+        lambda d: change_journal(d, lambda rows: rows.insert(2, rows[1].copy())),
+        lambda d: change_journal(d, lambda rows: rows.pop(2)),
+        lambda d: change_journal(d, lambda rows: rows.__setitem__(slice(1, 3), rows[1:3][::-1])),
+        lambda d: change_journal(d, lambda rows: rows.pop()),
+        lambda d: change_journal(d, lambda rows: rows[0].update(kind='producer_frame')),
+        lambda d: change_journal(d, lambda rows: rows[3].update(kind='closed')),
         lambda d: change_json(d/'limiter.json', lambda v: v['request'].update(rx_rate_limiter={'operations': {'size': 1, 'one_time_burst': 0, 'refill_time': 3600000}})),
         lambda d: change_json(d/'packets.json', lambda v: v.update(kernel_drops=1)),
         lambda d: change_json(d/'packets.json', lambda v: v.update(kernel_packets=6)),
@@ -338,7 +356,7 @@ def selftest_deferred():
                 if not mutate: raise
             else:
                 assert mutate is None, 'final verifier accepted invalid evidence'
-    print('SUP921 final disk/fence verifier: positive and nine negative cases passed')
+    print('SUP921 final disk/fence verifier: positive and seventeen negative cases passed')
 
 
 if __name__ == '__main__':
