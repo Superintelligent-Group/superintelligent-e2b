@@ -20,8 +20,10 @@ import (
 )
 
 type awsCustody struct {
-	client      *s3.Client
-	destination CustodyDestination
+	client        *s3.Client
+	destination   CustodyDestination
+	identity      *sts.GetCallerIdentityOutput
+	retentionDays int
 }
 
 var _ ImmutableCustodyStore = (*awsCustody)(nil)
@@ -30,6 +32,9 @@ var _ ImmutableCustodyStore = (*awsCustody)(nil)
 // account mismatch and uses AWS regional endpoints rather than custom endpoints.
 // Account equality authenticates the credential account, not ClaimedHostID.
 func NewAWSCustody(ctx context.Context, d CustodyDestination) (ImmutableCustodyStore, error) {
+	if d.ProducerUserID != "" {
+		return nil, errors.New("producer namespace requires protected custody constructor")
+	}
 	if err := d.Validate(); err != nil {
 		return nil, err
 	}
@@ -65,9 +70,12 @@ func newAWSCustodyConfigured(ctx context.Context, d CustodyDestination, cfg aws.
 		o.EndpointResolverV2 = s3.NewDefaultEndpointResolverV2()
 		o.UsePathStyle = false
 	})
-	return &awsCustody{client: client, destination: d}, nil
+	return &awsCustody{client: client, destination: d, identity: identity}, nil
 }
 func custodyMetadata(d CustodyDestination, c CustodyClaim) map[string]string {
+	if d.ProducerUserID != "" {
+		return map[string]string{"custody-schema": "raw-segment-v1", "sha256": c.SHA256, "producer-user-id": d.ProducerUserID}
+	}
 	return map[string]string{"custody-schema": "raw-segment-v1", "sha256": c.SHA256, "claimed-host-id": d.ClaimedHostID}
 }
 func (s *awsCustody) CreateExact(ctx context.Context, c CustodyClaim, data []byte) (CustodyReceipt, error) {
@@ -92,18 +100,33 @@ func (s *awsCustody) CreateExact(ctx context.Context, c CustodyClaim, data []byt
 	return s.VerifyExact(ctx, c)
 }
 func (s *awsCustody) VerifyExact(ctx context.Context, c CustodyClaim) (CustodyReceipt, error) {
+	return s.verifyExactVersion(ctx, c, "")
+}
+func (s *awsCustody) verifyExactVersion(ctx context.Context, c CustodyClaim, versionID string) (CustodyReceipt, error) {
 	key, err := s.destination.ObjectKey(c)
 	if err != nil {
 		return CustodyReceipt{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.destination.Bucket), Key: aws.String(key), ExpectedBucketOwner: aws.String(s.destination.AccountID), ChecksumMode: types.ChecksumModeEnabled})
+	var version *string
+	if versionID != "" {
+		version = aws.String(versionID)
+	}
+	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.destination.Bucket), Key: aws.String(key), ExpectedBucketOwner: aws.String(s.destination.AccountID), ChecksumMode: types.ChecksumModeEnabled, VersionId: version})
 	if err != nil {
 		return CustodyReceipt{}, err
 	}
+	if versionID != "" && aws.ToString(head.VersionId) != versionID {
+		return CustodyReceipt{}, errors.New("custody exact version mismatch")
+	}
 	if head.ContentLength == nil || *head.ContentLength != c.Bytes {
 		return CustodyReceipt{}, errors.New("custody remote length mismatch")
+	}
+	if s.retentionDays > 0 {
+		if aws.ToString(head.VersionId) == "" || aws.ToString(head.VersionId) == "null" || head.LastModified == nil || head.ObjectLockMode != types.ObjectLockModeGovernance || head.ObjectLockRetainUntilDate == nil || !head.ObjectLockRetainUntilDate.After(time.Now()) || head.ObjectLockRetainUntilDate.Before(head.LastModified.Add(time.Duration(s.retentionDays)*24*time.Hour)) {
+			return CustodyReceipt{}, errors.New("protected custody version or retention evidence missing")
+		}
 	}
 	for k, v := range custodyMetadata(s.destination, c) {
 		if head.Metadata[k] != v {
