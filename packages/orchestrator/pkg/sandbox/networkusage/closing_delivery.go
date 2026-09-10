@@ -437,6 +437,9 @@ func equalClosingJSON(a, b any) bool {
 	return e == nil && bytes.Equal(x, y)
 }
 func (l *closingLedger) checkMembership(id string, plan *closingPlan, inventory []CustodyInventory) error {
+	return checkClosingMembership(id, plan, inventory)
+}
+func checkClosingMembership(id string, plan *closingPlan, inventory []CustodyInventory) error {
 	if plan.Intent.Registration.Schema != 1 || plan.Intent.Registration.JournalIncarnation != id || plan.Intent.Complete || plan.Intent.Registration.Complete || plan.Seal.Complete {
 		return errors.New("invalid close intent identity")
 	}
