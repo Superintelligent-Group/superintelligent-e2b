@@ -1244,6 +1244,11 @@ func (s *Sandbox) doStop(ctx context.Context) error {
 	case <-ctx.Done():
 		errs = append(errs, fmt.Errorf("failed waiting for FC exit: %w", ctx.Err()))
 	}
+	// Join persistence only after process/cgroup termination was attempted: a
+	// surviving writer must not delay the cgroup kill while holding FIFO EOF open.
+	if err := s.process.JoinMetrics(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed joining FC metrics persistence: %w", err))
+	}
 
 	uffdStopErr := s.Resources.memory.Stop()
 	if uffdStopErr != nil {

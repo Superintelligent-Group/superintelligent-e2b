@@ -187,6 +187,11 @@ Key mechanisms (all under `pkg/sandbox/`):
   and emits a distinct cutoff receipt. It remains an inactive build input: the
   orchestrator still needs to own collection readiness, finalization and durable
   joins before declaring a complete identified device-observation window.
+  The [owned reader lifecycle](../specs/network-usage-reader-lifecycle.md) opens
+  journal/FIFO resources synchronously, owns periodic flushing and parsing, and
+  joins journal closure after process/cgroup termination before slot return.
+  Startup abort does not depend on process exit. Interrupted joins and partial
+  FIFO tails remain incomplete; this does not activate the correlated producer.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.

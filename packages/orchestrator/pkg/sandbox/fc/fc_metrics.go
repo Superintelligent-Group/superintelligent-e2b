@@ -3,7 +3,6 @@
 package fc
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,7 +25,7 @@ import (
 const (
 	// metricsReaderBufSize is the scanner buffer for a single Firecracker metrics line.
 	// 1 MB is well above the size of any single Firecracker metrics JSON line.
-	metricsReaderBufSize = 1 * 1024 * 1024 // 1 MB
+	metricsReaderBufSize = 1*1024*1024 + 1 // one MiB JSON plus terminating newline
 
 	// metricsFlushInterval controls how often we trigger a Firecracker metrics flush.
 	metricsFlushInterval = 5 * time.Second
@@ -278,197 +277,120 @@ func (p *Process) FlushAndReadBalloonMetrics(ctx context.Context) (BalloonMetric
 	}
 }
 
-// startMetricsReader opens the metrics FIFO and starts a goroutine that reads
-// Firecracker metrics lines and exports metrics via OTEL.
-// It must be called before setMetrics so that the FIFO is open for reading
-// before Firecracker opens the write end in response to PUT /metrics.
+// startMetricsReader returns only after journal and FIFO descriptors are open.
+// Process owns the session until startup abort or post-termination persistence join.
 func (p *Process) startMetricsReader(ctx context.Context) error {
-	// Detach from the request context so the goroutine runs for the VM's lifetime
-	// but still inherits trace values for logging.
-	ctx = context.WithoutCancel(ctx)
-	sandboxID := p.files.SandboxID
-	metricsPath := p.metricsPath
-	journal, err := networkusage.Open(p.config.NetworkUsageJournalDir, sandboxID)
+	p.metricsMu.Lock()
+	defer p.metricsMu.Unlock()
+	if p.metricsStopped || p.metrics != nil {
+		return errors.New("metrics reader already started or process stopping")
+	}
+	journal, err := networkusage.Open(p.config.NetworkUsageJournalDir, p.files.SandboxID)
 	if err != nil {
 		return err
 	}
+	session, err := openMetricsReader(ctx, p.metricsPath, journal, func(line []byte) error {
+		return p.consumeMetricsLine(context.WithoutCancel(ctx), journal, line)
+	}, p.client.flushMetrics, metricsFlushInterval, p.Exit.Done())
+	if err != nil {
+		return err
+	}
+	p.metrics = session
+	return nil
+}
+
+func (p *Process) consumeMetricsLine(ctx context.Context, journal *networkusage.Journal, line []byte) error {
+	var m firecrackerMetrics
+	if err := json.Unmarshal(line, &m); err != nil {
+		return errors.Join(fmt.Errorf("invalid metrics frame: %w", err), journal.Gap("invalid_metrics_frame"))
+	}
+	var evidenceErr error
 	journalError := func(err error) {
+		evidenceErr = errors.Join(evidenceErr, err)
 		if err != nil {
-			logger.L().Error(ctx, "network usage journal incomplete", zap.Error(err), logger.WithSandboxID(sandboxID))
+			logger.L().Error(ctx, "network usage journal incomplete", zap.Error(err), logger.WithSandboxID(p.files.SandboxID))
 		}
 	}
+	n := m.Net
+	txBytes, rxBytes, present := n.byteDeltas()
+	if n == nil {
+		n = &firecrackerNetMetrics{}
+	}
+	if !present {
+		journalError(journal.Gap("missing_network_counters"))
+	} else {
+		journalError(journal.Observe(txBytes, rxBytes))
+	}
 
-	// Flusher: periodically triggers a Firecracker metrics flush so the reader receives
-	// fresh data at metricsFlushInterval instead of the default 60 s.
-	go func() {
-		ticker := time.NewTicker(metricsFlushInterval)
-		defer ticker.Stop()
+	// TX histograms — values are already per-flush deltas from Firecracker.
+	fcNetBytes.Record(ctx, int64(txBytes), attrTX)
+	fcNetPackets.Record(ctx, int64(n.TxPacketsCount), attrTX)
+	fcNetCount.Record(ctx, int64(n.TxCount), attrTX)
+	fcNetRateLimiterEventCount.Record(ctx, int64(n.TxRateLimiterEventCount), attrTX)
+	fcNetRemainingReqs.Record(ctx, int64(n.TxRemainingReqsCount), attrTX)
 
-		for {
-			select {
-			case <-p.Exit.Done():
-				return
-			case <-ticker.C:
-				if err := p.client.flushMetrics(ctx); err != nil {
-					journalError(journal.Gap("flush_request_failed"))
-					logger.L().Warn(ctx, "failed to flush fc metrics",
-						zap.Error(err),
-						logger.WithSandboxID(sandboxID),
-					)
-				}
-			}
-		}
-	}()
+	// Only record throttled when non-zero to avoid polluting the histogram with idle intervals.
+	if n.TxRateLimiterThrottled > 0 {
+		fcNetRateLimiterThrottled.Record(ctx, int64(n.TxRateLimiterThrottled), attrTX)
+	}
 
-	go func() {
-		defer func() { journalError(journal.Close()) }()
-		// O_RDWR opens without blocking (no need to wait for a writer).
-		// We keep this FD solely to unblock the open; the scanner reads from
-		// a separate O_RDONLY FD below. On process exit we close the O_RDWR FD
-		// to drop our write reference — once Firecracker also exits, the
-		// O_RDONLY read receives EOF and the goroutine exits cleanly.
-		rwFd, err := os.OpenFile(metricsPath, os.O_RDWR, os.ModeNamedPipe)
-		if err != nil {
-			journalError(journal.Gap("fifo_open_failed"))
-			logger.L().Warn(ctx, "failed to open fc metrics FIFO",
-				zap.Error(err),
-				logger.WithSandboxID(sandboxID),
-			)
+	// RX histograms.
+	fcNetBytes.Record(ctx, int64(rxBytes), attrRX)
+	fcNetPackets.Record(ctx, int64(n.RxPacketsCount), attrRX)
+	fcNetCount.Record(ctx, int64(n.RxCount), attrRX)
 
-			return
-		}
+	if n.RxRateLimiterThrottled > 0 {
+		fcNetRateLimiterThrottled.Record(ctx, int64(n.RxRateLimiterThrottled), attrRX)
+	}
 
-		// O_RDONLY succeeds immediately because O_RDWR already established both ends.
-		rFd, err := os.OpenFile(metricsPath, os.O_RDONLY, os.ModeNamedPipe)
-		if err != nil {
-			rwFd.Close()
-			journalError(journal.Gap("fifo_read_open_failed"))
-			logger.L().Warn(ctx, "failed to open fc metrics FIFO for reading",
-				zap.Error(err),
-				logger.WithSandboxID(sandboxID),
-			)
+	// Global error/event counters (only increment on non-zero values).
+	if n.TxFails > 0 {
+		fcNetFails.Add(ctx, int64(n.TxFails), attrTX)
+	}
+	if n.RxFails > 0 {
+		fcNetFails.Add(ctx, int64(n.RxFails), attrRX)
+	}
+	if n.NoTxAvailBuffer > 0 {
+		fcNetNoAvailBuffer.Add(ctx, int64(n.NoTxAvailBuffer), attrTX)
+	}
+	if n.NoRxAvailBuffer > 0 {
+		fcNetNoAvailBuffer.Add(ctx, int64(n.NoRxAvailBuffer), attrRX)
+	}
+	if n.TapWriteFails > 0 {
+		fcNetTapIOFails.Add(ctx, int64(n.TapWriteFails), attrTX)
+	}
+	if n.TapReadFails > 0 {
+		fcNetTapIOFails.Add(ctx, int64(n.TapReadFails), attrRX)
+	}
 
-			return
-		}
-		defer rFd.Close()
+	// Block histograms — values are already per-flush deltas from Firecracker.
+	b := &m.Block
 
-		// Drop our write reference on exit so the scanner can receive EOF.
-		go func() {
-			<-p.Exit.Done()
-			rwFd.Close()
-		}()
+	fcBlockBytes.Record(ctx, int64(b.ReadBytes), attrRead)
+	fcBlockBytes.Record(ctx, int64(b.WriteBytes), attrWrite)
+	fcBlockCount.Record(ctx, int64(b.ReadCount), attrRead)
+	fcBlockCount.Record(ctx, int64(b.WriteCount), attrWrite)
+	fcBlockRateLimiterEventCount.Record(ctx, int64(b.RateLimiterEventCount))
+	fcBlockRemainingReqs.Record(ctx, int64(b.RemainingReqsCount))
 
-		scanner := bufio.NewScanner(rFd)
-		scanner.Buffer(make([]byte, metricsReaderBufSize), metricsReaderBufSize)
+	if b.RateLimiterThrottledEvents > 0 {
+		fcBlockRateLimiterThrottled.Record(ctx, int64(b.RateLimiterThrottledEvents))
+	}
+	if b.IOEngineThrottledEvents > 0 {
+		fcBlockIOEngineThrottled.Record(ctx, int64(b.IOEngineThrottledEvents))
+	}
 
-		for scanner.Scan() {
-			var m firecrackerMetrics
-			if err := json.Unmarshal(scanner.Bytes(), &m); err != nil {
-				journalError(journal.Gap("invalid_metrics_frame"))
-				logger.L().Warn(ctx, "failed to parse fc metrics line",
-					zap.Error(err),
-					logger.WithSandboxID(sandboxID),
-				)
+	// Block global error/event counters.
+	if b.ExecuteFails > 0 || b.EventFails > 0 {
+		fcBlockFails.Add(ctx, int64(b.ExecuteFails)+int64(b.EventFails))
+	}
+	if b.NoAvailBuffer > 0 {
+		fcBlockNoAvailBuffer.Add(ctx, int64(b.NoAvailBuffer))
+	}
 
-				continue
-			}
+	// Balloon: SharedIncMetric resets on flush, so accumulate.
+	next := accumulateBalloon(p.balloonAccum.Load(), m.Balloon)
+	p.balloonAccum.Store(&next)
 
-			n := m.Net
-			txBytes, rxBytes, present := n.byteDeltas()
-			if n == nil {
-				n = &firecrackerNetMetrics{}
-			}
-			if !present {
-				journalError(journal.Gap("missing_network_counters"))
-			} else {
-				journalError(journal.Observe(txBytes, rxBytes))
-			}
-
-			// TX histograms — values are already per-flush deltas from Firecracker.
-			fcNetBytes.Record(ctx, int64(txBytes), attrTX)
-			fcNetPackets.Record(ctx, int64(n.TxPacketsCount), attrTX)
-			fcNetCount.Record(ctx, int64(n.TxCount), attrTX)
-			fcNetRateLimiterEventCount.Record(ctx, int64(n.TxRateLimiterEventCount), attrTX)
-			fcNetRemainingReqs.Record(ctx, int64(n.TxRemainingReqsCount), attrTX)
-
-			// Only record throttled when non-zero to avoid polluting the histogram with idle intervals.
-			if n.TxRateLimiterThrottled > 0 {
-				fcNetRateLimiterThrottled.Record(ctx, int64(n.TxRateLimiterThrottled), attrTX)
-			}
-
-			// RX histograms.
-			fcNetBytes.Record(ctx, int64(rxBytes), attrRX)
-			fcNetPackets.Record(ctx, int64(n.RxPacketsCount), attrRX)
-			fcNetCount.Record(ctx, int64(n.RxCount), attrRX)
-
-			if n.RxRateLimiterThrottled > 0 {
-				fcNetRateLimiterThrottled.Record(ctx, int64(n.RxRateLimiterThrottled), attrRX)
-			}
-
-			// Global error/event counters (only increment on non-zero values).
-			if n.TxFails > 0 {
-				fcNetFails.Add(ctx, int64(n.TxFails), attrTX)
-			}
-			if n.RxFails > 0 {
-				fcNetFails.Add(ctx, int64(n.RxFails), attrRX)
-			}
-			if n.NoTxAvailBuffer > 0 {
-				fcNetNoAvailBuffer.Add(ctx, int64(n.NoTxAvailBuffer), attrTX)
-			}
-			if n.NoRxAvailBuffer > 0 {
-				fcNetNoAvailBuffer.Add(ctx, int64(n.NoRxAvailBuffer), attrRX)
-			}
-			if n.TapWriteFails > 0 {
-				fcNetTapIOFails.Add(ctx, int64(n.TapWriteFails), attrTX)
-			}
-			if n.TapReadFails > 0 {
-				fcNetTapIOFails.Add(ctx, int64(n.TapReadFails), attrRX)
-			}
-
-			// Block histograms — values are already per-flush deltas from Firecracker.
-			b := &m.Block
-
-			fcBlockBytes.Record(ctx, int64(b.ReadBytes), attrRead)
-			fcBlockBytes.Record(ctx, int64(b.WriteBytes), attrWrite)
-			fcBlockCount.Record(ctx, int64(b.ReadCount), attrRead)
-			fcBlockCount.Record(ctx, int64(b.WriteCount), attrWrite)
-			fcBlockRateLimiterEventCount.Record(ctx, int64(b.RateLimiterEventCount))
-			fcBlockRemainingReqs.Record(ctx, int64(b.RemainingReqsCount))
-
-			if b.RateLimiterThrottledEvents > 0 {
-				fcBlockRateLimiterThrottled.Record(ctx, int64(b.RateLimiterThrottledEvents))
-			}
-			if b.IOEngineThrottledEvents > 0 {
-				fcBlockIOEngineThrottled.Record(ctx, int64(b.IOEngineThrottledEvents))
-			}
-
-			// Block global error/event counters.
-			if b.ExecuteFails > 0 || b.EventFails > 0 {
-				fcBlockFails.Add(ctx, int64(b.ExecuteFails)+int64(b.EventFails))
-			}
-			if b.NoAvailBuffer > 0 {
-				fcBlockNoAvailBuffer.Add(ctx, int64(b.NoAvailBuffer))
-			}
-
-			// Balloon: SharedIncMetric resets on flush, so accumulate.
-			next := accumulateBalloon(p.balloonAccum.Load(), m.Balloon)
-			p.balloonAccum.Store(&next)
-		}
-
-		if err := scanner.Err(); err != nil {
-			journalError(journal.Gap("metrics_reader_failed"))
-			if errors.Is(err, bufio.ErrTooLong) {
-				logger.L().Error(ctx, "fc metrics line exceeded buffer size, metrics reader stopped",
-					zap.Int("bufferSizeBytes", metricsReaderBufSize),
-					logger.WithSandboxID(sandboxID),
-				)
-			} else {
-				logger.L().Warn(ctx, "fc metrics FIFO scanner error",
-					zap.Error(err),
-					logger.WithSandboxID(sandboxID),
-				)
-			}
-		}
-	}()
-	return nil
+	return evidenceErr
 }
