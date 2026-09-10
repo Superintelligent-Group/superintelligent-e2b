@@ -25,6 +25,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/networkusage"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/socket"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
@@ -150,10 +151,13 @@ type Process struct {
 
 	Exit *utils.ErrorOnce
 
-	client         *apiClient
-	metricsMu      sync.Mutex
-	metrics        *metricsReader
-	metricsStopped bool
+	client             *apiClient
+	metricsMu          sync.Mutex
+	metrics            *metricsReader
+	metricsStopped     bool
+	measurementService *networkusage.Service
+	measurement        *measurementSession
+	binaryPath         string
 
 	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
 	// metrics-reader goroutine (FC's SharedIncMetric resets per flush).
@@ -186,7 +190,7 @@ func NewProcess(
 		attribute.String("sandbox.cmd", startScript.Value),
 	)
 
-	_, err = os.Stat(versions.FirecrackerPath(config))
+	_, err = os.Stat(startScript.FirecrackerPath)
 	if err != nil {
 		return nil, fmt.Errorf("error stating firecracker binary: %w", err)
 	}
@@ -217,6 +221,7 @@ func NewProcess(
 		files:                 files,
 		slot:                  slot,
 
+		binaryPath: startScript.FirecrackerPath,
 		kernelPath: startScript.KernelPath,
 		rootfsPath: startScript.RootfsPath,
 	}
@@ -237,6 +242,9 @@ func (p *Process) configure(
 ) error {
 	ctx, childSpan := tracer.Start(ctx, "configure-fc")
 	defer childSpan.End()
+	if err := p.verifyMeasurementBinary(); err != nil {
+		return err
+	}
 
 	stdoutWriter := &zapio.Writer{Log: sbxlogger.I(sbxMetadata).Logger.Detach(ctx), Level: zap.InfoLevel}
 	stdoutWriters := []io.Writer{stdoutWriter}
@@ -367,7 +375,7 @@ func (p *Process) Create(
 		return errors.Join(fmt.Errorf("initialize metrics evidence: %w", err), p.Stop(ctx))
 	}
 
-	err = p.client.setMetrics(ctx, p.metricsPath)
+	err = p.configureMetrics(ctx)
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -509,7 +517,7 @@ func (p *Process) Create(
 		telemetry.ReportEvent(ctx, "set fc mmds metadata")
 	}
 
-	err = p.client.startVM(ctx)
+	err = p.startMeasuredActivity(ctx, func() error { return p.client.startVM(ctx) })
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -612,7 +620,7 @@ func (p *Process) Resume(
 		return errors.Join(fmt.Errorf("initialize metrics evidence: %w", err), p.Stop(ctx))
 	}
 
-	err = p.client.setMetrics(ctx, p.metricsPath)
+	err = p.configureMetrics(ctx)
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -620,13 +628,15 @@ func (p *Process) Resume(
 	}
 	telemetry.ReportEvent(ctx, "set fc metrics")
 
-	err = p.client.loadSnapshot(
-		ctx,
-		uffdSocketPath,
-		uffdReady,
-		snapfile,
-		useMemfd,
-	)
+	err = p.startMeasuredActivity(ctx, func() error {
+		return p.client.loadSnapshot(
+			ctx,
+			uffdSocketPath,
+			uffdReady,
+			snapfile,
+			useMemfd,
+		)
+	})
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -695,6 +705,9 @@ func (p *Process) Pid() (int, error) {
 func (p *Process) Stop(ctx context.Context) error {
 	p.metricsMu.Lock()
 	p.metricsStopped = true
+	if p.measurement != nil {
+		p.measurement.ending.Store(true)
+	}
 	if p.metrics != nil {
 		p.metrics.cancel()
 	}

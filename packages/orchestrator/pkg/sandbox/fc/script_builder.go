@@ -32,6 +32,8 @@ type startScriptArgs struct {
 
 // StartScriptResult contains the generated script and computed paths
 type StartScriptResult struct {
+	// FirecrackerPath is the exact host executable rendered into Value.
+	FirecrackerPath string
 	// Value is the generated firecracker start script
 	Value string
 
@@ -147,9 +149,10 @@ func (sb *StartScriptBuilder) Build(
 	kernelPath := sb.getKernelPath(args)
 
 	return &StartScriptResult{
-		Value:      script,
-		RootfsPath: rootfsPath,
-		KernelPath: kernelPath,
+		Value:           script,
+		FirecrackerPath: args.FirecrackerPath,
+		RootfsPath:      rootfsPath,
+		KernelPath:      kernelPath,
 	}, nil
 }
 

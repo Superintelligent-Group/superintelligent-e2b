@@ -247,8 +247,11 @@ func (p *Process) BalloonMetrics() BalloonMetricsSnapshot {
 	return BalloonMetricsSnapshot{}
 }
 
-// FlushMetrics triggers an FC metrics flush. Non-blocking on the reader.
+// FlushMetrics waits for the durable reader fence in correlated mode.
 func (p *Process) FlushMetrics(ctx context.Context) error {
+	if measurement := p.measurementSession(); measurement != nil {
+		return measurement.sample(ctx)
+	}
 	return p.client.flushMetrics(ctx)
 }
 
@@ -256,6 +259,10 @@ func (p *Process) FlushMetrics(ctx context.Context) error {
 // resulting line, returning the updated cumulative snapshot. On flush error
 // (e.g. FC already torn down) returns the last observed snapshot.
 func (p *Process) FlushAndReadBalloonMetrics(ctx context.Context) (BalloonMetricsSnapshot, error) {
+	if measurement := p.measurementSession(); measurement != nil {
+		err := measurement.sample(ctx)
+		return p.BalloonMetrics(), err
+	}
 	pre := p.balloonAccum.Load()
 	if err := p.client.flushMetrics(ctx); err != nil {
 		return p.BalloonMetrics(), fmt.Errorf("flush metrics: %w", err)
@@ -285,6 +292,24 @@ func (p *Process) startMetricsReader(ctx context.Context) error {
 	if p.metricsStopped || p.metrics != nil {
 		return errors.New("metrics reader already started or process stopping")
 	}
+	if p.config.NetworkUsageCorrelated {
+		measurement, err := newMeasurementSession(p.measurementService, p.files.SandboxID, p.firecrackerSocketPath)
+		if err != nil {
+			return err
+		}
+		p.measurement = measurement
+		reader, err := openMetricsReader(ctx, p.metricsPath, measurement, func(line []byte) error {
+			// metricsLines strips only LF, so this recreates the exact producer bytes.
+			raw := append(append([]byte(nil), line...), '\n')
+			return measurement.observe(raw, func(inner []byte) error { return p.consumeMetricsLine(context.WithoutCancel(ctx), nil, inner) })
+		}, measurement.periodicSample, metricsFlushInterval, p.Exit.Done())
+		if err != nil {
+			return err
+		}
+		p.metrics = reader
+		p.superviseMeasurement(ctx, measurement)
+		return nil
+	}
 	journal, err := networkusage.Open(p.config.NetworkUsageJournalDir, p.files.SandboxID)
 	if err != nil {
 		return err
@@ -302,7 +327,10 @@ func (p *Process) startMetricsReader(ctx context.Context) error {
 func (p *Process) consumeMetricsLine(ctx context.Context, journal *networkusage.Journal, line []byte) error {
 	var m firecrackerMetrics
 	if err := json.Unmarshal(line, &m); err != nil {
-		return errors.Join(fmt.Errorf("invalid metrics frame: %w", err), journal.Gap("invalid_metrics_frame"))
+		if journal != nil {
+			return errors.Join(fmt.Errorf("invalid metrics frame: %w", err), journal.Gap("invalid_metrics_frame"))
+		}
+		return err
 	}
 	var evidenceErr error
 	journalError := func(err error) {
@@ -316,10 +344,12 @@ func (p *Process) consumeMetricsLine(ctx context.Context, journal *networkusage.
 	if n == nil {
 		n = &firecrackerNetMetrics{}
 	}
-	if !present {
-		journalError(journal.Gap("missing_network_counters"))
-	} else {
-		journalError(journal.Observe(txBytes, rxBytes))
+	if journal != nil {
+		if !present {
+			journalError(journal.Gap("missing_network_counters"))
+		} else {
+			journalError(journal.Observe(txBytes, rxBytes))
+		}
 	}
 
 	// TX histograms — values are already per-flush deltas from Firecracker.

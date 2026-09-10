@@ -163,8 +163,8 @@ Key mechanisms (all under `pkg/sandbox/`):
   An additional [host-local spool API](../specs/network-usage-spool.md) can segment
   the same journal records under byte/file-count budgets, preserve crash tails,
   and reclaim exact immutable segments after a trusted adapter acknowledges them.
-  It is not yet wired into orchestrator configuration or remote delivery; active
-  journal configuration still uses the original single-file producer. The spool
+  The opt-in correlated runtime uses one shared host spool; legacy journal
+  configuration retains the original single-file producer. The spool
   never upgrades observations to complete terminal coverage or provider pricing.
   A further [optional raw-custody API](../specs/network-usage-custody.md) supports
   conditional S3 uploads and checksum/readback verification before local segment
@@ -179,25 +179,35 @@ Key mechanisms (all under `pkg/sandbox/`):
   separate requirements for a complete measured window.
   A [pinned Firecracker producer patch](../third_party/firecracker-measurement/README.md)
   adds opt-in correlated flush receipts and sticky emission loss. Its local build
-  recipe preserves source, patch and binary provenance; it does not change runtime
-  binary selection. Emission acknowledgment is distinct from collector persistence
+  recipe preserves source, patch and binary provenance. Correlated runtime startup
+  checks the selected executable against the reviewed SHA256 before launching it.
+  Emission acknowledgment is distinct from collector persistence
   and terminal device cutoff. Device counters are not provider-billable bytes.
   The [terminal producer extension](../specs/firecracker-terminal-measurement.md)
   adds an irreversible runtime latch before pause, blocks subsequent device restart,
-  and emits a distinct cutoff receipt. It remains an inactive build input: the
-  orchestrator still needs to own collection readiness, finalization and durable
-  joins before declaring a complete identified device-observation window.
+  and emits a distinct cutoff receipt. The default-off correlated runtime owns
+  collection readiness, finalization and durable joins. Deployment, protected
+  custody and complete identified window acceptance remain separate gates.
   The [owned reader lifecycle](../specs/network-usage-reader-lifecycle.md) opens
   journal/FIFO resources synchronously, owns periodic flushing and parsing, and
   joins journal closure after process/cgroup termination before slot return.
   Startup abort does not depend on process exit. Interrupted joins and partial
-  FIFO tails remain incomplete; this does not activate the correlated producer.
-  The inactive [durable correlation API](../specs/network-usage-correlation.md)
+  FIFO tails remain incomplete.
+  The [durable correlation API](../specs/network-usage-correlation.md)
   binds exact producer frames and receipts to the journal/spool durability path.
   A single owner persists baseline, activity intent and matched frame references;
   producer sequence and local journal sequence remain separate. It accepts the
-  opt-in envelope without activating it in the existing telemetry reader, and
+  opt-in envelope before passing its inner metrics to the telemetry reader, and
   never upgrades a local fence to complete coverage or remote custody.
+  The [correlated runtime](../specs/network-usage-runtime.md) is enabled only by
+  explicit validated host configuration. It persists a baseline before Create
+  starts the VM or Resume loads a snapshot, serializes measurement requests, and
+  obtains a terminal fence before normal sandbox termination. Snapshot creation
+  precedes finalization; the snapshot lock is released before rootfs export can
+  call Stop. Session failures stop the affected process; shared spool IO failures
+  stop admission, stop affected processes, and trigger host shutdown. Spool closure
+  waits for collector closure. There is no scheduled remote delivery or automatic
+  reclaim in this runtime, so a full spool fails closed.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
