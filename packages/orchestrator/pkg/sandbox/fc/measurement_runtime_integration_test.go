@@ -47,6 +47,12 @@ func TestMeasurementRuntimeCreateAndTerminal(t *testing.T) {
 func TestMeasurementRuntimeSpoolExhaustion(t *testing.T) {
 	runMeasurementRuntime(t, "budget")
 }
+func TestMeasurementRuntimeFiniteCalibration(t *testing.T) {
+	if os.Getenv("SUP916_CALIBRATION") != "1" {
+		t.Skip("explicit SUP916_CALIBRATION=1 required")
+	}
+	runMeasurementRuntime(t, "calibration")
+}
 func runMeasurementRuntime(t *testing.T, mode string) {
 	if os.Getenv("SUP912_KVM_ACCEPTANCE") != "1" {
 		t.Skip("explicit SUP912_KVM_ACCEPTANCE=1 required")
@@ -180,7 +186,7 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 			require.Positive(t, tx, "no durable guest TX")
 			require.Positive(t, rx, "no durable guest RX")
 			ids := []string{"sup912-create"}
-			if mode == "resume" {
+			if mode == "resume" || mode == "calibration" {
 				ids = append(ids, "sup912-resume")
 			}
 			for _, id := range ids {
@@ -192,11 +198,14 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 				require.Equal(t, terminals, correlations[id][networkusage.TerminalScope])
 			}
 			result := map[string]any{"passed": true, "mode": mode, "create_pre_icmp": 3, "create_post_icmp": 0, "binary_sha256": binarySHA, "durable_correlations": correlations, "durable_tx": tx, "durable_rx": rx, "segments": segments, "rootfs_sha256_after_run": hashFile(filepath.Join(base, "rootfs.ext4")), "scope": "local Process acceptance only; no cgroup containment or remote custody claim"}
-			if mode == "resume" {
+			if mode == "resume" || mode == "calibration" {
 				result["resume_pre_icmp"], result["resume_post_icmp"] = 3, 0
 			}
 			encoded, err := json.MarshalIndent(result, "", "  ")
 			require.NoError(t, err)
+			if mode == "calibration" {
+				verifyFiniteCalibration(t, base)
+			}
 			require.NoError(t, os.WriteFile(filepath.Join(base, "result.json"), encoded, 0600))
 		}
 	})
@@ -263,6 +272,9 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 	require.True(t, booted, "guest boot ICMP failed: %s", lastProbe)
 	alive(source)
 	ping(true)
+	if mode == "calibration" {
+		runFiniteCalibration(t, ctx, source, base, "create")
+	}
 	if mode == "budget" {
 		for i := 0; i < 32 && service.Err() == nil; i++ {
 			_ = source.FlushMetrics(ctx)
@@ -307,6 +319,9 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 	require.NoError(t, restored.Resume(ctx, metadata, restoredFiles.SandboxUffdSocketPath(), snapshot, backend.Ready(), nil, cgroup.NoCgroupFD, false, disabled, disabled))
 	alive(restored)
 	ping(true)
+	if mode == "calibration" {
+		runFiniteCalibration(t, ctx, restored, base, "resume")
+	}
 	require.NoError(t, restored.FinalizeMeasurement(ctx))
 	require.NoError(t, restored.FinalizeMeasurement(ctx))
 	alive(restored)
