@@ -152,6 +152,10 @@ Key mechanisms (all under `pkg/sandbox/`):
 
 - **Firecracker** (`fc/`): each sandbox is one Firecracker process in its own cgroup and network
   namespace. The FC HTTP API (unix socket) configures machine, drives, network, and snapshots.
+  Resume reapplies current TX and root-drive limits before resuming the VM. Each disabled
+  bucket is sent explicitly with zero size/refill time, clearing any saved limit; omitted
+  PATCH buckets would preserve the saved value. Initial device creation retains omission
+  semantics. This does not change configured budgets or defaults (SUP-925).
   Guest metadata (sandbox ID, envd access token hash) is passed via MMDS.
 - **Network observation journal** (`networkusage/`, opt-in): the existing Firecracker
   metrics reader can persist per-flush TX/RX byte deltas in an operator-owned host

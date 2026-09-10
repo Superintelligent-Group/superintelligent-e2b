@@ -270,15 +270,25 @@ func buildRateLimiter(config RateLimiterConfig) *models.RateLimiter {
 	return &models.RateLimiter{Ops: ops, Bandwidth: bw}
 }
 
+// buildRateLimiterUpdate explicitly replaces each bucket when applying current
+// configuration to an existing device. On PATCH, an omitted bucket means no
+// update; size=0/refill_time=0 disables a bucket restored from a snapshot.
+// Keep buildRateLimiter's omission behavior for initial device creation.
+func buildRateLimiterUpdate(config RateLimiterConfig) *models.RateLimiter {
+	if config.Ops.BucketSize < 0 {
+		config.Ops = TokenBucketConfig{}
+	}
+	if config.Bandwidth.BucketSize < 0 {
+		config.Bandwidth = TokenBucketConfig{}
+	}
+	return buildRateLimiter(config)
+}
+
 // setTxRateLimit applies or clears a Firecracker VMM-level transmit rate limit.
-// Both buckets are disabled when their BucketSize < 0; if all are disabled an empty
-// RateLimiter is sent to reset any limit persisted in a snapshot.
+// Negative BucketSize explicitly disables the corresponding saved bucket.
 // This always sends a PATCH so snapshot-persisted limits are overwritten.
 func (c *apiClient) setTxRateLimit(ctx context.Context, ifaceID string, config RateLimiterConfig) error {
-	limiter := buildRateLimiter(config)
-	if limiter == nil {
-		limiter = &models.RateLimiter{} // empty = reset
-	}
+	limiter := buildRateLimiterUpdate(config)
 
 	params := operations.PatchGuestNetworkInterfaceByIDParams{
 		Context: ctx,
@@ -298,14 +308,10 @@ func (c *apiClient) setTxRateLimit(ctx context.Context, ifaceID string, config R
 }
 
 // setDriveRateLimit applies or clears a Firecracker VMM-level block device rate limit.
-// Both buckets are disabled when their BucketSize < 0; if all are disabled an empty
-// RateLimiter is sent to reset any limit persisted in a snapshot.
+// Negative BucketSize explicitly disables the corresponding saved bucket.
 // This always sends a PATCH so snapshot-persisted limits are overwritten.
 func (c *apiClient) setDriveRateLimit(ctx context.Context, driveID string, config RateLimiterConfig) error {
-	limiter := buildRateLimiter(config)
-	if limiter == nil {
-		limiter = &models.RateLimiter{} // empty = reset
-	}
+	limiter := buildRateLimiterUpdate(config)
 
 	params := operations.PatchGuestDriveByIDParams{
 		Context: ctx,
