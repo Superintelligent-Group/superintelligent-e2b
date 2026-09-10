@@ -53,6 +53,12 @@ func TestMeasurementRuntimeFiniteCalibration(t *testing.T) {
 	}
 	runMeasurementRuntime(t, "calibration")
 }
+func TestMeasurementRuntimeDeferredRXCalibration(t *testing.T) {
+	if os.Getenv("SUP921_CALIBRATION") != "1" {
+		t.Skip("explicit SUP921_CALIBRATION=1 required")
+	}
+	runMeasurementRuntime(t, "deferred-rx")
+}
 func runMeasurementRuntime(t *testing.T, mode string) {
 	if os.Getenv("SUP912_KVM_ACCEPTANCE") != "1" {
 		t.Skip("explicit SUP912_KVM_ACCEPTANCE=1 required")
@@ -91,6 +97,9 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 	t.Cleanup(func() { require.NoError(t, exec.Command("ip", "netns", "del", "ns-912").Run()) })
 	run("netns", "exec", "ns-912", "ip", "link", "set", "lo", "up")
 	run("netns", "exec", "ns-912", "ip", "tuntap", "add", "tap0", "mode", "tap")
+	if mode == "deferred-rx" {
+		disableDeferredRXHostIPv6(t, ctx, base)
+	}
 	run("netns", "exec", "ns-912", "ip", "addr", "add", "169.254.0.22/30", "dev", "tap0")
 	run("netns", "exec", "ns-912", "ip", "link", "set", "tap0", "up")
 	for _, dir := range []string{"cache", "spool", "vm"} {
@@ -206,6 +215,9 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 			if mode == "calibration" {
 				verifyFiniteCalibration(t, base)
 			}
+			if mode == "deferred-rx" {
+				verifyDeferredRXCalibration(t, base)
+			}
 			require.NoError(t, os.WriteFile(filepath.Join(base, "result.json"), encoded, 0600))
 		}
 	})
@@ -272,6 +284,17 @@ func runMeasurementRuntime(t *testing.T, mode string) {
 	require.True(t, booted, "guest boot ICMP failed: %s", lastProbe)
 	alive(source)
 	ping(true)
+	if mode == "deferred-rx" {
+		runDeferredRXCalibration(t, ctx, source, base, sourceFiles.SandboxFirecrackerSocketPath(), slot.VpeerName())
+		alive(source)
+		paused(sourceFiles)
+		ping(false)
+		require.NoError(t, source.Stop(ctx))
+		require.NoError(t, source.JoinMetrics(ctx))
+		require.NoError(t, service.Err())
+		accepted = true
+		return // Snapshot prepare_save would finish the deferred RX buffer.
+	}
 	if mode == "calibration" {
 		runFiniteCalibration(t, ctx, source, base, "create")
 	}

@@ -9,6 +9,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,23 @@ import (
 var calibrationPython string
 
 func runFiniteCalibration(t *testing.T, ctx context.Context, process *fc.Process, base, phase string) {
+	runCalibrationCapture(t, ctx, process, base, phase, calibrationPython, func(dir string, writeJSON func(string, any), input io.Writer, lines *bufio.Scanner) {
+		start, err := fc.CalibrationSample(process, ctx)
+		require.NoError(t, err)
+		writeJSON("start.json", start)
+		_, err = fmt.Fprintln(input, "traffic")
+		require.NoError(t, err)
+		require.True(t, lines.Scan(), "traffic completion missing")
+		require.Equal(t, "traffic-complete", lines.Text())
+		end, err := fc.CalibrationSample(process, ctx)
+		require.NoError(t, err)
+		writeJSON("end.json", end)
+	})
+}
+
+// Capture outlives every fence and the supplied exercise. Final parsers run only
+// after tracer detach and packet-reader join; live checks are readiness only.
+func runCalibrationCapture(t *testing.T, ctx context.Context, process *fc.Process, base, phase, python string, exercise func(string, func(string, any), io.Writer, *bufio.Scanner)) {
 	t.Helper()
 	dir := filepath.Join(base, "calibration-"+phase)
 	require.NoError(t, os.Mkdir(dir, 0700))
@@ -87,7 +105,7 @@ func runFiniteCalibration(t *testing.T, ctx context.Context, process *fc.Process
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), raw, 0600))
 	}
 	writeJSON("fds.json", fds)
-	capture := exec.CommandContext(ctx, "ip", "netns", "exec", "ns-912", "python3", "-c", calibrationPython, "capture", dir, phase)
+	capture := exec.CommandContext(ctx, "ip", "netns", "exec", "ns-912", "python3", "-c", python, "capture", dir, phase)
 	captureError, err := os.Create(filepath.Join(dir, "capture-stderr.txt"))
 	require.NoError(t, err)
 	defer captureError.Close()
@@ -156,17 +174,7 @@ func runFiniteCalibration(t *testing.T, ctx context.Context, process *fc.Process
 		require.True(t, time.Now().Before(deadline), "tracer attachment timeout")
 		time.Sleep(10 * time.Millisecond)
 	}
-	start, err := fc.CalibrationSample(process, ctx)
-	require.NoError(t, err)
-	writeJSON("start.json", start)
-	// Observe both directions independently while generating finite tagged traffic.
-	_, err = fmt.Fprintln(captureInput, "traffic")
-	require.NoError(t, err)
-	require.True(t, captureLines.Scan(), "traffic completion missing")
-	require.Equal(t, "traffic-complete", captureLines.Text())
-	end, err := fc.CalibrationSample(process, ctx)
-	require.NoError(t, err)
-	writeJSON("end.json", end)
+	exercise(dir, writeJSON, captureInput, captureLines)
 	stop()
 	_, err = fmt.Fprintln(captureInput, "stop")
 	require.NoError(t, err)
