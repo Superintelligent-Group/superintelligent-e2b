@@ -1,0 +1,1020 @@
+diff --git a/docs/measurement-protocol.md b/docs/measurement-protocol.md
+new file mode 100644
+index 00000000..1c772d2b
+--- /dev/null
++++ b/docs/measurement-protocol.md
+@@ -0,0 +1,81 @@
++# Opt-in measurement emission (SUP-908)
++
++Based on e2b-dev/firecracker `431f1fc7d47f4cfe1dfe42437b9394f20972b65d`.
++This protocol proves correlated emission only. It does not claim network
++quiescence, whole-lifetime coverage, collector persistence, or cloud custody.
++
++Configure `PUT /metrics` before workload admission:
++
++```json
++{"metrics_path":"/path/to/metrics.fifo","measurement_incarnation":"collector_epoch_1"}
++```
++
++Without `measurement_incarnation`, the legacy stream and FlushMetrics behavior
++are unchanged. Incarnation and request IDs are ASCII alphanumeric, dash or
++underscore tokens of 1 through 128 bytes. The collector must select a fresh
++incarnation per process and bind it to independently verified producer identity.
++
++Request a correlated emission, including preboot baseline capture:
++
++```json
++{"action_type":"FlushMeasurement","measurement":{"incarnation":"collector_epoch_1","request_sequence":1,"request_id":"baseline"}}
++```
++
++Each API request sequence starts at one and advances exactly by one. Identity
++is the full `(incarnation, request_sequence, request_id)` tuple. An exact retry
++of the last accepted request returns its original success or failure without
++serializing metrics again, even after intervening periodic writes. Only one
++last-request result is retained. Older, skipped, zero or conflicting request
++sequences fail without writing. Request IDs are not a separate global replay
++registry. Malformed or wrong-incarnation requests do not consume attempts.
++
++HTTP 200 returns the exact emitted frame header:
++
++```json
++{"schema":"sig.fc-measurement.v1","incarnation":"collector_epoch_1","attempt_sequence":2,"request_sequence":1,"request_id":"baseline","loss_detected":false}
++```
++
++Every opted-in periodic/startup/legacy-FlushMetrics write uses the same writer
++mutex and attempt sequence. Its request fields are null. Stream records are
++newline-delimited objects `{ "measurement": <header>, "metrics": <legacy payload> }`.
++Attempts start at one and are assigned before serialization. Counters and
++sequences are unsigned 64-bit values; consumers must not parse through lossy
++floating-point numbers. Measurement attempt sequence overflow rejects further
++emission without wrapping; request sequence exhaustion rejects new requests.
++Existing metric counter arithmetic is unchanged and does not acquire this checked
++overflow guarantee.
++
++The producer serializes exactly once, writes the complete frame plus newline,
++and flushes the sink before returning success. This is not fsync or a collector
++acknowledgement. Any serialization, oversized-frame, partial write, or flush
++failure sets sticky `loss_detected` for this incarnation. Legacy delta fields
++can already have advanced before failure; subsequent success never repairs
++that loss. An unsuccessful requested attempt is cached just like success.
++Frames are capped at one MiB after serialization. An incomplete prefix may
++remain after sink failure, so consumers must mark malformed/gapped streams
++incomplete rather than skip them and claim complete coverage.
++
++A replayed successful receipt describes its original emission, not a fresh
++observation of later sticky-loss state. Consumers verify contiguous evidence
++through their target receipt and retain later detected loss according to the
++measurement-window protocol. Uninitialized and mode-disabled measurement
++requests return errors, never a successful empty response. Normal legacy
++`FlushMetrics` retains its original behavior when measurement is not enabled.
++
++Verification mapping:
++
++- `measurement_periodic_interleaving_and_replay`: actual Metrics writer ordering,
++  distinct periodic and request sequences, exact cached success and conflicts.
++- `measurement_partial_write_and_flush_errors_are_sticky_and_replayed`: failed
++  requested emission, exact retry and later sticky-loss receipt.
++- `measurement_serialization_failure_poison_and_overflow`: consumed delta before
++  serialization failure, sticky poison, attempt exhaustion.
++- `measurement_requires_initialized_opt_in_and_valid_identity`: initialization,
++  mode, validation and request sequence exhaustion.
++- `test_parse_measurement_action`, `test_convert_to_response`, and
++  `test_measurement_action_preboot_requires_configured_stream`: API request,
++  response, and real preboot dispatch paths.
++
++SUP-907 still owns reader readiness, start boundary, network cutoff, joined
++persistence and protected remote receipts. Neither a successful HTTP response
++nor a changed reader pointer makes a complete measured window.
+diff --git a/src/firecracker/src/api_server/parsed_request.rs b/src/firecracker/src/api_server/parsed_request.rs
+index 478483e9..69c8e846 100644
+--- a/src/firecracker/src/api_server/parsed_request.rs
++++ b/src/firecracker/src/api_server/parsed_request.rs
+@@ -181,6 +181,7 @@ impl ParsedRequest {
+                     info!("The request was executed successfully. Status code: 204 No Content.");
+                     Response::new(Version::Http11, StatusCode::NoContent)
+                 }
++                VmmData::Measurement(receipt) => Self::success_response_with_data(receipt),
+                 VmmData::MachineConfiguration(machine_config) => {
+                     Self::success_response_with_data(machine_config)
+                 }
+@@ -599,6 +600,9 @@ pub mod tests {
+                     http_response(&serde_json::to_string(status).unwrap(), 200)
+                 }
+                 VmmData::Empty => http_response("", 204),
++                VmmData::Measurement(receipt) => {
++                    http_response(&serde_json::to_string(receipt).unwrap(), 200)
++                }
+                 VmmData::FullVmConfig(cfg) => {
+                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
+                 }
+@@ -640,6 +644,14 @@ pub mod tests {
+             ..Default::default()
+         }));
+         verify_ok_response_with(VmmData::Empty);
++        verify_ok_response_with(VmmData::Measurement(vmm::logger::MeasurementReceipt {
++            schema: "sig.fc-measurement.v1",
++            incarnation: "epoch_1".into(),
++            attempt_sequence: 2,
++            request_sequence: Some(1),
++            request_id: Some("flush_1".into()),
++            loss_detected: false,
++        }));
+         verify_ok_response_with(VmmData::FullVmConfig(VmmConfig::default()));
+         verify_ok_response_with(VmmData::MachineConfiguration(MachineConfig::default()));
+         verify_ok_response_with(VmmData::MmdsValue(serde_json::from_str("{}").unwrap()));
+diff --git a/src/firecracker/src/api_server/request/actions.rs b/src/firecracker/src/api_server/request/actions.rs
+index a3b3f3f3..e5651bee 100644
+--- a/src/firecracker/src/api_server/request/actions.rs
++++ b/src/firecracker/src/api_server/request/actions.rs
+@@ -7,7 +7,6 @@ use vmm::rpc_interface::VmmAction;
+ 
+ use super::super::parsed_request::{ParsedRequest, RequestError};
+ use super::Body;
+-#[cfg(target_arch = "aarch64")]
+ use super::StatusCode;
+ 
+ // The names of the members from this enum must precisely correspond (as a string) to the possible
+@@ -16,6 +15,7 @@ use super::StatusCode;
+ #[derive(Debug, Deserialize, Serialize)]
+ enum ActionType {
+     FlushMetrics,
++    FlushMeasurement,
+     InstanceStart,
+     SendCtrlAltDel,
+ }
+@@ -26,6 +26,20 @@ enum ActionType {
+ #[serde(deny_unknown_fields)]
+ struct ActionBody {
+     action_type: ActionType,
++    #[serde(
++        default,
++        deserialize_with = "present_measurement",
++        skip_serializing_if = "Option::is_none"
++    )]
++    measurement: Option<vmm::logger::MeasurementRequest>,
++}
++
++// An explicitly present null is invalid, including on legacy actions. Only an
++// absent field may become None; this preserves legacy deny_unknown_fields.
++fn present_measurement<'de, D: serde::Deserializer<'de>>(
++    deserializer: D,
++) -> Result<Option<vmm::logger::MeasurementRequest>, D::Error> {
++    vmm::logger::MeasurementRequest::deserialize(deserializer).map(Some)
+ }
+ 
+ pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestError> {
+@@ -34,7 +48,32 @@ pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestErr
+         METRICS.put_api_requests.actions_fails.inc();
+     })?;
+ 
++    if !matches!(action_body.action_type, ActionType::FlushMeasurement)
++        && action_body.measurement.is_some()
++    {
++        METRICS.put_api_requests.actions_fails.inc();
++        return Err(RequestError::Generic(
++            StatusCode::BadRequest,
++            "measurement is only valid for FlushMeasurement".into(),
++        ));
++    }
+     match action_body.action_type {
++        ActionType::FlushMeasurement => {
++            let request = action_body.measurement.ok_or_else(|| {
++                METRICS.put_api_requests.actions_fails.inc();
++                RequestError::Generic(
++                    StatusCode::BadRequest,
++                    "FlushMeasurement requires measurement identity".into(),
++                )
++            })?;
++            request.validate().map_err(|error| {
++                METRICS.put_api_requests.actions_fails.inc();
++                RequestError::Generic(StatusCode::BadRequest, error.to_string())
++            })?;
++            Ok(ParsedRequest::new_sync(VmmAction::FlushMeasurement(
++                request,
++            )))
++        }
+         ActionType::FlushMetrics => Ok(ParsedRequest::new_sync(VmmAction::FlushMetrics)),
+         ActionType::InstanceStart => Ok(ParsedRequest::new_sync(VmmAction::StartMicroVm)),
+         ActionType::SendCtrlAltDel => {
+@@ -55,6 +94,33 @@ pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestErr
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn test_parse_measurement_action() {
++        let json = r#"{"action_type":"FlushMeasurement","measurement":{"incarnation":"epoch_1","request_sequence":1,"request_id":"flush_1"}}"#;
++        assert_eq!(
++            parse_put_actions(&Body::new(json)).unwrap(),
++            ParsedRequest::new_sync(VmmAction::FlushMeasurement(
++                vmm::logger::MeasurementRequest {
++                    incarnation: "epoch_1".into(),
++                    request_sequence: 1,
++                    request_id: "flush_1".into(),
++                }
++            ))
++        );
++        for invalid in [
++            r#"{"action_type":"FlushMeasurement"}"#,
++            r#"{"action_type":"FlushMeasurement","measurement":null}"#,
++            r#"{"action_type":"FlushMetrics","measurement":null}"#,
++            r#"{"action_type":"InstanceStart","measurement":null}"#,
++            r#"{"action_type":"InstanceStart","measurement":{"incarnation":"epoch_1","request_sequence":1,"request_id":"flush_1"}}"#,
++            r#"{"action_type":"FlushMeasurement","measurement":{"incarnation":"epoch_1","request_sequence":0,"request_id":"flush_1"}}"#,
++            r#"{"action_type":"FlushMetrics","measurement":{"incarnation":"epoch_1","request_sequence":1,"request_id":"flush_1"}}"#,
++            r#"{"action_type":"FlushMeasurement","measurement":{"incarnation":"epoch_1","request_sequence":1,"request_id":"flush_1","extra":true}}"#,
++        ] {
++            assert!(parse_put_actions(&Body::new(invalid)).is_err());
++        }
++    }
++
+     #[test]
+     fn test_parse_put_actions_request() {
+         {
+diff --git a/src/firecracker/src/api_server/request/metrics.rs b/src/firecracker/src/api_server/request/metrics.rs
+index 054ece19..798b1c01 100644
+--- a/src/firecracker/src/api_server/request/metrics.rs
++++ b/src/firecracker/src/api_server/request/metrics.rs
+@@ -31,6 +31,7 @@ mod tests {
+         }"#;
+         let expected_config = MetricsConfig {
+             metrics_path: PathBuf::from("metrics"),
++            measurement_incarnation: None,
+         };
+         assert_eq!(
+             vmm_action_from_request(parse_put_metrics(&Body::new(body)).unwrap()),
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index 73921499..fc5a5c53 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -352,6 +352,7 @@ fn main_exec() -> Result<(), MainError> {
+     if let Some(metrics_path) = arguments.single_value("metrics-path") {
+         let metrics_config = MetricsConfig {
+             metrics_path: PathBuf::from(metrics_path),
++            measurement_incarnation: None,
+         };
+         init_metrics(metrics_config).map_err(MainError::MetricsInitialization)?;
+     }
+diff --git a/src/firecracker/swagger/firecracker.yaml b/src/firecracker/swagger/firecracker.yaml
+index 6fab5b3e..415cfb6b 100644
+--- a/src/firecracker/swagger/firecracker.yaml
++++ b/src/firecracker/swagger/firecracker.yaml
+@@ -49,6 +49,10 @@ paths:
+           schema:
+             $ref: "#/definitions/InstanceActionInfo"
+       responses:
++        200:
++          description: Correlated measurement frame emitted; not collector persistence.
++          schema:
++            $ref: "#/definitions/MeasurementReceipt"
+         204:
+           description: The update was successful
+         400:
+@@ -1359,8 +1363,45 @@ definitions:
+         type: string
+         enum:
+           - FlushMetrics
++          - FlushMeasurement
+           - InstanceStart
+           - SendCtrlAltDel
++      measurement:
++        $ref: "#/definitions/MeasurementRequest"
++
++  MeasurementRequest:
++    type: object
++    required: [incarnation, request_sequence, request_id]
++    properties:
++      incarnation:
++        type: string
++        pattern: "^[A-Za-z0-9_-]{1,128}$"
++      request_sequence:
++        type: integer
++        minimum: 1
++        description: Consecutive unsigned 64-bit request sequence, starting at one.
++      request_id:
++        type: string
++        pattern: "^[A-Za-z0-9_-]{1,128}$"
++
++  MeasurementReceipt:
++    type: object
++    required: [schema, incarnation, attempt_sequence, request_sequence, request_id, loss_detected]
++    properties:
++      schema:
++        type: string
++        enum: [sig.fc-measurement.v1]
++      incarnation:
++        type: string
++      attempt_sequence:
++        type: integer
++      request_sequence:
++        type: integer
++      request_id:
++        type: string
++      loss_detected:
++        type: boolean
++        description: Sticky producer serialization or sink failure within this incarnation.
+ 
+   InstanceInfo:
+     type: object
+@@ -1560,6 +1601,10 @@ definitions:
+       metrics_path:
+         type: string
+         description: Path to the named pipe or file where the JSON-formatted metrics are flushed.
++      measurement_incarnation:
++        type: string
++        pattern: "^[A-Za-z0-9_-]{1,128}$"
++        description: Opt-in correlated measurement envelopes; absent retains legacy metrics.
+ 
+   MmdsConfig:
+     type: object
+diff --git a/src/vmm/src/logger/measurement.rs b/src/vmm/src/logger/measurement.rs
+new file mode 100644
+index 00000000..f6cf1350
+--- /dev/null
++++ b/src/vmm/src/logger/measurement.rs
+@@ -0,0 +1,455 @@
++// Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++//! Opt-in correlated measurement emission. Emission is not collector persistence.
++use std::io::Write;
++
++use serde::{Deserialize, Serialize};
++
++use super::MetricsError;
++
++/// Bounded caller-selected request identity. Sequence starts at one.
++#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct MeasurementRequest {
++    /// Collector-selected process incarnation configured before measured work.
++    pub incarnation: String,
++    /// Strictly consecutive caller request sequence, independent of periodic writes.
++    pub request_sequence: u64,
++    /// Token correlated with the exact emitted frame.
++    pub request_id: String,
++}
++
++/// Header present in every opted-in metrics frame and successful API receipt.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++pub struct MeasurementReceipt {
++    /// Explicit additive wire schema.
++    pub schema: &'static str,
++    /// Configured process incarnation.
++    pub incarnation: String,
++    /// Sequence allocated before serialization, including failed attempts.
++    pub attempt_sequence: u64,
++    /// None for periodic and legacy FlushMetrics calls.
++    pub request_sequence: Option<u64>,
++    /// None for periodic and legacy FlushMetrics calls.
++    pub request_id: Option<String>,
++    /// Sticky across the incarnation: a prior attempt may have lost deltas.
++    pub loss_detected: bool,
++}
++
++/// Token syntax is deliberately bounded and unambiguous on the wire.
++pub fn valid_measurement_token(token: &str) -> bool {
++    !token.is_empty()
++        && token.len() <= 128
++        && token
++            .bytes()
++            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
++}
++
++impl MeasurementRequest {
++    /// Reject malformed requests before any attempt or metric serialization.
++    pub fn validate(&self) -> Result<(), MetricsError> {
++        if !valid_measurement_token(&self.incarnation)
++            || !valid_measurement_token(&self.request_id)
++            || self.request_sequence == 0
++        {
++            return Err(MetricsError::Measurement(
++                "invalid measurement request".into(),
++            ));
++        }
++        Ok(())
++    }
++}
++
++#[derive(Debug)]
++pub(super) struct MeasurementState {
++    incarnation: String,
++    attempt_sequence: u64,
++    loss_detected: bool,
++    last_request: Option<(MeasurementRequest, Result<MeasurementReceipt, String>)>,
++}
++
++#[derive(Debug)]
++pub(super) struct MetricsSink<M> {
++    pub writer: M,
++    pub measurement: Option<MeasurementState>,
++}
++
++impl<M: Write> MetricsSink<M> {
++    pub fn new(writer: M, incarnation: Option<String>) -> Result<Self, MetricsError> {
++        if incarnation
++            .as_deref()
++            .is_some_and(|value| !valid_measurement_token(value))
++        {
++            return Err(MetricsError::Measurement(
++                "invalid measurement incarnation".into(),
++            ));
++        }
++        Ok(Self {
++            writer,
++            measurement: incarnation.map(|incarnation| MeasurementState {
++                incarnation,
++                attempt_sequence: 0,
++                loss_detected: false,
++                last_request: None,
++            }),
++        })
++    }
++
++    pub fn emit<T: Serialize>(
++        &mut self,
++        metrics: &T,
++        request: Option<&MeasurementRequest>,
++    ) -> Result<MeasurementReceipt, MetricsError> {
++        let state = self
++            .measurement
++            .as_mut()
++            .ok_or_else(|| MetricsError::Measurement("measurement mode not configured".into()))?;
++        if let Some(request) = request {
++            request.validate()?;
++            if request.incarnation != state.incarnation {
++                return Err(MetricsError::Measurement(
++                    "measurement incarnation mismatch".into(),
++                ));
++            }
++            if let Some((last, result)) = &state.last_request {
++                if request == last {
++                    return result.clone().map_err(MetricsError::Measurement);
++                }
++            }
++            let previous = state
++                .last_request
++                .as_ref()
++                .map_or(0, |(last, _)| last.request_sequence);
++            if previous.checked_add(1) != Some(request.request_sequence) {
++                return Err(MetricsError::Measurement(
++                    "measurement request conflict or reorder".into(),
++                ));
++            }
++        }
++        let result = (|| {
++            state.attempt_sequence = state
++                .attempt_sequence
++                .checked_add(1)
++                .ok_or_else(|| "measurement attempt sequence exhausted".to_string())?;
++            let receipt = MeasurementReceipt {
++                schema: "sig.fc-measurement.v1",
++                incarnation: state.incarnation.clone(),
++                attempt_sequence: state.attempt_sequence,
++                request_sequence: request.map(|r| r.request_sequence),
++                request_id: request.map(|r| r.request_id.clone()),
++                loss_detected: state.loss_detected,
++            };
++            #[derive(Serialize)]
++            struct Frame<'a, T> {
++                measurement: &'a MeasurementReceipt,
++                metrics: &'a T,
++            }
++            // Serialize exactly once. SharedIncMetric advances baselines during
++            // serialization; any error permanently disqualifies this window.
++            let mut bytes = serde_json::to_vec(&Frame {
++                measurement: &receipt,
++                metrics,
++            })
++            .map_err(|error| format!("measurement serialization failed: {error}"))?;
++            if bytes.len() > 1024 * 1024 {
++                return Err("measurement frame exceeds one MiB".into());
++            }
++            bytes.push(b'\n');
++            self.writer
++                .write_all(&bytes)
++                .map_err(|error| format!("measurement write failed: {error}"))?;
++            self.writer
++                .flush()
++                .map_err(|error| format!("measurement flush failed: {error}"))?;
++            Ok(receipt)
++        })();
++        if result.is_err() {
++            state.loss_detected = true;
++        }
++        if let Some(request) = request {
++            state.last_request = Some((request.clone(), result.clone()));
++        }
++        result.map_err(MetricsError::Measurement)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::logger::metrics::{IncMetric, Metrics, SharedIncMetric};
++    use serde::ser::SerializeStruct;
++    use std::io;
++    use std::sync::{Arc, Mutex};
++
++    #[derive(Debug, Default)]
++    struct SinkState {
++        bytes: Vec<u8>,
++        fail_after: Option<usize>,
++        fail_flush: bool,
++    }
++    #[derive(Clone, Debug, Default)]
++    struct TestWriter(Arc<Mutex<SinkState>>);
++    impl Write for TestWriter {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            let mut state = self.0.lock().unwrap();
++            let remaining = state
++                .fail_after
++                .map_or(bytes.len(), |limit| limit.saturating_sub(state.bytes.len()));
++            if remaining == 0 {
++                return Err(io::Error::other("injected partial write"));
++            }
++            let count = remaining.min(bytes.len());
++            state.bytes.extend_from_slice(&bytes[..count]);
++            Ok(count)
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            if self.0.lock().unwrap().fail_flush {
++                Err(io::Error::other("injected flush"))
++            } else {
++                Ok(())
++            }
++        }
++    }
++    fn request(sequence: u64) -> MeasurementRequest {
++        MeasurementRequest {
++            incarnation: "epoch_1".into(),
++            request_sequence: sequence,
++            request_id: format!("flush_{sequence}"),
++        }
++    }
++    #[derive(Debug, Default, Serialize)]
++    struct Counters {
++        bytes: SharedIncMetric,
++    }
++
++    #[test]
++    fn measurement_periodic_interleaving_and_replay() {
++        let metrics = Metrics::new(Counters::default());
++        let writer = TestWriter::default();
++        metrics
++            .init_with_measurement(writer.clone(), Some("epoch_1".into()))
++            .unwrap();
++        metrics.bytes.add(11);
++        assert!(metrics.write().unwrap());
++        metrics.bytes.add(7);
++        let receipt = metrics.flush_measurement(&request(1)).unwrap();
++        assert_eq!(receipt.attempt_sequence, 2);
++        assert!(!receipt.loss_detected);
++        metrics.bytes.add(3);
++        metrics.write().unwrap();
++        let before = writer.0.lock().unwrap().bytes.clone();
++        assert_eq!(metrics.flush_measurement(&request(1)).unwrap(), receipt);
++        assert_eq!(writer.0.lock().unwrap().bytes, before);
++        let next = metrics.flush_measurement(&request(2)).unwrap();
++        assert_eq!(next.attempt_sequence, 4);
++        let bytes = writer.0.lock().unwrap().bytes.clone();
++        let frames: Vec<serde_json::Value> = bytes
++            .split(|b| *b == b'\n')
++            .filter(|line| !line.is_empty())
++            .map(|line| serde_json::from_slice(line).unwrap())
++            .collect();
++        assert_eq!(
++            frames
++                .iter()
++                .map(|frame| frame["metrics"]["bytes"].as_u64().unwrap())
++                .collect::<Vec<_>>(),
++            vec![11, 7, 3, 0]
++        );
++        assert!(metrics.flush_measurement(&request(1)).is_err());
++        let mut conflict = request(2);
++        conflict.request_id = "different".into();
++        assert!(metrics.flush_measurement(&conflict).is_err());
++        assert!(metrics.flush_measurement(&request(4)).is_err());
++        let mut wrong_epoch = request(3);
++        wrong_epoch.incarnation = "other".into();
++        assert!(metrics.flush_measurement(&wrong_epoch).is_err());
++        assert_eq!(writer.0.lock().unwrap().bytes, bytes);
++    }
++
++    #[test]
++    fn measurement_partial_write_and_flush_errors_are_sticky_and_replayed() {
++        for flush_error in [false, true] {
++            let metrics = Metrics::new(Counters::default());
++            let writer = TestWriter::default();
++            metrics
++                .init_with_measurement(writer.clone(), Some("epoch_1".into()))
++                .unwrap();
++            {
++                let mut state = writer.0.lock().unwrap();
++                state.fail_flush = flush_error;
++                if !flush_error {
++                    state.fail_after = Some(30);
++                }
++            }
++            metrics.bytes.add(19);
++            let first = metrics
++                .flush_measurement(&request(1))
++                .unwrap_err()
++                .to_string();
++            let before = writer.0.lock().unwrap().bytes.clone();
++            {
++                let mut state = writer.0.lock().unwrap();
++                state.fail_after = None;
++                state.fail_flush = false;
++            }
++            assert_eq!(
++                metrics
++                    .flush_measurement(&request(1))
++                    .unwrap_err()
++                    .to_string(),
++                first
++            );
++            assert_eq!(writer.0.lock().unwrap().bytes, before);
++            metrics.write().unwrap();
++            assert!(
++                metrics
++                    .flush_measurement(&request(2))
++                    .unwrap()
++                    .loss_detected
++            );
++        }
++    }
++
++    #[test]
++    fn measurement_concurrent_periodic_and_requested_are_serialized() {
++        let metrics = Arc::new(Metrics::new(Counters::default()));
++        let writer = TestWriter::default();
++        metrics
++            .init_with_measurement(writer.clone(), Some("epoch_1".into()))
++            .unwrap();
++        let barrier = Arc::new(std::sync::Barrier::new(2));
++        let periodic_metrics = metrics.clone();
++        let periodic_barrier = barrier.clone();
++        let periodic = std::thread::spawn(move || {
++            periodic_barrier.wait();
++            for _ in 0..100 {
++                periodic_metrics.bytes.add(1);
++                periodic_metrics.write().unwrap();
++            }
++        });
++        barrier.wait();
++        let mut receipts = Vec::new();
++        for sequence in 1..=100 {
++            metrics.bytes.add(1);
++            receipts.push(metrics.flush_measurement(&request(sequence)).unwrap());
++        }
++        periodic.join().unwrap();
++        let bytes = writer.0.lock().unwrap().bytes.clone();
++        let frames: Vec<serde_json::Value> = bytes
++            .split(|b| *b == b'\n')
++            .filter(|line| !line.is_empty())
++            .map(|line| serde_json::from_slice(line).unwrap())
++            .collect();
++        assert_eq!(frames.len(), 200);
++        assert_eq!(
++            frames
++                .iter()
++                .map(|frame| frame["metrics"]["bytes"].as_u64().unwrap())
++                .sum::<u64>(),
++            200
++        );
++        for (index, frame) in frames.iter().enumerate() {
++            assert_eq!(frame["measurement"]["attempt_sequence"], (index + 1) as u64);
++            assert_eq!(frame["measurement"]["loss_detected"], false);
++        }
++        for receipt in receipts {
++            assert_eq!(
++                frames[receipt.attempt_sequence as usize - 1]["measurement"],
++                serde_json::to_value(receipt).unwrap()
++            );
++        }
++    }
++
++    #[test]
++    fn measurement_oversized_frame_consumes_delta_and_sets_sticky_loss() {
++        #[derive(Serialize)]
++        struct LargeFrame {
++            consumed: SharedIncMetric,
++            padding: String,
++        }
++        let writer = TestWriter::default();
++        let mut sink = MetricsSink::new(writer.clone(), Some("epoch_1".into())).unwrap();
++        let large = LargeFrame {
++            consumed: SharedIncMetric::new(),
++            padding: "x".repeat(1024 * 1024),
++        };
++        large.consumed.add(23);
++        let error = sink
++            .emit(&large, Some(&request(1)))
++            .unwrap_err()
++            .to_string();
++        assert!(error.contains("exceeds one MiB"));
++        assert_eq!(large.consumed.fetch_diff(), 0);
++        assert!(writer.0.lock().unwrap().bytes.is_empty());
++        assert_eq!(
++            sink.emit(&Counters::default(), Some(&request(1)))
++                .unwrap_err()
++                .to_string(),
++            error
++        );
++        assert!(writer.0.lock().unwrap().bytes.is_empty());
++        let receipt = sink.emit(&Counters::default(), Some(&request(2))).unwrap();
++        assert_eq!(receipt.attempt_sequence, 2);
++        assert!(receipt.loss_detected);
++    }
++
++    #[derive(Debug)]
++    struct SerializationFailure {
++        consumed: SharedIncMetric,
++    }
++    impl Serialize for SerializationFailure {
++        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++            let mut state = serializer.serialize_struct("Failure", 2)?;
++            state.serialize_field("consumed", &self.consumed)?;
++            Err(serde::ser::Error::custom(
++                "failure after delta serialization",
++            ))
++        }
++    }
++    #[test]
++    fn measurement_serialization_failure_poison_and_overflow() {
++        let mut sink = MetricsSink::new(TestWriter::default(), Some("epoch_1".into())).unwrap();
++        let metrics = SerializationFailure {
++            consumed: SharedIncMetric::new(),
++        };
++        metrics.consumed.add(13);
++        assert!(sink.emit(&metrics, None).is_err());
++        assert_eq!(metrics.consumed.fetch_diff(), 0);
++        assert!(
++            sink.emit(&Counters::default(), Some(&request(1)))
++                .unwrap()
++                .loss_detected
++        );
++        sink.measurement.as_mut().unwrap().attempt_sequence = u64::MAX;
++        assert!(sink.emit(&Counters::default(), Some(&request(2))).is_err());
++        assert!(sink.emit(&Counters::default(), None).is_err());
++        assert_eq!(
++            sink.measurement.as_ref().unwrap().attempt_sequence,
++            u64::MAX
++        );
++    }
++
++    #[test]
++    fn measurement_requires_initialized_opt_in_and_valid_identity() {
++        let metrics = Metrics::<Counters, TestWriter>::new(Counters::default());
++        assert!(metrics.flush_measurement(&request(1)).is_err());
++        assert!(!metrics.write().unwrap());
++        assert!(
++            metrics
++                .init_with_measurement(TestWriter::default(), Some("invalid/name".into()))
++                .is_err()
++        );
++        metrics.init(TestWriter::default()).unwrap();
++        assert!(metrics.flush_measurement(&request(1)).is_err());
++        let mut invalid = request(0);
++        assert!(invalid.validate().is_err());
++        invalid = request(1);
++        invalid.request_id = "x".repeat(129);
++        assert!(invalid.validate().is_err());
++        let mut sink = MetricsSink::new(TestWriter::default(), Some("epoch_1".into())).unwrap();
++        sink.measurement.as_mut().unwrap().last_request =
++            Some((request(u64::MAX), Err("old".into())));
++        assert!(sink.emit(&Counters::default(), Some(&request(1))).is_err());
++    }
++}
+diff --git a/src/vmm/src/logger/metrics.rs b/src/vmm/src/logger/metrics.rs
+index 2bd7330c..4f3e3cc9 100644
+--- a/src/vmm/src/logger/metrics.rs
++++ b/src/vmm/src/logger/metrics.rs
+@@ -67,6 +67,8 @@ use std::ops::Deref;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Mutex, OnceLock};
+ 
++use super::measurement::{MeasurementReceipt, MeasurementRequest, MetricsSink};
++
+ use serde::{Serialize, Serializer};
+ use utils::time::{ClockType, get_time_ns, get_time_us};
+ 
+@@ -91,7 +93,7 @@ pub static METRICS: Metrics<FirecrackerMetrics, FcLineWriter> =
+ #[derive(Debug)]
+ pub struct Metrics<T: Serialize, M: Write + Send> {
+     // Metrics will get flushed here.
+-    metrics_buf: OnceLock<Mutex<M>>,
++    metrics_buf: OnceLock<Mutex<MetricsSink<M>>>,
+     pub app_metrics: T,
+ }
+ 
+@@ -117,8 +119,17 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
+     ///
+     /// * `metrics_dest` - Buffer for JSON formatted metrics. Needs to implement `Write` and `Send`.
+     pub fn init(&self, metrics_dest: M) -> Result<(), MetricsError> {
++        self.init_with_measurement(metrics_dest, None)
++    }
++
++    /// Initialize an optional correlated measurement stream. Legacy mode is unchanged.
++    pub fn init_with_measurement(
++        &self,
++        metrics_dest: M,
++        incarnation: Option<String>,
++    ) -> Result<(), MetricsError> {
+         self.metrics_buf
+-            .set(Mutex::new(metrics_dest))
++            .set(Mutex::new(MetricsSink::new(metrics_dest, incarnation)?))
+             .map_err(|_| MetricsError::AlreadyInitialized)
+     }
+ 
+@@ -143,7 +154,11 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
+     /// known deadlock potential.
+     pub fn write(&self) -> Result<bool, MetricsError> {
+         if let Some(lock) = self.metrics_buf.get() {
+-            let mut writer = lock.lock().expect("poisoned lock");
++            let mut sink = lock.lock().expect("poisoned lock");
++            if sink.measurement.is_some() {
++                return sink.emit(&self.app_metrics, None).map(|_| true);
++            }
++            let writer = &mut sink.writer;
+             serde_json::to_writer(writer.by_ref(), &self.app_metrics)
+                 .map_err(|err| MetricsError::Serde(err.to_string()))?;
+             writer.write_all(b"\n").map_err(MetricsError::Write)?;
+@@ -154,6 +169,18 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
+             Ok(false)
+         }
+     }
++    /// Emit or replay the exact requested frame; uninitialized metrics are an error.
++    pub fn flush_measurement(
++        &self,
++        request: &MeasurementRequest,
++    ) -> Result<MeasurementReceipt, MetricsError> {
++        let lock = self.metrics_buf.get().ok_or_else(|| {
++            MetricsError::NeverInitialized("measurement metrics not initialized".into())
++        })?;
++        lock.lock()
++            .map_err(|_| MetricsError::Measurement("measurement writer poisoned".into()))?
++            .emit(&self.app_metrics, Some(request))
++    }
+ }
+ 
+ impl<T: Serialize + Debug, M: Write + Send + Debug> Deref for Metrics<T, M> {
+@@ -169,6 +196,8 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Deref for Metrics<T, M> {
+ pub enum MetricsError {
+     /// {0}
+     NeverInitialized(String),
++    /// Measurement protocol failure: {0}
++    Measurement(String),
+     /// Reinitialization of metrics not allowed.
+     AlreadyInitialized,
+     /// {0}
+diff --git a/src/vmm/src/logger/mod.rs b/src/vmm/src/logger/mod.rs
+index 4bbbf9e1..82dc6bdd 100644
+--- a/src/vmm/src/logger/mod.rs
++++ b/src/vmm/src/logger/mod.rs
+@@ -5,6 +5,7 @@
+ //! collecting.
+ 
+ mod logging;
++mod measurement;
+ mod metrics;
+ 
+ pub use log::{Level, debug, error, info, log_enabled, trace, warn};
+@@ -12,6 +13,7 @@ pub use logging::{
+     DEFAULT_INSTANCE_ID, DEFAULT_LEVEL, INSTANCE_ID, LOGGER, LevelFilter, LevelFilterFromStrError,
+     LoggerConfig, LoggerInitError, LoggerUpdateError,
+ };
++pub use measurement::{MeasurementReceipt, MeasurementRequest, valid_measurement_token};
+ pub use metrics::{
+     IncMetric, LatencyAggregateMetrics, METRICS, MetricsError, ProcessTimeReporter,
+     SharedIncMetric, SharedStoreMetric, StoreMetric,
+diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
+index a3fe8f74..bdf20c11 100644
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -79,6 +79,8 @@ pub enum VmmAction {
+     GetVmmVersion,
+     /// Flush the metrics. This action can only be called after the logger has been configured.
+     FlushMetrics,
++    /// Correlated opt-in measurement flush; also available before boot for baseline capture.
++    FlushMeasurement(crate::logger::MeasurementRequest),
+     /// Add a new block device or update one that already exists using the `BlockDeviceConfig` as
+     /// input. This action can only be called before the microVM has booted.
+     InsertBlockDevice(BlockDeviceConfig),
+@@ -155,6 +157,16 @@ pub enum VmmAction {
+     GetMemoryDirty,
+ }
+ 
++fn measurement_flush_response(
++    request: &crate::logger::MeasurementRequest,
++) -> Result<VmmData, VmmActionError> {
++    METRICS
++        .flush_measurement(request)
++        .map(VmmData::Measurement)
++        .map_err(super::VmmError::Metrics)
++        .map_err(VmmActionError::InternalVmm)
++}
++
+ /// Wrapper for all errors associated with VMM actions.
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+ pub enum VmmActionError {
+@@ -223,6 +235,8 @@ pub enum VmmData {
+     BalloonStats(BalloonStats),
+     /// No data is sent on the channel.
+     Empty,
++    /// Receipt for the exact fully emitted measurement frame, not collector persistence.
++    Measurement(crate::logger::MeasurementReceipt),
+     /// The complete microVM configuration in JSON format.
+     FullVmConfig(VmmConfig),
+     /// The microVM configuration represented by `VmConfig`.
+@@ -457,6 +471,7 @@ impl<'a> PrebootApiController<'a> {
+                 .update(logger_cfg)
+                 .map(|()| VmmData::Empty)
+                 .map_err(VmmActionError::Logger),
++            FlushMeasurement(request) => measurement_flush_response(&request),
+             ConfigureMetrics(metrics_cfg) => vmm_config::metrics::init_metrics(metrics_cfg)
+                 .map(|()| VmmData::Empty)
+                 .map_err(VmmActionError::Metrics),
+@@ -707,6 +722,7 @@ impl RuntimeApiController {
+             // Supported operations allowed post-boot.
+             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+             FlushMetrics => self.flush_metrics(),
++            FlushMeasurement(request) => measurement_flush_response(&request),
+             GetBalloonConfig => self
+                 .vmm
+                 .lock()
+@@ -1274,6 +1290,20 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_measurement_action_preboot_requires_configured_stream() {
++        // Unlike legacy FlushMetrics, baseline measurement is allowed preboot.
++        // Uninitialized or legacy-mode metrics must still return an explicit error.
++        let response = preboot_request(VmmAction::FlushMeasurement(
++            crate::logger::MeasurementRequest {
++                incarnation: "epoch_1".into(),
++                request_sequence: 1,
++                request_id: "flush_1".into(),
++            },
++        ));
++        assert!(matches!(response, Err(VmmActionError::InternalVmm(_))));
++    }
++
+     #[test]
+     fn test_preboot_disallowed() {
+         fn check_unsupported(res: Result<VmmData, VmmActionError>) {
+@@ -1377,6 +1407,7 @@ mod tests {
+         check_unsupported(runtime_request(VmmAction::ConfigureMetrics(
+             MetricsConfig {
+                 metrics_path: PathBuf::new(),
++                measurement_incarnation: None,
+             },
+         )));
+         check_unsupported(runtime_request(VmmAction::InsertBlockDevice(
+diff --git a/src/vmm/src/vmm_config/metrics.rs b/src/vmm/src/vmm_config/metrics.rs
+index 38001661..643f43db 100644
+--- a/src/vmm/src/vmm_config/metrics.rs
++++ b/src/vmm/src/vmm_config/metrics.rs
+@@ -14,6 +14,9 @@ use crate::utils::open_file_nonblock;
+ pub struct MetricsConfig {
+     /// Named pipe or file used as output for metrics.
+     pub metrics_path: PathBuf,
++    /// Opt-in correlated stream; absent preserves the legacy metrics format.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub measurement_incarnation: Option<String>,
+ }
+ 
+ /// Errors associated with actions on the `MetricsConfig`.
+@@ -25,12 +28,21 @@ pub enum MetricsConfigError {
+ 
+ /// Configures the metrics as described in `metrics_cfg`.
+ pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError> {
++    if metrics_cfg
++        .measurement_incarnation
++        .as_deref()
++        .is_some_and(|value| !crate::logger::valid_measurement_token(value))
++    {
++        return Err(MetricsConfigError::InitializationFailure(
++            "invalid measurement incarnation".into(),
++        ));
++    }
+     let writer = FcLineWriter::new(
+         open_file_nonblock(&metrics_cfg.metrics_path)
+             .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?,
+     );
+     METRICS
+-        .init(writer)
++        .init_with_measurement(writer, metrics_cfg.measurement_incarnation)
+         .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))
+ }
+ 
+@@ -46,6 +58,7 @@ mod tests {
+         let metrics_file = TempFile::new().unwrap();
+         let desc = MetricsConfig {
+             metrics_path: metrics_file.as_path().to_path_buf(),
++            measurement_incarnation: None,
+         };
+ 
+         init_metrics(desc.clone()).unwrap();
