@@ -128,3 +128,26 @@ func TestGetSandboxes_RestoresIamTokens(t *testing.T) {
 		"named token definitions must survive an orchestrator re-sync")
 	assert.Nil(t, got["no-iam"], "a config without an iam message must decode as no configuration")
 }
+
+func TestGetSandboxesAllocationIdentityUsesNodeAndServerConfig(t *testing.T) {
+	team, execution := uuid.New(), uuid.NewString()
+	for _, cluster := range []uuid.UUID{uuid.Nil, uuid.New()} {
+		node := NewTestNode("node924", api.NodeStatusReady, 0, 4)
+		node.ClusterID = cluster
+		node.SetSandboxClient(&mockSandboxListClient{resp: &orchestrator.SandboxListResponse{Sandboxes: []*orchestrator.RunningSandbox{{
+			StartTime: timestamppb.Now(), EndTime: timestamppb.Now(), Config: &orchestrator.SandboxConfig{
+				SandboxId: "sandbox924", TeamId: team.String(), ExecutionId: execution, BuildId: uuid.NewString(),
+				Metadata: map[string]string{"teamID": uuid.NewString(), "executionID": uuid.NewString(), "clusterID": uuid.NewString()},
+			},
+		}}}})
+		sandboxes, err := node.GetSandboxes(t.Context())
+		require.NoError(t, err)
+		require.Len(t, sandboxes, 1)
+		got := sandboxes[0].ToAPISandbox().AllocationIdentity
+		require.Equal(t, api.SandboxAllocationIdentityStatusAvailable, got.Status)
+		require.Equal(t, api.SandboxAllocationIdentityProvenanceOrchestratorResync, got.Provenance)
+		require.Equal(t, execution, got.ExecutionID.String())
+		require.Equal(t, team, *got.TeamID)
+		require.Equal(t, cluster, *got.ClusterID)
+	}
+}

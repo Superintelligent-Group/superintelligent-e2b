@@ -408,7 +408,7 @@ func (o *Orchestrator) CreateSandbox(
 		trafficAccessToken,
 		nodemanager.ConvertOrchestratorMountsToDatabaseMounts(sbxData.VolumeMounts),
 		sbxData.Iam,
-	)
+	).WithAllocationIdentity(api.SandboxAllocationIdentityProvenanceServerAllocation)
 
 	err = o.sandboxStore.Add(ctx, sbx, &creationMeta)
 	if err != nil {
