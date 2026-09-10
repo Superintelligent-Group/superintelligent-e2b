@@ -38,6 +38,7 @@ const log = openSync(path.join(output, 'build.log'), 'wx')
 let result
 try {
   result = spawnSync('docker', ['run', '--rm', '--entrypoint', 'bash',
+    '--device', '/dev/kvm', '--device', '/dev/net/tun', '--cap-add', 'NET_ADMIN',
     '--mount', `type=bind,source=${input},target=/input,readonly`,
     '--mount', `type=bind,source=${artifacts},target=/output`,
     manifest.builder_image, '/input/build.sh'], { stdio: ['ignore', log, log] })

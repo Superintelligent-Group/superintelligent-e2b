@@ -13,3 +13,6 @@ Makefile text      eol=lf
 # A unified diff's blank context lines contain a required space. Its added-source
 # whitespace is checked by git apply --whitespace=error-all in the pinned build.
 third_party/firecracker-measurement/*.patch text eol=lf whitespace=-blank-at-eol
+third_party/firecracker-measurement/*.mjs text eol=lf
+third_party/firecracker-measurement/*.json text eol=lf
+specs/firecracker*.dfy text eol=lf

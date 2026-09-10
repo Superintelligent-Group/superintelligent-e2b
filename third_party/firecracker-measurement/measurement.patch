@@ -1,9 +1,9 @@
 diff --git a/docs/measurement-protocol.md b/docs/measurement-protocol.md
 new file mode 100644
-index 00000000..1c772d2b
+index 00000000..3bfe710f
 --- /dev/null
 +++ b/docs/measurement-protocol.md
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,141 @@
 +# Opt-in measurement emission (SUP-908)
 +
 +Based on e2b-dev/firecracker `431f1fc7d47f4cfe1dfe42437b9394f20972b65d`.
@@ -85,32 +85,110 @@ index 00000000..1c772d2b
 +SUP-907 still owns reader readiness, start boundary, network cutoff, joined
 +persistence and protected remote receipts. Neither a successful HTTP response
 +nor a changed reader pointer makes a complete measured window.
++
++
++## Irreversible runtime cutoff (SUP-909)
++
++`FinalizeMeasurement` is runtime-only and accepts the same `measurement` request
++object as `FlushMeasurement`. It requires the next fresh request sequence; a
++previous ordinary flush cannot be promoted into a terminal receipt. Malformed,
++uninitialized, legacy-mode, stale and exhausted requests fail before latching.
++
++The writer lock covers freshness validation, terminal identity reservation,
++irreversible VMM latch, vCPU pause acknowledgment and terminal serialization.
++The adapter retains control from the EventManager while paused or terminal. It
++never releases callbacks because a rejected Resume opcode was received. The VMM
++also rejects resume before kicking virtio devices. Once latched, pause failure,
++writer failure or response delivery failure cannot reopen execution; terminate
++the process after reconciliation. A failed pause acknowledgment is incomplete,
++including possible continued guest execution, even though device dispatch stays
++frozen.
++
++The successful API response is distinct:
++
++```json
++{"schema":"sig.fc-terminal-measurement.v1","cutoff":"last_completed_device_operation","measurement":{"schema":"sig.fc-measurement.v1","incarnation":"collector_epoch_1","attempt_sequence":4,"request_sequence":2,"request_id":"final_2","loss_detected":false}}
++```
++
++The corresponding stream frame retains `measurement` and `metrics`, adding
++`terminal_cutoff: "last_completed_device_operation"`. Exact terminal request
++replay returns the original success or error without pausing or serializing
++again. Other terminal identities conflict. Only terminal replay and instance,
++version and machine-configuration reads are allowed postterminal. Snapshots,
++device updates, MMDS changes, Pause, Resume and ordinary measurement flushes
++are rejected. The shared writer rejects all later emission attempts, including
++periodic and exit-related flush calls. A partial failed terminal write is not a
++successful final frame. Receipt delivery and collector durability remain separate.
++
++The cutoff covers counted operations completed before this API callback's
++pause acknowledgment; pending device callbacks, TAP traffic and guest queues are
++not drained. It makes no provider-billing, network-delivery or whole-lifetime
++claim. Measurement must be configured and a baseline established before admitted
++work. Process restart or restoring an older snapshot is a different incarnation;
++the latch is intentionally not a snapshot lifecycle protocol.
++
++Non-KVM regression cases exercise the actual writer finalization method, parser,
++HTTP response converter and adapter dispatch loop with injected state responses.
++The terminal allowlist is exercised directly. Explicit KVM/TUN tests exercise
++actual VMM paused/terminal state and rejected resume, a disconnected real
++VcpuHandle, and an attached activated net device with pending TX descriptors.
++The net test positively verifies that ordinary resume counts one frame, then
++terminal rejection preserves the pending second frame and byte count. These
++use `/dev/kvm`, `/dev/net/tun` and `CAP_NET_ADMIN`; they are ignored by default
++and must be explicitly run with the `kvm_terminal_measurement` filter and
++`--ignored`. This is complementary to the production dispatch-loop regression.
++The separately isolated `kvm_runtime_finalize_measurement_action_isolated` test
++configures global METRICS with a real temporary LineWriter and drives the actual
++runtime baseline, terminal action, replay and rejection paths, matching the
++terminal stream header to the API receipt. It must run alone with `--ignored`
++because it terminalizes the process-wide singleton. Its default VMM fixture has
++no running vCPU handles. A single integrated same-epoll-batch test and a booted guest's vCPU pause
++acknowledgment/live network cutoff remain open acceptance gates. No test-only
++VMM API is exported merely to cross the firecracker/vmm crate test boundary.
 diff --git a/src/firecracker/src/api_server/parsed_request.rs b/src/firecracker/src/api_server/parsed_request.rs
-index 478483e9..69c8e846 100644
+index 478483e9..cb042ab6 100644
 --- a/src/firecracker/src/api_server/parsed_request.rs
 +++ b/src/firecracker/src/api_server/parsed_request.rs
-@@ -181,6 +181,7 @@ impl ParsedRequest {
+@@ -181,6 +181,8 @@ impl ParsedRequest {
                      info!("The request was executed successfully. Status code: 204 No Content.");
                      Response::new(Version::Http11, StatusCode::NoContent)
                  }
 +                VmmData::Measurement(receipt) => Self::success_response_with_data(receipt),
++                VmmData::TerminalMeasurement(receipt) => Self::success_response_with_data(receipt),
                  VmmData::MachineConfiguration(machine_config) => {
                      Self::success_response_with_data(machine_config)
                  }
-@@ -599,6 +600,9 @@ pub mod tests {
+@@ -599,6 +601,12 @@ pub mod tests {
                      http_response(&serde_json::to_string(status).unwrap(), 200)
                  }
                  VmmData::Empty => http_response("", 204),
++                VmmData::TerminalMeasurement(receipt) => {
++                    http_response(&serde_json::to_string(receipt).unwrap(), 200)
++                }
 +                VmmData::Measurement(receipt) => {
 +                    http_response(&serde_json::to_string(receipt).unwrap(), 200)
 +                }
                  VmmData::FullVmConfig(cfg) => {
                      http_response(&serde_json::to_string(cfg).unwrap(), 200)
                  }
-@@ -640,6 +644,14 @@ pub mod tests {
+@@ -640,6 +648,28 @@ pub mod tests {
              ..Default::default()
          }));
          verify_ok_response_with(VmmData::Empty);
++        verify_ok_response_with(VmmData::TerminalMeasurement(
++            vmm::logger::TerminalMeasurementReceipt {
++                schema: "sig.fc-terminal-measurement.v1",
++                cutoff: "last_completed_device_operation",
++                measurement: vmm::logger::MeasurementReceipt {
++                    schema: "sig.fc-measurement.v1",
++                    incarnation: "epoch_1".into(),
++                    attempt_sequence: 3,
++                    request_sequence: Some(2),
++                    request_id: Some("final_2".into()),
++                    loss_detected: false,
++                },
++            },
++        ));
 +        verify_ok_response_with(VmmData::Measurement(vmm::logger::MeasurementReceipt {
 +            schema: "sig.fc-measurement.v1",
 +            incarnation: "epoch_1".into(),
@@ -123,7 +201,7 @@ index 478483e9..69c8e846 100644
          verify_ok_response_with(VmmData::MachineConfiguration(MachineConfig::default()));
          verify_ok_response_with(VmmData::MmdsValue(serde_json::from_str("{}").unwrap()));
 diff --git a/src/firecracker/src/api_server/request/actions.rs b/src/firecracker/src/api_server/request/actions.rs
-index a3b3f3f3..e5651bee 100644
+index a3b3f3f3..0f3ea4a4 100644
 --- a/src/firecracker/src/api_server/request/actions.rs
 +++ b/src/firecracker/src/api_server/request/actions.rs
 @@ -7,7 +7,6 @@ use vmm::rpc_interface::VmmAction;
@@ -134,15 +212,16 @@ index a3b3f3f3..e5651bee 100644
  use super::StatusCode;
  
  // The names of the members from this enum must precisely correspond (as a string) to the possible
-@@ -16,6 +15,7 @@ use super::StatusCode;
+@@ -16,6 +15,8 @@ use super::StatusCode;
  #[derive(Debug, Deserialize, Serialize)]
  enum ActionType {
      FlushMetrics,
 +    FlushMeasurement,
++    FinalizeMeasurement,
      InstanceStart,
      SendCtrlAltDel,
  }
-@@ -26,6 +26,20 @@ enum ActionType {
+@@ -26,6 +27,20 @@ enum ActionType {
  #[serde(deny_unknown_fields)]
  struct ActionBody {
      action_type: ActionType,
@@ -163,43 +242,67 @@ index a3b3f3f3..e5651bee 100644
  }
  
  pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestError> {
-@@ -34,7 +48,32 @@ pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestErr
+@@ -34,7 +49,35 @@ pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestErr
          METRICS.put_api_requests.actions_fails.inc();
      })?;
  
-+    if !matches!(action_body.action_type, ActionType::FlushMeasurement)
-+        && action_body.measurement.is_some()
++    if !matches!(
++        action_body.action_type,
++        ActionType::FlushMeasurement | ActionType::FinalizeMeasurement
++    ) && action_body.measurement.is_some()
 +    {
 +        METRICS.put_api_requests.actions_fails.inc();
 +        return Err(RequestError::Generic(
 +            StatusCode::BadRequest,
-+            "measurement is only valid for FlushMeasurement".into(),
++            "measurement is only valid for measurement actions".into(),
 +        ));
 +    }
      match action_body.action_type {
-+        ActionType::FlushMeasurement => {
++        ActionType::FlushMeasurement | ActionType::FinalizeMeasurement => {
 +            let request = action_body.measurement.ok_or_else(|| {
 +                METRICS.put_api_requests.actions_fails.inc();
 +                RequestError::Generic(
 +                    StatusCode::BadRequest,
-+                    "FlushMeasurement requires measurement identity".into(),
++                    "measurement action requires measurement identity".into(),
 +                )
 +            })?;
 +            request.validate().map_err(|error| {
 +                METRICS.put_api_requests.actions_fails.inc();
 +                RequestError::Generic(StatusCode::BadRequest, error.to_string())
 +            })?;
-+            Ok(ParsedRequest::new_sync(VmmAction::FlushMeasurement(
-+                request,
-+            )))
++            Ok(ParsedRequest::new_sync(match action_body.action_type {
++                ActionType::FinalizeMeasurement => VmmAction::FinalizeMeasurement(request),
++                _ => VmmAction::FlushMeasurement(request),
++            }))
 +        }
          ActionType::FlushMetrics => Ok(ParsedRequest::new_sync(VmmAction::FlushMetrics)),
          ActionType::InstanceStart => Ok(ParsedRequest::new_sync(VmmAction::StartMicroVm)),
          ActionType::SendCtrlAltDel => {
-@@ -55,6 +94,33 @@ pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestErr
+@@ -55,6 +98,54 @@ pub(crate) fn parse_put_actions(body: &Body) -> Result<ParsedRequest, RequestErr
  mod tests {
      use super::*;
  
++    #[test]
++    fn test_terminal_measurement_action() {
++        let json = r#"{"action_type":"FinalizeMeasurement","measurement":{"incarnation":"epoch_1","request_sequence":1,"request_id":"final_1"}}"#;
++        assert_eq!(
++            parse_put_actions(&Body::new(json)).unwrap(),
++            ParsedRequest::new_sync(VmmAction::FinalizeMeasurement(
++                vmm::logger::MeasurementRequest {
++                    incarnation: "epoch_1".into(),
++                    request_sequence: 1,
++                    request_id: "final_1".into(),
++                }
++            ))
++        );
++        for json in [
++            r#"{"action_type":"FinalizeMeasurement"}"#,
++            r#"{"action_type":"FinalizeMeasurement","measurement":null}"#,
++        ] {
++            assert!(parse_put_actions(&Body::new(json)).is_err());
++        }
++    }
++
 +    #[test]
 +    fn test_parse_measurement_action() {
 +        let json = r#"{"action_type":"FlushMeasurement","measurement":{"incarnation":"epoch_1","request_sequence":1,"request_id":"flush_1"}}"#;
@@ -242,6 +345,121 @@ index 054ece19..798b1c01 100644
          };
          assert_eq!(
              vmm_action_from_request(parse_put_metrics(&Body::new(body)).unwrap()),
+diff --git a/src/firecracker/src/api_server_adapter.rs b/src/firecracker/src/api_server_adapter.rs
+index f597a5f7..99bcb604 100644
+--- a/src/firecracker/src/api_server_adapter.rs
++++ b/src/firecracker/src/api_server_adapter.rs
+@@ -75,16 +75,20 @@ impl ApiServerAdapter {
+         }
+         Ok(())
+     }
+-
+-    fn handle_request(&mut self, req_action: VmmAction) {
+-        let response = self.controller.handle_request(req_action);
+-        // Send back the result.
+-        self.to_api
+-            .send(Box::new(response))
+-            .map_err(|_| ())
+-            .expect("one-shot channel closed");
++}
++// This function is the actual adapter dispatch loop, also exercised without KVM.
++// The handler's authoritative state controls return to EventManager; no opcode does.
++fn dispatch_until_running(
++    first: VmmAction,
++    receiver: &Receiver<ApiRequest>,
++    mut handle: impl FnMut(VmmAction) -> bool,
++) {
++    let mut request = first;
++    while handle(request) {
++        request = *receiver.recv().expect("Error receiving API request.");
+     }
+ }
++
+ impl MutEventSubscriber for ApiServerAdapter {
+     /// Handle a read event (EPOLLIN).
+     fn process(&mut self, event: Events, _: &mut EventOps) {
+@@ -95,26 +99,15 @@ impl MutEventSubscriber for ApiServerAdapter {
+             let _ = self.api_event_fd.read();
+             match self.from_api.try_recv() {
+                 Ok(api_request) => {
+-                    let request_is_pause = *api_request == VmmAction::Pause;
+-                    self.handle_request(*api_request);
+-
+-                    // If the latest req is a pause request, temporarily switch to a mode where we
+-                    // do blocking `recv`s on the `from_api` receiver in a loop, until we get
+-                    // unpaused. The device emulation is implicitly paused since we do not
+-                    // relinquish control to the event manager because we're not returning from
+-                    // `process`.
+-                    if request_is_pause {
+-                        // This loop only attempts to process API requests, so things like the
+-                        // metric flush timerfd handling are frozen as well.
+-                        loop {
+-                            let req = self.from_api.recv().expect("Error receiving API request.");
+-                            let req_is_resume = *req == VmmAction::Resume;
+-                            self.handle_request(*req);
+-                            if req_is_resume {
+-                                break;
+-                            }
+-                        }
+-                    }
++                    let controller = &mut self.controller;
++                    let to_api = &self.to_api;
++                    dispatch_until_running(*api_request, &self.from_api, |request| {
++                        let response = controller.handle_request(request);
++                        to_api
++                            .send(Box::new(response))
++                            .expect("one-shot channel closed");
++                        controller.requires_api_only()
++                    });
+                 }
+                 Err(TryRecvError::Empty) => {
+                     warn!("Got a spurious notification from api thread");
+@@ -256,3 +249,45 @@ pub(crate) fn run_with_api(
+ 
+     result
+ }
++
++#[cfg(test)]
++mod terminal_tests {
++    use super::*;
++
++    #[test]
++    fn terminal_dispatch_rejected_resume_does_not_release_event_manager() {
++        let (tx, rx) = channel();
++        tx.send(Box::new(VmmAction::Resume)).unwrap();
++        tx.send(Box::new(VmmAction::GetVmmVersion)).unwrap();
++        drop(tx);
++        let mut observed = Vec::new();
++        // Channel disconnect is the production fail-stop, not a normal loop exit.
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            dispatch_until_running(VmmAction::Pause, &rx, |request| {
++                observed.push(request);
++                true // terminal state survives every response, including rejected Resume
++            });
++        }));
++        assert!(result.is_err());
++        assert_eq!(
++            observed,
++            vec![
++                VmmAction::Pause,
++                VmmAction::Resume,
++                VmmAction::GetVmmVersion
++            ]
++        );
++    }
++
++    #[test]
++    fn terminal_dispatch_ordinary_successful_resume_returns() {
++        let (tx, rx) = channel();
++        tx.send(Box::new(VmmAction::Resume)).unwrap();
++        let mut count = 0;
++        dispatch_until_running(VmmAction::Pause, &rx, |request| {
++            count += 1;
++            request != VmmAction::Resume // successful ordinary resume changes authoritative state
++        });
++        assert_eq!(count, 2);
++    }
++}
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
 index 73921499..fc5a5c53 100644
 --- a/src/firecracker/src/main.rs
@@ -255,29 +473,44 @@ index 73921499..fc5a5c53 100644
          init_metrics(metrics_config).map_err(MainError::MetricsInitialization)?;
      }
 diff --git a/src/firecracker/swagger/firecracker.yaml b/src/firecracker/swagger/firecracker.yaml
-index 6fab5b3e..415cfb6b 100644
+index 6fab5b3e..becf79f2 100644
 --- a/src/firecracker/swagger/firecracker.yaml
 +++ b/src/firecracker/swagger/firecracker.yaml
-@@ -49,6 +49,10 @@ paths:
+@@ -49,6 +49,11 @@ paths:
            schema:
              $ref: "#/definitions/InstanceActionInfo"
        responses:
 +        200:
-+          description: Correlated measurement frame emitted; not collector persistence.
++          description: Correlated emission; not collector persistence.
 +          schema:
-+            $ref: "#/definitions/MeasurementReceipt"
++            type: object
++            description: MeasurementReceipt for FlushMeasurement; TerminalMeasurementReceipt for FinalizeMeasurement. Swagger 2 cannot express this response union.
          204:
            description: The update was successful
          400:
-@@ -1359,8 +1363,45 @@ definitions:
+@@ -1359,8 +1364,59 @@ definitions:
          type: string
          enum:
            - FlushMetrics
 +          - FlushMeasurement
++          - FinalizeMeasurement
            - InstanceStart
            - SendCtrlAltDel
 +      measurement:
 +        $ref: "#/definitions/MeasurementRequest"
++
++  TerminalMeasurementReceipt:
++    type: object
++    required: [schema, cutoff, measurement]
++    properties:
++      schema:
++        type: string
++        enum: [sig.fc-terminal-measurement.v1]
++      cutoff:
++        type: string
++        enum: [last_completed_device_operation]
++      measurement:
++        $ref: "#/definitions/MeasurementReceipt"
 +
 +  MeasurementRequest:
 +    type: object
@@ -315,7 +548,7 @@ index 6fab5b3e..415cfb6b 100644
  
    InstanceInfo:
      type: object
-@@ -1560,6 +1601,10 @@ definitions:
+@@ -1560,6 +1616,10 @@ definitions:
        metrics_path:
          type: string
          description: Path to the named pipe or file where the JSON-formatted metrics are flushed.
@@ -326,12 +559,138 @@ index 6fab5b3e..415cfb6b 100644
  
    MmdsConfig:
      type: object
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index 15be9488..82ac15c2 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -312,6 +312,7 @@ pub fn build_microvm_for_boot(
+     let vmm = Vmm {
+         instance_info: instance_info.clone(),
+         shutdown_exit_code: None,
++        measurement_terminal: false,
+         kvm,
+         vm,
+         uffd: None,
+@@ -519,6 +520,7 @@ pub fn build_microvm_from_snapshot(
+     let mut vmm = Vmm {
+         instance_info: instance_info.clone(),
+         shutdown_exit_code: None,
++        measurement_terminal: false,
+         kvm,
+         vm,
+         uffd,
+@@ -839,6 +841,7 @@ pub(crate) mod tests {
+         Vmm {
+             instance_info: InstanceInfo::default(),
+             shutdown_exit_code: None,
++            measurement_terminal: false,
+             kvm,
+             vm: Arc::new(vm),
+             uffd: None,
+@@ -1059,6 +1062,45 @@ pub(crate) mod tests {
+         );
+     }
+ 
++    #[test]
++    #[ignore = "requires /dev/kvm, /dev/net/tun and CAP_NET_ADMIN"]
++    fn kvm_terminal_measurement_pending_net_queue_not_kicked() {
++        use crate::devices::virtio::net::test_utils::{NetQueue, test::TestHelper};
++        use crate::logger::IncMetric;
++        let mem = crate::test_utils::single_region_mem(65536);
++        let mut helper = TestHelper::get_default(&mem);
++        let mut vmm = default_vmm();
++        let mut event_manager = EventManager::new().unwrap();
++        attach_net_devices(
++            &mut vmm.device_manager,
++            &vmm.vm,
++            &mut default_kernel_cmdline(),
++            std::iter::once(&helper.net),
++            &mut event_manager,
++        )
++        .unwrap();
++        helper.activate_net();
++        helper.add_desc_chain(NetQueue::Tx, 0, &[(0, 300, 0)]);
++        helper.write_tx_frame(&[(0, 300, 0)], 300);
++        // Positive control: ordinary resume kicks the actual attached net device.
++        vmm.resume_vm().unwrap();
++        assert_eq!(helper.txq.used.idx.get(), 1);
++        let counted = helper.net().metrics.tx_bytes_count.count();
++        assert!(counted > 0);
++        vmm.pause_vm().unwrap();
++        helper.add_desc_chain(NetQueue::Tx, 500, &[(1, 300, 0)]);
++        helper.write_tx_frame(&[(1, 300, 0)], 300);
++        vmm.latch_measurement_and_pause().unwrap();
++        assert!(matches!(
++            vmm.resume_vm(),
++            Err(crate::VmmError::MeasurementTerminal)
++        ));
++        assert_eq!(helper.txq.used.idx.get(), 1);
++        assert_eq!(helper.net().metrics.tx_bytes_count.count(), counted);
++        // The second descriptor remains pending: terminal semantics do not drain it.
++        assert_eq!(helper.txq.avail.idx.get(), 2);
++    }
++
+     #[test]
+     fn test_attach_net_devices() {
+         let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 2f4bde48..722eae57 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -204,6 +204,8 @@ pub const HTTP_MAX_PAYLOAD_SIZE: usize = 51200;
+ /// have permissions to open the KVM fd).
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+ pub enum VmmError {
++    /// Terminal measurement latch prohibits resuming the microVM.
++    MeasurementTerminal,
+     #[cfg(target_arch = "aarch64")]
+     /// Invalid command line error.
+     Cmdline,
+@@ -303,6 +305,7 @@ pub struct Vmm {
+     /// The [`InstanceInfo`] state of this [`Vmm`].
+     pub instance_info: InstanceInfo,
+     shutdown_exit_code: Option<FcExitCode>,
++    measurement_terminal: bool,
+ 
+     // Guest VM core resources.
+     kvm: Kvm,
+@@ -385,6 +388,9 @@ impl Vmm {
+ 
+     /// Sends a resume command to the vCPUs.
+     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
++        if self.measurement_terminal {
++            return Err(VmmError::MeasurementTerminal);
++        }
+         self.device_manager.kick_virtio_devices();
+ 
+         // Send the events.
+@@ -407,6 +413,20 @@ impl Vmm {
+         Ok(())
+     }
+ 
++    /// Irreversibly latch before pause; a failed acknowledgment remains terminal.
++    pub fn latch_measurement_and_pause(&mut self) -> Result<(), VmmError> {
++        self.measurement_terminal = true;
++        if self.instance_info.state == VmState::Paused {
++            return Ok(());
++        }
++        self.pause_vm()
++    }
++
++    /// Whether device dispatch and resume must remain prohibited.
++    pub fn measurement_terminal(&self) -> bool {
++        self.measurement_terminal
++    }
++
+     /// Sends a pause command to the vCPUs.
+     pub fn pause_vm(&mut self) -> Result<(), VmmError> {
+         // Send the events.
 diff --git a/src/vmm/src/logger/measurement.rs b/src/vmm/src/logger/measurement.rs
 new file mode 100644
-index 00000000..f6cf1350
+index 00000000..eca1b5de
 --- /dev/null
 +++ b/src/vmm/src/logger/measurement.rs
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,706 @@
 +// Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -371,6 +730,17 @@ index 00000000..f6cf1350
 +    pub loss_detected: bool,
 +}
 +
++/// Irreversible runtime cutoff and its correlated emission; not durable custody.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++pub struct TerminalMeasurementReceipt {
++    /// Distinct terminal protocol schema.
++    pub schema: &'static str,
++    /// Counts end at the last completed device operation, without draining queues.
++    pub cutoff: &'static str,
++    /// Exact emitted metrics header.
++    pub measurement: MeasurementReceipt,
++}
++
 +/// Token syntax is deliberately bounded and unambiguous on the wire.
 +pub fn valid_measurement_token(token: &str) -> bool {
 +    !token.is_empty()
@@ -407,6 +777,10 @@ index 00000000..f6cf1350
 +pub(super) struct MetricsSink<M> {
 +    pub writer: M,
 +    pub measurement: Option<MeasurementState>,
++    terminal: Option<(
++        MeasurementRequest,
++        Result<TerminalMeasurementReceipt, String>,
++    )>,
 +}
 +
 +impl<M: Write> MetricsSink<M> {
@@ -420,6 +794,7 @@ index 00000000..f6cf1350
 +            ));
 +        }
 +        Ok(Self {
++            terminal: None,
 +            writer,
 +            measurement: incarnation.map(|incarnation| MeasurementState {
 +                incarnation,
@@ -434,6 +809,71 @@ index 00000000..f6cf1350
 +        &mut self,
 +        metrics: &T,
 +        request: Option<&MeasurementRequest>,
++    ) -> Result<MeasurementReceipt, MetricsError> {
++        if self.terminal.is_some() {
++            return Err(MetricsError::Measurement(
++                "measurement stream is terminal".into(),
++            ));
++        }
++        self.emit_inner(metrics, request, false)
++    }
++
++    pub fn finalize<T: Serialize, F: FnOnce() -> Result<(), String>>(
++        &mut self,
++        metrics: &T,
++        request: &MeasurementRequest,
++        pause: F,
++    ) -> Result<TerminalMeasurementReceipt, MetricsError> {
++        if let Some((last, result)) = &self.terminal {
++            return if last == request {
++                result.clone().map_err(MetricsError::Measurement)
++            } else {
++                Err(MetricsError::Measurement(
++                    "terminal request conflict".into(),
++                ))
++            };
++        }
++        request.validate()?;
++        let state = self
++            .measurement
++            .as_ref()
++            .ok_or_else(|| MetricsError::Measurement("measurement mode not configured".into()))?;
++        let previous = state
++            .last_request
++            .as_ref()
++            .map_or(0, |(last, _)| last.request_sequence);
++        if request.incarnation != state.incarnation
++            || previous.checked_add(1) != Some(request.request_sequence)
++            || state.attempt_sequence == u64::MAX
++        {
++            return Err(MetricsError::Measurement(
++                "terminal request must be fresh and emit-capable".into(),
++            ));
++        }
++        // Reserve the terminal identity while holding the writer lock. A panic or
++        // failed pause can never make this stream available for fresh attempts.
++        self.terminal = Some((
++            request.clone(),
++            Err("terminal operation interrupted".into()),
++        ));
++        let result = pause().and_then(|()| {
++            self.emit_inner(metrics, Some(request), true)
++                .map(|measurement| TerminalMeasurementReceipt {
++                    schema: "sig.fc-terminal-measurement.v1",
++                    cutoff: "last_completed_device_operation",
++                    measurement,
++                })
++                .map_err(|error| error.to_string())
++        });
++        self.terminal = Some((request.clone(), result.clone()));
++        result.map_err(MetricsError::Measurement)
++    }
++
++    fn emit_inner<T: Serialize>(
++        &mut self,
++        metrics: &T,
++        request: Option<&MeasurementRequest>,
++        terminal: bool,
 +    ) -> Result<MeasurementReceipt, MetricsError> {
 +        let state = self
 +            .measurement
@@ -478,12 +918,15 @@ index 00000000..f6cf1350
 +            struct Frame<'a, T> {
 +                measurement: &'a MeasurementReceipt,
 +                metrics: &'a T,
++                #[serde(skip_serializing_if = "Option::is_none")]
++                terminal_cutoff: Option<&'static str>,
 +            }
 +            // Serialize exactly once. SharedIncMetric advances baselines during
 +            // serialization; any error permanently disqualifies this window.
 +            let mut bytes = serde_json::to_vec(&Frame {
 +                measurement: &receipt,
 +                metrics,
++                terminal_cutoff: terminal.then_some("last_completed_device_operation"),
 +            })
 +            .map_err(|error| format!("measurement serialization failed: {error}"))?;
 +            if bytes.len() > 1024 * 1024 {
@@ -555,6 +998,173 @@ index 00000000..f6cf1350
 +    #[derive(Debug, Default, Serialize)]
 +    struct Counters {
 +        bytes: SharedIncMetric,
++    }
++
++    #[test]
++    fn terminal_measurement_freshness_and_exact_replay() {
++        let metrics = Metrics::new(Counters::default());
++        let writer = TestWriter::default();
++        metrics
++            .init_with_measurement(writer.clone(), Some("epoch_1".into()))
++            .unwrap();
++        metrics.flush_measurement(&request(1)).unwrap();
++        for invalid in [
++            request(1),
++            request(3),
++            MeasurementRequest {
++                incarnation: "other".into(),
++                ..request(2)
++            },
++        ] {
++            assert!(
++                metrics
++                    .finalize_measurement(&invalid, || panic!("invalid request latched"))
++                    .is_err()
++            );
++        }
++        metrics.bytes.add(9);
++        let receipt = metrics
++            .finalize_measurement(&request(2), || Ok(()))
++            .unwrap();
++        assert_eq!(receipt.cutoff, "last_completed_device_operation");
++        assert_eq!(receipt.measurement.attempt_sequence, 2);
++        let before = writer.0.lock().unwrap().bytes.clone();
++        let frame: serde_json::Value =
++            serde_json::from_slice(before.split(|b| *b == b'\n').nth(1).unwrap()).unwrap();
++        assert_eq!(frame["terminal_cutoff"], receipt.cutoff);
++        assert_eq!(
++            frame["measurement"],
++            serde_json::to_value(&receipt.measurement).unwrap()
++        );
++        assert_eq!(frame["metrics"]["bytes"], 9);
++        assert_eq!(
++            metrics
++                .finalize_measurement(&request(2), || panic!("replay paused again"))
++                .unwrap(),
++            receipt
++        );
++        assert!(
++            metrics
++                .finalize_measurement(&request(3), || panic!("conflict paused"))
++                .is_err()
++        );
++        assert!(metrics.flush_measurement(&request(2)).is_err());
++        assert!(metrics.write().is_err()); // includes periodic and fatal-signal attempts
++        assert_eq!(writer.0.lock().unwrap().bytes, before);
++    }
++
++    #[test]
++    fn terminal_measurement_racing_periodic_writer_cannot_emit_after_cutoff() {
++        for _ in 0..20 {
++            let metrics = Arc::new(Metrics::new(Counters::default()));
++            let writer = TestWriter::default();
++            metrics
++                .init_with_measurement(writer.clone(), Some("epoch_1".into()))
++                .unwrap();
++            metrics.bytes.add(17);
++            let barrier = Arc::new(std::sync::Barrier::new(2));
++            let other_metrics = metrics.clone();
++            let other_barrier = barrier.clone();
++            let periodic = std::thread::spawn(move || {
++                other_barrier.wait();
++                other_metrics.write()
++            });
++            barrier.wait();
++            let receipt = metrics
++                .finalize_measurement(&request(1), || Ok(()))
++                .unwrap();
++            let periodic_ok = periodic.join().unwrap().is_ok();
++            let bytes = writer.0.lock().unwrap().bytes.clone();
++            let frames: Vec<serde_json::Value> = bytes
++                .split(|b| *b == b'\n')
++                .filter(|line| !line.is_empty())
++                .map(|line| serde_json::from_slice(line).unwrap())
++                .collect();
++            assert_eq!(frames.len(), if periodic_ok { 2 } else { 1 });
++            assert_eq!(
++                frames.last().unwrap()["measurement"],
++                serde_json::to_value(receipt.measurement).unwrap()
++            );
++            assert_eq!(
++                frames.last().unwrap()["terminal_cutoff"],
++                "last_completed_device_operation"
++            );
++            assert_eq!(
++                frames
++                    .iter()
++                    .map(|frame| frame["metrics"]["bytes"].as_u64().unwrap())
++                    .sum::<u64>(),
++                17
++            );
++            assert!(metrics.write().is_err());
++            assert_eq!(writer.0.lock().unwrap().bytes, bytes);
++        }
++    }
++
++    #[test]
++    fn terminal_measurement_failed_pause_or_sink_is_irreversible() {
++        for pause_fails in [false, true] {
++            let metrics = Metrics::new(Counters::default());
++            let writer = TestWriter::default();
++            writer.0.lock().unwrap().fail_flush = !pause_fails;
++            metrics
++                .init_with_measurement(writer.clone(), Some("epoch_1".into()))
++                .unwrap();
++            let mut latched = false;
++            let error = metrics
++                .finalize_measurement(&request(1), || {
++                    latched = true;
++                    if pause_fails {
++                        Err("pause acknowledgment uncertain".into())
++                    } else {
++                        Ok(())
++                    }
++                })
++                .unwrap_err()
++                .to_string();
++            assert!(latched);
++            let before = writer.0.lock().unwrap().bytes.clone();
++            writer.0.lock().unwrap().fail_flush = false;
++            assert_eq!(
++                metrics
++                    .finalize_measurement(&request(1), || panic!("retry attempted pause"))
++                    .unwrap_err()
++                    .to_string(),
++                error
++            );
++            assert!(
++                metrics
++                    .finalize_measurement(&request(2), || panic!("new terminal attempt"))
++                    .is_err()
++            );
++            assert!(metrics.write().is_err());
++            assert_eq!(writer.0.lock().unwrap().bytes, before);
++        }
++    }
++
++    #[test]
++    fn terminal_measurement_uninitialized_legacy_and_overflow_never_latch() {
++        let metrics = Metrics::<Counters, TestWriter>::new(Counters::default());
++        assert!(
++            metrics
++                .finalize_measurement(&request(1), || panic!("uninitialized latch"))
++                .is_err()
++        );
++        metrics.init(TestWriter::default()).unwrap();
++        assert!(
++            metrics
++                .finalize_measurement(&request(1), || panic!("legacy latch"))
++                .is_err()
++        );
++        let mut sink = MetricsSink::new(TestWriter::default(), Some("epoch_1".into())).unwrap();
++        sink.measurement.as_mut().unwrap().attempt_sequence = u64::MAX;
++        assert!(
++            sink.finalize(&Counters::default(), &request(1), || panic!(
++                "overflow latch"
++            ))
++            .is_err()
++        );
++        assert!(sink.terminal.is_none());
 +    }
 +
 +    #[test]
@@ -788,19 +1398,21 @@ index 00000000..f6cf1350
 +    }
 +}
 diff --git a/src/vmm/src/logger/metrics.rs b/src/vmm/src/logger/metrics.rs
-index 2bd7330c..4f3e3cc9 100644
+index 2bd7330c..4a5378f9 100644
 --- a/src/vmm/src/logger/metrics.rs
 +++ b/src/vmm/src/logger/metrics.rs
-@@ -67,6 +67,8 @@ use std::ops::Deref;
+@@ -67,6 +67,10 @@ use std::ops::Deref;
  use std::sync::atomic::{AtomicU64, Ordering};
  use std::sync::{Mutex, OnceLock};
  
-+use super::measurement::{MeasurementReceipt, MeasurementRequest, MetricsSink};
++use super::measurement::{
++    MeasurementReceipt, MeasurementRequest, MetricsSink, TerminalMeasurementReceipt,
++};
 +
  use serde::{Serialize, Serializer};
  use utils::time::{ClockType, get_time_ns, get_time_us};
  
-@@ -91,7 +93,7 @@ pub static METRICS: Metrics<FirecrackerMetrics, FcLineWriter> =
+@@ -91,7 +95,7 @@ pub static METRICS: Metrics<FirecrackerMetrics, FcLineWriter> =
  #[derive(Debug)]
  pub struct Metrics<T: Serialize, M: Write + Send> {
      // Metrics will get flushed here.
@@ -809,7 +1421,7 @@ index 2bd7330c..4f3e3cc9 100644
      pub app_metrics: T,
  }
  
-@@ -117,8 +119,17 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
+@@ -117,8 +121,17 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
      ///
      /// * `metrics_dest` - Buffer for JSON formatted metrics. Needs to implement `Write` and `Send`.
      pub fn init(&self, metrics_dest: M) -> Result<(), MetricsError> {
@@ -828,7 +1440,7 @@ index 2bd7330c..4f3e3cc9 100644
              .map_err(|_| MetricsError::AlreadyInitialized)
      }
  
-@@ -143,7 +154,11 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
+@@ -143,7 +156,11 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
      /// known deadlock potential.
      pub fn write(&self) -> Result<bool, MetricsError> {
          if let Some(lock) = self.metrics_buf.get() {
@@ -841,10 +1453,25 @@ index 2bd7330c..4f3e3cc9 100644
              serde_json::to_writer(writer.by_ref(), &self.app_metrics)
                  .map_err(|err| MetricsError::Serde(err.to_string()))?;
              writer.write_all(b"\n").map_err(MetricsError::Write)?;
-@@ -154,6 +169,18 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
+@@ -154,6 +171,33 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
              Ok(false)
          }
      }
++    /// Validate freshness, latch/pause runtime, and emit under one writer lock.
++    /// Failure after calling pause is irreversible and cached; no drain is promised.
++    pub fn finalize_measurement<F: FnOnce() -> Result<(), String>>(
++        &self,
++        request: &MeasurementRequest,
++        pause: F,
++    ) -> Result<TerminalMeasurementReceipt, MetricsError> {
++        let lock = self.metrics_buf.get().ok_or_else(|| {
++            MetricsError::NeverInitialized("measurement metrics not initialized".into())
++        })?;
++        lock.lock()
++            .map_err(|_| MetricsError::Measurement("measurement writer poisoned".into()))?
++            .finalize(&self.app_metrics, request, pause)
++    }
++
 +    /// Emit or replay the exact requested frame; uninitialized metrics are an error.
 +    pub fn flush_measurement(
 +        &self,
@@ -860,7 +1487,7 @@ index 2bd7330c..4f3e3cc9 100644
  }
  
  impl<T: Serialize + Debug, M: Write + Send + Debug> Deref for Metrics<T, M> {
-@@ -169,6 +196,8 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Deref for Metrics<T, M> {
+@@ -169,6 +213,8 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Deref for Metrics<T, M> {
  pub enum MetricsError {
      /// {0}
      NeverInitialized(String),
@@ -870,7 +1497,7 @@ index 2bd7330c..4f3e3cc9 100644
      AlreadyInitialized,
      /// {0}
 diff --git a/src/vmm/src/logger/mod.rs b/src/vmm/src/logger/mod.rs
-index 4bbbf9e1..82dc6bdd 100644
+index 4bbbf9e1..59654733 100644
 --- a/src/vmm/src/logger/mod.rs
 +++ b/src/vmm/src/logger/mod.rs
 @@ -5,6 +5,7 @@
@@ -881,28 +1508,32 @@ index 4bbbf9e1..82dc6bdd 100644
  mod metrics;
  
  pub use log::{Level, debug, error, info, log_enabled, trace, warn};
-@@ -12,6 +13,7 @@ pub use logging::{
+@@ -12,6 +13,9 @@ pub use logging::{
      DEFAULT_INSTANCE_ID, DEFAULT_LEVEL, INSTANCE_ID, LOGGER, LevelFilter, LevelFilterFromStrError,
      LoggerConfig, LoggerInitError, LoggerUpdateError,
  };
-+pub use measurement::{MeasurementReceipt, MeasurementRequest, valid_measurement_token};
++pub use measurement::{
++    MeasurementReceipt, MeasurementRequest, TerminalMeasurementReceipt, valid_measurement_token,
++};
  pub use metrics::{
      IncMetric, LatencyAggregateMetrics, METRICS, MetricsError, ProcessTimeReporter,
      SharedIncMetric, SharedStoreMetric, StoreMetric,
 diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
-index a3fe8f74..bdf20c11 100644
+index a3fe8f74..26f12109 100644
 --- a/src/vmm/src/rpc_interface.rs
 +++ b/src/vmm/src/rpc_interface.rs
-@@ -79,6 +79,8 @@ pub enum VmmAction {
+@@ -79,6 +79,10 @@ pub enum VmmAction {
      GetVmmVersion,
      /// Flush the metrics. This action can only be called after the logger has been configured.
      FlushMetrics,
 +    /// Correlated opt-in measurement flush; also available before boot for baseline capture.
 +    FlushMeasurement(crate::logger::MeasurementRequest),
++    /// Irreversibly freeze device dispatch and emit a distinct terminal receipt.
++    FinalizeMeasurement(crate::logger::MeasurementRequest),
      /// Add a new block device or update one that already exists using the `BlockDeviceConfig` as
      /// input. This action can only be called before the microVM has booted.
      InsertBlockDevice(BlockDeviceConfig),
-@@ -155,6 +157,16 @@ pub enum VmmAction {
+@@ -155,6 +159,16 @@ pub enum VmmAction {
      GetMemoryDirty,
  }
  
@@ -919,16 +1550,18 @@ index a3fe8f74..bdf20c11 100644
  /// Wrapper for all errors associated with VMM actions.
  #[derive(Debug, thiserror::Error, displaydoc::Display)]
  pub enum VmmActionError {
-@@ -223,6 +235,8 @@ pub enum VmmData {
+@@ -223,6 +237,10 @@ pub enum VmmData {
      BalloonStats(BalloonStats),
      /// No data is sent on the channel.
      Empty,
 +    /// Receipt for the exact fully emitted measurement frame, not collector persistence.
 +    Measurement(crate::logger::MeasurementReceipt),
++    /// Terminal cutoff receipt, not queue drainage or durable persistence.
++    TerminalMeasurement(crate::logger::TerminalMeasurementReceipt),
      /// The complete microVM configuration in JSON format.
      FullVmConfig(VmmConfig),
      /// The microVM configuration represented by `VmConfig`.
-@@ -457,6 +471,7 @@ impl<'a> PrebootApiController<'a> {
+@@ -457,6 +475,7 @@ impl<'a> PrebootApiController<'a> {
                  .update(logger_cfg)
                  .map(|()| VmmData::Empty)
                  .map_err(VmmActionError::Logger),
@@ -936,15 +1569,78 @@ index a3fe8f74..bdf20c11 100644
              ConfigureMetrics(metrics_cfg) => vmm_config::metrics::init_metrics(metrics_cfg)
                  .map(|()| VmmData::Empty)
                  .map_err(VmmActionError::Metrics),
-@@ -707,6 +722,7 @@ impl RuntimeApiController {
+@@ -499,6 +518,7 @@ impl<'a> PrebootApiController<'a> {
+             // Operations not allowed pre-boot.
+             CreateSnapshot(_)
+             | FlushMetrics
++            | FinalizeMeasurement(_)
+             | Pause
+             | Resume
+             | GetBalloonStats
+@@ -684,6 +704,17 @@ impl<'a> PrebootApiController<'a> {
+     }
+ }
+ 
++// Deny by default, including all snapshot, metrics, device and resume actions.
++fn allowed_after_terminal(request: &VmmAction) -> bool {
++    matches!(
++        request,
++        VmmAction::FinalizeMeasurement(_)
++            | VmmAction::GetVmInstanceInfo
++            | VmmAction::GetVmmVersion
++            | VmmAction::GetVmMachineConfig
++    )
++}
++
+ /// Enables RPC interaction with a running Firecracker VMM.
+ #[derive(Debug)]
+ pub struct RuntimeApiController {
+@@ -703,10 +734,31 @@ impl RuntimeApiController {
+     /// Handles the incoming runtime `VmmAction` request and provides a response for it.
+     pub fn handle_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
+         use self::VmmAction::*;
++        if self
++            .vmm
++            .lock()
++            .expect("Poisoned lock")
++            .measurement_terminal()
++            && !allowed_after_terminal(&request)
++        {
++            return Err(VmmActionError::InternalVmm(VmmError::MeasurementTerminal));
++        }
+         match request {
              // Supported operations allowed post-boot.
              CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
              FlushMetrics => self.flush_metrics(),
++            FinalizeMeasurement(request) => METRICS
++                .finalize_measurement(&request, || {
++                    self.vmm
++                        .lock()
++                        .expect("Poisoned lock")
++                        .latch_measurement_and_pause()
++                        .map_err(|error| format!("terminal pause failed: {error}"))
++                })
++                .map(VmmData::TerminalMeasurement)
++                .map_err(super::VmmError::Metrics)
++                .map_err(VmmActionError::InternalVmm),
 +            FlushMeasurement(request) => measurement_flush_response(&request),
              GetBalloonConfig => self
                  .vmm
                  .lock()
-@@ -1274,6 +1290,20 @@ mod tests {
+@@ -812,6 +864,12 @@ impl RuntimeApiController {
+         }
+     }
+ 
++    /// Keep EventManager callbacks frozen after pause or any terminal attempt.
++    pub fn requires_api_only(&self) -> bool {
++        let vmm = self.vmm.lock().expect("Poisoned lock");
++        vmm.measurement_terminal() || vmm.instance_info.state == VmState::Paused
++    }
++
+     /// Creates a new `RuntimeApiController`.
+     pub fn new(vm_resources: VmResources, vmm: Arc<Mutex<Vmm>>) -> Self {
+         Self { vmm, vm_resources }
+@@ -1274,6 +1332,20 @@ mod tests {
          );
      }
  
@@ -965,7 +1661,175 @@ index a3fe8f74..bdf20c11 100644
      #[test]
      fn test_preboot_disallowed() {
          fn check_unsupported(res: Result<VmmData, VmmActionError>) {
-@@ -1377,6 +1407,7 @@ mod tests {
+@@ -1327,6 +1399,167 @@ mod tests {
+         )));
+     }
+ 
++    #[test]
++    fn terminal_measurement_allowlist_and_preboot_rejection() {
++        for request in [
++            VmmAction::Resume,
++            VmmAction::Pause,
++            VmmAction::FlushMetrics,
++            VmmAction::GetFullVmConfig,
++            VmmAction::GetMMDS,
++            VmmAction::FlushMeasurement(crate::logger::MeasurementRequest {
++                incarnation: "epoch_1".into(),
++                request_sequence: 1,
++                request_id: "ordinary".into(),
++            }),
++        ] {
++            assert!(!allowed_after_terminal(&request));
++        }
++        for request in [
++            VmmAction::GetVmInstanceInfo,
++            VmmAction::GetVmmVersion,
++            VmmAction::GetVmMachineConfig,
++        ] {
++            assert!(allowed_after_terminal(&request));
++        }
++        assert!(matches!(
++            preboot_request(VmmAction::FinalizeMeasurement(
++                crate::logger::MeasurementRequest {
++                    incarnation: "epoch_1".into(),
++                    request_sequence: 1,
++                    request_id: "final".into(),
++                },
++            )),
++            Err(VmmActionError::OperationNotSupportedPreBoot)
++        ));
++    }
++
++    #[test]
++    #[ignore = "requires /dev/kvm and its own test process: terminalizes global METRICS"]
++    fn kvm_runtime_finalize_measurement_action_isolated() {
++        use crate::logger::{FcLineWriter, MeasurementRequest};
++        use vmm_sys_util::tempfile::TempFile;
++        let file = TempFile::new().unwrap();
++        METRICS
++            .init_with_measurement(
++                FcLineWriter::new(file.as_file().try_clone().unwrap()),
++                Some("runtime_epoch".into()),
++            )
++            .unwrap();
++        let shared = Arc::new(Mutex::new(default_vmm()));
++        // This fixture has no running vCPU handles; booted-guest acknowledgment
++        // remains a separate gate despite exercising the actual runtime action.
++        shared.lock().unwrap().resume_vm().unwrap();
++        let mut runtime = RuntimeApiController::new(VmResources::default(), shared.clone());
++        assert!(!runtime.requires_api_only());
++        let baseline = MeasurementRequest {
++            incarnation: "runtime_epoch".into(),
++            request_sequence: 1,
++            request_id: "baseline".into(),
++        };
++        assert!(matches!(
++            runtime
++                .handle_request(VmmAction::FlushMeasurement(baseline.clone()))
++                .unwrap(),
++            VmmData::Measurement(_)
++        ));
++        // Ordinary cached receipt must never become a terminal receipt.
++        assert!(
++            runtime
++                .handle_request(VmmAction::FinalizeMeasurement(baseline))
++                .is_err()
++        );
++        assert!(!shared.lock().unwrap().measurement_terminal());
++        assert!(!runtime.requires_api_only());
++        let final_request = MeasurementRequest {
++            incarnation: "runtime_epoch".into(),
++            request_sequence: 2,
++            request_id: "final".into(),
++        };
++        let VmmData::TerminalMeasurement(receipt) = runtime
++            .handle_request(VmmAction::FinalizeMeasurement(final_request.clone()))
++            .unwrap()
++        else {
++            panic!("expected distinct terminal receipt");
++        };
++        assert!(shared.lock().unwrap().measurement_terminal());
++        assert_eq!(shared.lock().unwrap().instance_info.state, VmState::Paused);
++        assert!(runtime.requires_api_only());
++        let before = std::fs::read(file.as_path()).unwrap();
++        let frames: Vec<serde_json::Value> = before
++            .split(|byte| *byte == b'\n')
++            .filter(|line| !line.is_empty())
++            .map(|line| serde_json::from_slice(line).unwrap())
++            .collect();
++        assert_eq!(frames.len(), 2);
++        assert!(frames[0].get("terminal_cutoff").is_none());
++        assert_eq!(frames[1]["terminal_cutoff"], receipt.cutoff);
++        assert_eq!(
++            frames[1]["measurement"],
++            serde_json::to_value(&receipt.measurement).unwrap()
++        );
++        assert_eq!(receipt.schema, "sig.fc-terminal-measurement.v1");
++        assert_eq!(receipt.measurement.request_id.as_deref(), Some("final"));
++        assert_eq!(
++            runtime
++                .handle_request(VmmAction::FinalizeMeasurement(final_request.clone()))
++                .unwrap(),
++            VmmData::TerminalMeasurement(receipt)
++        );
++        assert!(runtime.handle_request(VmmAction::Resume).is_err());
++        assert!(runtime.handle_request(VmmAction::FlushMetrics).is_err());
++        assert!(
++            runtime
++                .handle_request(VmmAction::FlushMeasurement(MeasurementRequest {
++                    request_sequence: 3,
++                    ..final_request.clone()
++                }))
++                .is_err()
++        );
++        assert!(
++            runtime
++                .handle_request(VmmAction::FinalizeMeasurement(MeasurementRequest {
++                    request_sequence: 3,
++                    ..final_request
++                }))
++                .is_err()
++        );
++        assert!(runtime.handle_request(VmmAction::GetVmInstanceInfo).is_ok());
++        assert!(runtime.requires_api_only());
++        assert!(METRICS.write().is_err());
++        assert_eq!(std::fs::read(file.as_path()).unwrap(), before);
++    }
++
++    #[test]
++    #[ignore = "requires /dev/kvm; explicit terminal integration gate"]
++    fn kvm_terminal_measurement_guard_precedes_resume_kick() {
++        let mut vmm = default_vmm();
++        vmm.resume_vm().unwrap();
++        let shared = Arc::new(Mutex::new(vmm));
++        let mut ordinary = RuntimeApiController::new(VmResources::default(), shared.clone());
++        assert!(!ordinary.requires_api_only());
++        ordinary.handle_request(VmmAction::Pause).unwrap();
++        assert!(ordinary.requires_api_only());
++        ordinary.handle_request(VmmAction::Resume).unwrap();
++        assert!(!ordinary.requires_api_only());
++        drop(ordinary);
++        let mut vmm = Arc::try_unwrap(shared).unwrap().into_inner().unwrap();
++        vmm.latch_measurement_and_pause().unwrap();
++        assert!(vmm.measurement_terminal());
++        assert!(matches!(
++            vmm.resume_vm(),
++            Err(VmmError::MeasurementTerminal)
++        ));
++        let mut controller =
++            RuntimeApiController::new(VmResources::default(), Arc::new(Mutex::new(vmm)));
++        assert!(controller.requires_api_only());
++        assert!(matches!(
++            controller.handle_request(VmmAction::Resume),
++            Err(VmmActionError::InternalVmm(VmmError::MeasurementTerminal))
++        ));
++        assert!(controller.requires_api_only());
++    }
++
+     fn runtime_request(request: VmmAction) -> Result<VmmData, VmmActionError> {
+         let vmm = Arc::new(Mutex::new(default_vmm()));
+         let mut runtime = RuntimeApiController::new(VmResources::default(), vmm.clone());
+@@ -1377,6 +1610,7 @@ mod tests {
          check_unsupported(runtime_request(VmmAction::ConfigureMetrics(
              MetricsConfig {
                  metrics_path: PathBuf::new(),
@@ -1018,3 +1882,76 @@ index 38001661..643f43db 100644
          };
  
          init_metrics(desc.clone()).unwrap();
+diff --git a/src/vmm/src/vstate/vcpu.rs b/src/vmm/src/vstate/vcpu.rs
+index 1efeee58..fb89d90d 100644
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -598,6 +598,17 @@ pub struct VcpuHandle {
+ #[error("Failed to signal vCPU: {0}")]
+ pub struct VcpuSendEventError(pub vmm_sys_util::errno::Error);
+ 
++// Return before touching the vCPU fd or signaling when its receiver has exited.
++// Panicking here can recursively enter the metrics writer through the panic hook.
++fn enqueue_vcpu_event(
++    sender: &Sender<VcpuEvent>,
++    event: VcpuEvent,
++) -> Result<(), VcpuSendEventError> {
++    sender
++        .send(event)
++        .map_err(|_| VcpuSendEventError(vmm_sys_util::errno::Error::new(libc::EPIPE)))
++}
++
+ impl VcpuHandle {
+     /// Creates a new [`VcpuHandle`].
+     ///
+@@ -622,12 +633,9 @@ impl VcpuHandle {
+     ///
+     /// # Errors
+     ///
+-    /// When [`vmm_sys_util::linux::signal::Killable::kill`] errors.
++    /// When the vCPU receiver is closed (EPIPE) or signaling the thread fails.
+     pub fn send_event(&mut self, event: VcpuEvent) -> Result<(), VcpuSendEventError> {
+-        // Use expect() to crash if the other thread closed this channel.
+-        self.event_sender
+-            .send(event)
+-            .expect("event sender channel closed on vcpu end.");
++        enqueue_vcpu_event(&self.event_sender, event)?;
+         // Kick the vcpu so it picks up the message.
+         // Add a fence to ensure the write is visible to the vpu thread
+         self.vcpu_fd.set_kvm_immediate_exit(1);
+@@ -954,6 +962,35 @@ pub(crate) mod tests {
+         assert!(vcpu.kvm_vcpu.peripherals.mmio_bus.is_some());
+     }
+ 
++    #[test]
++    #[ignore = "requires /dev/kvm"]
++    fn kvm_terminal_measurement_disconnected_handle_send_event() {
++        let (_, vm, vcpu) = setup_vcpu(0x1000);
++        let fd = vcpu.copy_kvm_vcpu_fd(&vm).unwrap();
++        let (sender, receiver) = std::sync::mpsc::channel();
++        drop(receiver);
++        let (_, responses) = std::sync::mpsc::channel();
++        let thread = std::thread::spawn(|| {});
++        let mut handle = VcpuHandle::new(sender, responses, fd, thread);
++        assert_eq!(
++            handle.send_event(VcpuEvent::Pause).unwrap_err().0.errno(),
++            libc::EPIPE
++        );
++    }
++
++    #[test]
++    fn terminal_measurement_disconnected_vcpu_channel_is_error() {
++        let (sender, receiver) = std::sync::mpsc::channel();
++        drop(receiver);
++        assert_eq!(
++            enqueue_vcpu_event(&sender, VcpuEvent::Pause)
++                .unwrap_err()
++                .0
++                .errno(),
++            libc::EPIPE
++        );
++    }
++
+     #[test]
+     fn test_vcpu_kick() {
+         let (_, vm, mut vcpu) = setup_vcpu(0x1000);

@@ -4,19 +4,27 @@
   "upstream_commit": "431f1fc7d47f4cfe1dfe42437b9394f20972b65d",
   "upstream_tree": "46cf56643a3023512489434ac1f400f4ae214a31",
   "cargo_lock_sha256": "63e3cf13651becad306104e378b911b1495abee6839e9654934eaf37e0ff0902",
-  "patch_sha256": "51fb3bf2f02561c2b9d0b235ab7c18771a61988c1d09d0188aa3064c2610dcda",
+  "patch_sha256": "33bedb92e62a523dc24981748f5d72c9fab7d776da7cd38da871c054b1273020",
   "builder_image": "public.ecr.aws/firecracker/fcuvm@sha256:3992e750f8b41b730410d3d991742189376fbfb6b5d455e628d73ca048a1d490",
   "target": "x86_64-unknown-linux-musl",
   "rust_version": "1.89.0",
+  "capabilities": [
+    "sig.fc-measurement.v1",
+    "sig.fc-terminal-measurement.v1"
+  ],
   "changed_rust_files": [
     "src/firecracker/src/api_server/parsed_request.rs",
     "src/firecracker/src/api_server/request/actions.rs",
     "src/firecracker/src/api_server/request/metrics.rs",
+    "src/firecracker/src/api_server_adapter.rs",
     "src/firecracker/src/main.rs",
+    "src/vmm/src/builder.rs",
+    "src/vmm/src/lib.rs",
     "src/vmm/src/logger/measurement.rs",
     "src/vmm/src/logger/metrics.rs",
     "src/vmm/src/logger/mod.rs",
     "src/vmm/src/rpc_interface.rs",
-    "src/vmm/src/vmm_config/metrics.rs"
+    "src/vmm/src/vmm_config/metrics.rs",
+    "src/vmm/src/vstate/vcpu.rs"
   ]
 }
