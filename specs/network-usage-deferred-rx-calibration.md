@@ -10,7 +10,7 @@ The producer remains SHA256
 
 The actual Process boots and establishes positive guest traffic. Capture and
 completed-syscall tracing start before an exact durable sample. The fixture sends
-the supported `PATCH /network-interfaces/{iface_id}` request with RX operations
+the supported `PATCH /network-interfaces/{iface_id}` request with `rx_rate_limiter.ops`
 `size=1`, `one_time_burst=0`, `refill_time=3600000` milliseconds. It records the
 actual request and 204 response. A zero size/refill would disable the bucket and
 is not used. TX remains unrestricted. The one-hour refill does not disable the

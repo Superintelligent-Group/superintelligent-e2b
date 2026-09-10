@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
+	"github.com/e2b-dev/infra/packages/shared/pkg/fc/models"
+	"github.com/go-openapi/strfmt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,6 +33,31 @@ func deferredRXProgram() string {
 	return strings.Replace(calibrationPython, "if __name__=='__main__':", "if False:", 1) + "\n" + deferredRXPython
 }
 
+// Use the same generated wire models as production client.setTxRateLimit.
+// Pinned producer vmm_config::RateLimiterConfig accepts "ops", not "operations".
+func deferredRXLimiter(iface string) *models.PartialNetworkInterface {
+	size, burst, refill := int64(1), int64(0), int64(3600000)
+	return &models.PartialNetworkInterface{IfaceID: &iface, RxRateLimiter: &models.RateLimiter{Ops: &models.TokenBucket{Size: &size, OneTimeBurst: &burst, RefillTime: &refill}}}
+}
+
+func TestMeasurementDeferredRXWireContract(t *testing.T) {
+	body := deferredRXLimiter("eth0")
+	require.NoError(t, body.Validate(strfmt.Default))
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"iface_id":"eth0","rx_rate_limiter":{"ops":{"size":1,"one_time_burst":0,"refill_time":3600000}}}`, string(raw))
+	decode := func(raw []byte) error {
+		var wire models.PartialNetworkInterface
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		return decoder.Decode(&wire)
+	}
+	require.NoError(t, decode(raw))
+	// Run 1 sent this unknown key. Reject it against the actual generated model,
+	// rather than accepting a fixture map and mirrored parser expectation.
+	require.ErrorContains(t, decode(bytes.Replace(raw, []byte(`"ops"`), []byte(`"operations"`), 1)), "unknown field")
+}
+
 func runDeferredRXCalibration(t *testing.T, ctx context.Context, p *fc.Process, base, socketPath, iface string) {
 	t.Helper()
 	program := deferredRXProgram()
@@ -38,7 +65,8 @@ func runDeferredRXCalibration(t *testing.T, ctx context.Context, p *fc.Process, 
 		start, err := fc.CalibrationSample(p, ctx)
 		require.NoError(t, err)
 		writeJSON("start.json", start)
-		body := map[string]any{"iface_id": iface, "rx_rate_limiter": map[string]any{"operations": map[string]uint64{"size": 1, "one_time_burst": 0, "refill_time": 3600000}}}
+		body := deferredRXLimiter(iface)
+		require.NoError(t, body.Validate(strfmt.Default))
 		raw, err := json.Marshal(body)
 		require.NoError(t, err)
 		client := &http.Client{Transport: &http.Transport{DialContext: func(c context.Context, _, _ string) (net.Conn, error) {

@@ -193,7 +193,7 @@ def verify_deferred(base):
     config = json.loads((directory/'limiter.json').read_text())
     assert config['method'] == 'PATCH' and config['status'] == 204 and config['response'] == ''
     assert config['path'] == '/network-interfaces/'+config['request']['iface_id']
-    assert config['request']['rx_rate_limiter'] == {'operations': {'size': 1, 'one_time_burst': 0, 'refill_time': 3600000}}
+    assert config['request']['rx_rate_limiter'] == {'ops': {'size': 1, 'one_time_burst': 0, 'refill_time': 3600000}}
     records = []; raw_hashes = {}
     for file in sorted((base/'spool').glob('*.jsonl')):
         raw = file.read_bytes(); assert raw.endswith(b'\n'), 'partial journal tail'
@@ -288,7 +288,7 @@ def selftest_deferred():
         directory = base/'calibration-deferred-rx'; directory.mkdir()
         (base/'spool').mkdir()
         save(directory/'fds.json', {'tap': '14', 'metrics': '15'})
-        save(directory/'limiter.json', {'method': 'PATCH', 'path': '/network-interfaces/eth0', 'request': {'iface_id': 'eth0', 'rx_rate_limiter': {'operations': {'size': 1, 'one_time_burst': 0, 'refill_time': 3600000}}}, 'status': 204, 'response': ''})
+        save(directory/'limiter.json', {'method': 'PATCH', 'path': '/network-interfaces/eth0', 'request': {'iface_id': 'eth0', 'rx_rate_limiter': {'ops': {'size': 1, 'one_time_burst': 0, 'refill_time': 3600000}}}, 'status': 204, 'response': ''})
         metric['metrics']['net']['rx_rate_limiter_throttled'] = 1
         records = []; producer_raw = []
         for index, name in enumerate(('start', 'held', 'terminal')):
@@ -317,6 +317,7 @@ def selftest_deferred():
         value = json.loads(path.read_text()); mutate(value); save(path, value)
 
     mutations = [
+        lambda d: change_json(d/'limiter.json', lambda v: v['request'].update(rx_rate_limiter={'operations': {'size': 1, 'one_time_burst': 0, 'refill_time': 3600000}})),
         lambda d: change_json(d/'packets.json', lambda v: v.update(kernel_drops=1)),
         lambda d: change_json(d/'packets.json', lambda v: v.update(kernel_packets=6)),
         lambda d: change_json(d/'terminal.json', lambda v: v.update(FrameSHA256='0'*64)),
@@ -337,7 +338,7 @@ def selftest_deferred():
                 if not mutate: raise
             else:
                 assert mutate is None, 'final verifier accepted invalid evidence'
-    print('SUP921 final disk/fence verifier: positive and eight negative cases passed')
+    print('SUP921 final disk/fence verifier: positive and nine negative cases passed')
 
 
 if __name__ == '__main__':
