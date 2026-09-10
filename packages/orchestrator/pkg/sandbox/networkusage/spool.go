@@ -1,6 +1,7 @@
 package networkusage
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -228,8 +229,15 @@ func (s *Spool) Segments() ([]Segment, error) {
 // Acknowledge removes immutable evidence only after exact content matching.
 // Incomplete segments require custody of the raw bytes, not merely parsed rows.
 func (s *Spool) Acknowledge(name, digest string) error {
+	return s.acknowledge(context.Background(), name, digest)
+}
+
+func (s *Spool) acknowledge(ctx context.Context, name, digest string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed || s.failed != nil || !segmentName(name) || strings.HasSuffix(name, ".active") {
 		return errors.New("invalid acknowledgment")
 	}
@@ -238,13 +246,16 @@ func (s *Spool) Acknowledge(name, digest string) error {
 		return err
 	}
 	h := sha256.New()
-	n, err := io.Copy(h, f)
+	n, err := io.Copy(h, contextReader{ctx: ctx, reader: f})
 	err = errors.Join(err, f.Close())
 	if err != nil {
 		return err
 	}
 	if hex.EncodeToString(h.Sum(nil)) != digest {
 		return errors.New("segment acknowledgment content mismatch")
+	}
+	if err = ctx.Err(); err != nil {
+		return err
 	}
 	if err = os.Remove(filepath.Join(s.dir, name)); err != nil {
 		return err

@@ -166,6 +166,11 @@ Key mechanisms (all under `pkg/sandbox/`):
   It is not yet wired into orchestrator configuration or remote delivery; active
   journal configuration still uses the original single-file producer. The spool
   never upgrades observations to complete terminal coverage or provider pricing.
+  A further [optional raw-custody API](../specs/network-usage-custody.md) supports
+  conditional S3 uploads and checksum/readback verification before local segment
+  acknowledgment. It is not wired into startup or scheduled delivery. Existing
+  host claims and bucket permissions do not establish authenticated per-host
+  provenance or protected evidence retention; those remain activation gates.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
