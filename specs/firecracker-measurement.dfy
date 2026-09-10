@@ -1,4 +1,4 @@
-﻿// SUP-908 abstract serialized producer model; not a Rust refinement proof.
+// SUP-908 abstract serialized producer model; not a Rust refinement proof.
 // Sink mutex supplies the assumed total order. Failed attempt includes partial
 // serialization, oversize, write and flush errors. Replay preserves historical
 // receipt, not later loss. No persistence or network-lifetime claim.

@@ -182,6 +182,11 @@ Key mechanisms (all under `pkg/sandbox/`):
   recipe preserves source, patch and binary provenance; it does not change runtime
   binary selection. Emission acknowledgment is distinct from collector persistence
   and terminal device cutoff. Device counters are not provider-billable bytes.
+  The [terminal producer extension](../specs/firecracker-terminal-measurement.md)
+  adds an irreversible runtime latch before pause, blocks subsequent device restart,
+  and emits a distinct cutoff receipt. It remains an inactive build input: the
+  orchestrator still needs to own collection readiness, finalization and durable
+  joins before declaring a complete identified device-observation window.
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.

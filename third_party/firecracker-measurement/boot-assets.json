@@ -1,0 +1,19 @@
+{
+    "bucket":  "spec.ccfc.min",
+    "assets":  [
+                   {
+                       "sha256":  "643096c1fabf0fbbda1d03c100b9e86b4e6965fd5a01d3c6fb9e8c0ecb7fbfc9",
+                       "name":  "vmlinux-5.10.245",
+                       "version":  "u783AoQsEbcwkz6OMuMQ8fT7TgaLVULw",
+                       "bytes":  39669712
+                   },
+                   {
+                       "sha256":  "f4fbb71a581c2f4cd204900ceaf280b71b031c58479250cb0430e0b29774ef5c",
+                       "name":  "ubuntu-24.04.squashfs",
+                       "version":  "3qH7elUfcHKXor7RupocpdfaoaMKpWiW",
+                       "bytes":  107810816
+                   }
+               ],
+    "recordedAt":  "2026-09-10T16:58:36.7612270Z",
+    "downloadMode":  "anonymous current GET with If-Match; response exact VersionId checked; explicit version GET denied"
+}
