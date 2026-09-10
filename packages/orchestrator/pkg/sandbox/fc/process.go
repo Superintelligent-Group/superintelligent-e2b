@@ -151,13 +151,14 @@ type Process struct {
 
 	Exit *utils.ErrorOnce
 
-	client             *apiClient
-	metricsMu          sync.Mutex
-	metrics            *metricsReader
-	metricsStopped     bool
-	measurementService *networkusage.Service
-	measurement        *measurementSession
-	binaryPath         string
+	client              *apiClient
+	metricsMu           sync.Mutex
+	metrics             *metricsReader
+	metricsStopped      bool
+	measurementService  *networkusage.Service
+	measurement         *measurementSession
+	measurementWorkload networkusage.WorkloadBinding
+	binaryPath          string
 
 	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
 	// metrics-reader goroutine (FC's SharedIncMetric resets per flush).

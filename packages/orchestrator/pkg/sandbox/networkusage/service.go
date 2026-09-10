@@ -17,6 +17,9 @@ var ErrCollectorLimit = errors.New("network evidence active collector limit reac
 // reclaim are intentionally not exposed here. All collectors must close before
 // the spool lock is released; a canceled Close keeps ownership and rejects admission.
 type Service struct {
+	delivery            *protectedDelivery
+	finishOnce          sync.Once
+	finishDone          chan struct{}
 	mu                  sync.Mutex
 	spool               *Spool
 	maxCollectors       int
@@ -35,14 +38,29 @@ func OpenService(directory string, options SpoolOptions) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	return serviceWithSpool(spool, options), nil
+}
+
+func serviceWithSpool(spool *Spool, options SpoolOptions) *Service {
 	drained := make(chan struct{})
 	close(drained)
-	return &Service{spool: spool, maxCollectors: options.MaxSegments, failedCh: make(chan struct{}), closingCh: make(chan struct{}), drained: drained}, nil
+	return &Service{spool: spool, maxCollectors: options.MaxSegments, failedCh: make(chan struct{}), closingCh: make(chan struct{}), drained: drained, finishDone: make(chan struct{})}
 }
 
 // NewCollector reserves a bounded lifetime before doing persistence I/O. It
 // never returns a collector after admission has closed or failed concurrently.
-func (s *Service) NewCollector(sandboxID string) (*Correlator, error) {
+func (s *Service) NewCollector(sandboxID string, context ...WorkloadBinding) (*Correlator, error) {
+	var workload *WorkloadBinding
+	if len(context) > 1 {
+		return nil, errors.New("multiple workload bindings")
+	}
+	if len(context) == 1 {
+		w := context[0]
+		workload = &w
+	}
+	if s.delivery != nil && (workload == nil || workload.validate(sandboxID) != nil) {
+		return nil, errors.New("protected collection requires authoritative workload binding")
+	}
 	if sandboxID == "" || len(sandboxID) > 256 || !utf8.ValidString(sandboxID) {
 		return nil, errors.New("invalid sandbox identity")
 	}
@@ -74,7 +92,12 @@ func (s *Service) NewCollector(sandboxID string) (*Correlator, error) {
 	// Correlator.Close -> Journal.Close -> wrapper.Close seals the writer first.
 	// Failure broadcasts only notify; they never join a collector from its callback.
 	journal.file = &serviceFile{durableFile: journal.file, service: s}
-	collector, err := NewCorrelator(journal, rand.Text())
+	incarnation := rand.Text()
+	if workload != nil {
+		workload.ProducerIncarnation = incarnation
+		journal.workload = workload
+	}
+	collector, err := NewCorrelator(journal, incarnation)
 	if err != nil {
 		s.Fail(err)
 		return nil, errors.Join(err, journal.Close())
@@ -147,13 +170,26 @@ func (s *Service) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return errors.Join(ctx.Err(), s.Err())
 	}
+	s.finishOnce.Do(func() {
+		go func() {
+			if s.delivery != nil {
+				s.delivery.finish()
+			}
+			close(s.finishDone)
+		}()
+	})
+	select {
+	case <-s.finishDone:
+	case <-ctx.Done():
+		return errors.Join(ctx.Err(), s.Err())
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return s.closeErr
 	}
 	// No writer can be constructed after closing; active releases only after seal.
-	s.closeErr = errors.Join(s.failed, s.spool.Close())
+	s.closeErr = errors.Join(s.failed, s.DeliveryError(), s.spool.Close())
 	s.closed = true
 	return s.closeErr
 }

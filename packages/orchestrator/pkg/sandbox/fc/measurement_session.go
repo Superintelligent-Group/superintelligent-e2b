@@ -35,11 +35,11 @@ type measurementSession struct {
 	sequence  uint64 // action gate owned
 }
 
-func newMeasurementSession(service *networkusage.Service, sandboxID, socket string) (*measurementSession, error) {
+func newMeasurementSession(service *networkusage.Service, sandboxID, socket string, workload ...networkusage.WorkloadBinding) (*measurementSession, error) {
 	if service == nil {
 		return nil, errors.New("correlated measurement requires host spool service")
 	}
-	c, err := service.NewCollector(sandboxID)
+	c, err := service.NewCollector(sandboxID, workload...)
 	if err != nil {
 		return nil, err
 	}
@@ -260,6 +260,13 @@ func (s *measurementSession) finalize(ctx context.Context) error {
 // SetNetworkUsageService is an initialization-only dependency setter, before Create/Resume.
 func (p *Process) SetNetworkUsageService(service *networkusage.Service) {
 	p.measurementService = service
+}
+
+// Initialization-only: Factory supplies this from runtime metadata before Create/Resume.
+// The SHA is filled from the same config verified against the selected executable.
+func (p *Process) SetMeasurementWorkload(w networkusage.WorkloadBinding) {
+	w.ProducerSHA256 = p.config.NetworkUsageBinarySHA256
+	p.measurementWorkload = w
 }
 func (p *Process) FinalizeMeasurement(ctx context.Context) error {
 	measurement := p.measurementSession()

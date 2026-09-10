@@ -660,6 +660,7 @@ func (f *Factory) CreateSandbox(
 
 	freePageHinting := fc.FCSupportsFreePageHinting(config.FirecrackerConfig.FirecrackerVersion) && config.FreePageHinting
 
+	fcHandle.SetMeasurementWorkload(networkusage.WorkloadBinding{SandboxID: runtime.SandboxID, ExecutionID: runtime.ExecutionID, TemplateID: runtime.TemplateID, BuildID: runtime.BuildID, TeamID: runtime.TeamID, LifecycleID: sbx.LifecycleID})
 	err = fcHandle.Create(
 		ctx,
 		sbxlogger.SandboxMetadata{
@@ -1106,6 +1107,7 @@ func (f *Factory) ResumeSandbox(
 
 		cancelUffdStartCtx(fmt.Errorf("uffd process exited: %w", errors.Join(uffdWaitErr, context.Cause(uffdStartCtx))))
 	}()
+	fcHandle.SetMeasurementWorkload(networkusage.WorkloadBinding{SandboxID: runtime.SandboxID, ExecutionID: runtime.ExecutionID, TemplateID: runtime.TemplateID, BuildID: runtime.BuildID, TeamID: runtime.TeamID, LifecycleID: sbx.LifecycleID})
 	fcStartErr := fcHandle.Resume(
 		uffdStartCtx,
 		sbxlogger.SandboxMetadata{

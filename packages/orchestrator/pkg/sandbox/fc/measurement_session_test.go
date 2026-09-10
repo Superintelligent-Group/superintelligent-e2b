@@ -36,8 +36,9 @@ func TestMeasurementProcessFIFOExactRetryAndTerminalJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &Process{config: cfg.BuilderConfig{NetworkUsageCorrelated: true}, files: &storage.SandboxFiles{SandboxID: "session-test"}, metricsPath: fifoForTest(t), firecrackerSocketPath: socket, Exit: utils.NewErrorOnce()}
+	p := &Process{config: cfg.BuilderConfig{NetworkUsageCorrelated: true, NetworkUsageBinarySHA256: cfg.CorrelatedProducerSHA256}, files: &storage.SandboxFiles{SandboxID: "session-test"}, metricsPath: fifoForTest(t), firecrackerSocketPath: socket, Exit: utils.NewErrorOnce()}
 	p.SetNetworkUsageService(service)
+	p.SetMeasurementWorkload(networkusage.WorkloadBinding{SandboxID: "session-test", ExecutionID: "host-execution", LifecycleID: "host-lifecycle", TemplateID: "host-template", TeamID: "best-effort-team"})
 	if err = p.startMetricsReader(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +182,27 @@ func TestMeasurementProcessFIFOExactRetryAndTerminalJoin(t *testing.T) {
 	for _, segment := range segments {
 		if segment.Incomplete {
 			t.Fatal("unexpected raw tail", segment)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, segment.Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		bound := 0
+		for _, line := range bytes.Split(bytes.TrimSpace(data), []byte{'\n'}) {
+			var record networkusage.Record
+			if err = json.Unmarshal(line, &record); err != nil {
+				t.Fatal(err)
+			}
+			if record.Kind == "start" {
+				continue
+			}
+			if record.Workload == nil || record.Workload.ExecutionID != "host-execution" || record.Workload.LifecycleID != "host-lifecycle" || record.Workload.ProducerSHA256 != cfg.CorrelatedProducerSHA256 || record.Workload.ProducerIncarnation != first.Incarnation {
+				t.Fatalf("lost runtime workload binding: %+v", record.Workload)
+			}
+			bound++
+		}
+		if bound == 0 {
+			t.Fatal("no durable workload-bound producer evidence")
 		}
 	}
 }

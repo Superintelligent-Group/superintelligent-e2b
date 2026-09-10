@@ -17,6 +17,7 @@ import (
 )
 
 type Record struct {
+	Workload      *WorkloadBinding  `json:"workload,omitempty"`
 	Producer      *ProducerEvidence `json:"producer,omitempty"`
 	SchemaVersion int               `json:"schemaVersion"`
 	Kind          string            `json:"kind"`
@@ -42,6 +43,7 @@ type durableFile interface {
 // Journal serializes the reader and flusher's evidence into one process epoch.
 // A failed write or sync is latched: no later record can hide a partial tail.
 type Journal struct {
+	workload   *WorkloadBinding
 	mu         sync.Mutex
 	file       durableFile
 	last       Record
@@ -89,6 +91,7 @@ func Open(directory, sandboxID string) (*Journal, error) {
 // append publishes in-memory counters only after the full record is synced.
 // Callers hold mu, except Open before the journal is shared.
 func (j *Journal) append(record Record) error {
+	record.Workload = j.workload
 	if j.failed != nil {
 		return j.failed
 	}

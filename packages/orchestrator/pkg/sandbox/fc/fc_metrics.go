@@ -293,7 +293,7 @@ func (p *Process) startMetricsReader(ctx context.Context) error {
 		return errors.New("metrics reader already started or process stopping")
 	}
 	if p.config.NetworkUsageCorrelated {
-		measurement, err := newMeasurementSession(p.measurementService, p.files.SandboxID, p.firecrackerSocketPath)
+		measurement, err := newMeasurementSession(p.measurementService, p.files.SandboxID, p.firecrackerSocketPath, p.measurementWorkload)
 		if err != nil {
 			return err
 		}

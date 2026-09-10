@@ -49,10 +49,15 @@ type Spool struct {
 	count, writers int
 	closed         bool
 	failed         error
+	allowCustody   bool
 	syncDirectory  func() error // injectable directory durability boundary
 }
 
 func OpenSpool(directory string, options SpoolOptions) (*Spool, error) {
+	return openSpool(directory, options, false)
+}
+
+func openSpool(directory string, options SpoolOptions, custody bool) (*Spool, error) {
 	if !filepath.IsAbs(directory) || options.MaxBytes < 2 || options.SegmentBytes < 1 || options.SegmentBytes >= options.MaxBytes || options.MaxSegments < 1 {
 		return nil, errors.New("invalid network spool options")
 	}
@@ -60,7 +65,7 @@ func OpenSpool(directory string, options SpoolOptions) (*Spool, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Spool{dir: directory, options: options, lock: lock, used: 1}
+	s := &Spool{dir: directory, options: options, lock: lock, used: 1, allowCustody: custody}
 	fail := func(err error) (*Spool, error) { unlockSpool(lock); return nil, err }
 	marker, err := openSpoolControl(filepath.Join(directory, ".incomplete"), os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	created := err == nil
@@ -97,6 +102,9 @@ func OpenSpool(directory string, options SpoolOptions) (*Spool, error) {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
+		if name == ".custody" && custody && entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
 		if name == ".lock" || name == ".incomplete" {
 			continue
 		}
@@ -236,7 +244,7 @@ func (s *Spool) acknowledge(ctx context.Context, name, digest string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return err
+		return cooperativeCancellation{err}
 	}
 	if s.closed || s.failed != nil || !segmentName(name) || strings.HasSuffix(name, ".active") {
 		return errors.New("invalid acknowledgment")
@@ -255,7 +263,7 @@ func (s *Spool) acknowledge(ctx context.Context, name, digest string) error {
 		return errors.New("segment acknowledgment content mismatch")
 	}
 	if err = ctx.Err(); err != nil {
-		return err
+		return cooperativeCancellation{err}
 	}
 	if err = os.Remove(filepath.Join(s.dir, name)); err != nil {
 		return err
