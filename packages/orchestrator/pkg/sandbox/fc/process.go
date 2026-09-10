@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -149,7 +150,10 @@ type Process struct {
 
 	Exit *utils.ErrorOnce
 
-	client *apiClient
+	client         *apiClient
+	metricsMu      sync.Mutex
+	metrics        *metricsReader
+	metricsStopped bool
 
 	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
 	// metrics-reader goroutine (FC's SharedIncMetric resets per flush).
@@ -328,9 +332,14 @@ func (p *Process) Create(
 	txRateLimit RateLimiterConfig,
 	driveRateLimit RateLimiterConfig,
 	cgroupFD int,
-) error {
+) (retErr error) {
 	ctx, childSpan := tracer.Start(ctx, "create-fc")
 	defer childSpan.End()
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, p.abortMetricsReader())
+		}
+	}()
 
 	// Symlink /dev/null to the rootfs link path, so we can start the FC process without the rootfs and then symlink the real rootfs.
 	err := utils.SymlinkForce("/dev/null", p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
@@ -523,9 +532,14 @@ func (p *Process) Resume(
 	useMemfd bool,
 	txRateLimit RateLimiterConfig,
 	driveRateLimit RateLimiterConfig,
-) error {
+) (retErr error) {
 	ctx, span := tracer.Start(ctx, "resume-fc")
 	defer span.End()
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, p.abortMetricsReader())
+		}
+	}()
 
 	// Symlink /dev/null to the rootfs link path, so we can start the FC process without the rootfs and then symlink the real rootfs.
 	err := utils.SymlinkForce("/dev/null", p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
@@ -679,14 +693,19 @@ func (p *Process) Pid() (int, error) {
 }
 
 func (p *Process) Stop(ctx context.Context) error {
+	p.metricsMu.Lock()
+	p.metricsStopped = true
+	if p.metrics != nil {
+		p.metrics.cancel()
+	}
+	p.metricsMu.Unlock()
+	defer func() {
+		if err := os.Remove(p.metricsPath); err != nil && !os.IsNotExist(err) {
+			logger.L().Warn(ctx, "failed to remove fc metrics FIFO", zap.Error(err), logger.WithSandboxID(p.files.SandboxID))
+		}
+	}()
 	if p.cmd.Process == nil {
 		return errors.New("fc process not started")
-	}
-
-	// Always remove the metrics FIFO, even if the process already exited,
-	// to avoid leaving orphaned files behind.
-	if removeErr := os.Remove(p.metricsPath); removeErr != nil && !os.IsNotExist(removeErr) {
-		logger.L().Warn(ctx, "failed to remove fc metrics FIFO", zap.Error(removeErr), logger.WithSandboxID(p.files.SandboxID))
 	}
 
 	pid := p.cmd.Process.Pid
