@@ -4,6 +4,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -599,7 +602,11 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 	}()
 
 	teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
+	closedAt := time.Now().UTC()
 	eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
+	receipt, receiptSHA256 := buildSandboxTerminalReceipt(sbx, closedAt, eventData[executionEventDataKey])
+	eventData["terminal_receipt"] = receipt
+	eventData["terminal_receipt_sha256"] = receiptSHA256
 	addKillReason(eventData, killReason)
 	recordSandboxKill(ctx, s.sandboxKilledCounter, killReason)
 
@@ -935,6 +942,29 @@ func (s *Server) getSandboxExecutionData(sbx *sandbox.Sandbox) map[string]any {
 		"memory_mb":      sbx.Config.RamMB,
 		"execution_time": time.Since(startedAt).Milliseconds(),
 	}
+}
+
+// buildSandboxTerminalReceipt creates the provider-owned, canonical receipt
+// attached to the durable sandbox-killed event. The hash covers exactly the
+// JSON payload consumers use for evidence binding; callers must not replace
+// missing provider measurements with guessed zeroes.
+func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execution any) (map[string]any, string) {
+	receipt := map[string]any{
+		"schema_version": 1,
+		"provider":       "e2b",
+		"sandbox_id":     sbx.Runtime.SandboxID,
+		"execution_id":   sbx.Runtime.ExecutionID,
+		"closed_at":      closedAt.UTC().Format(time.RFC3339Nano),
+		"execution":      execution,
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		// All fields above are JSON-native. Keep a deterministic failure value
+		// rather than allowing a serialization error to drop the lifecycle event.
+		return receipt, ""
+	}
+	digest := sha256.Sum256(encoded)
+	return receipt, hex.EncodeToString(digest[:])
 }
 
 // snapshotResult holds the data produced by snapshotAndCacheSandbox that
