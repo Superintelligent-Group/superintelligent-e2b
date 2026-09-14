@@ -135,6 +135,28 @@ func TestGetSandboxExecutionData(t *testing.T) {
 	assert.Positive(t, result["execution_time"].(int64))
 }
 
+func TestBuildSandboxTerminalReceiptIsCanonical(t *testing.T) {
+	t.Parallel()
+
+	sbx := &sandbox.Sandbox{Metadata: &sandbox.Metadata{
+		Runtime: sandbox.RuntimeMetadata{SandboxID: "sandbox-1", ExecutionID: "execution-1"},
+	}}
+	closedAt := time.Date(2026, 9, 14, 20, 0, 0, 123000000, time.UTC)
+	execution := map[string]any{"vcpu_count": int64(2), "execution_time": int64(42)}
+
+	receipt, digest := buildSandboxTerminalReceipt(sbx, closedAt, execution)
+
+	assert.Equal(t, 1, receipt["schema_version"])
+	assert.Equal(t, "e2b", receipt["provider"])
+	assert.Equal(t, "sandbox-1", receipt["sandbox_id"])
+	assert.Equal(t, "execution-1", receipt["execution_id"])
+	assert.Equal(t, "2026-09-14T20:00:00.123Z", receipt["closed_at"])
+	assert.Len(t, digest, 64)
+
+	_, repeated := buildSandboxTerminalReceipt(sbx, closedAt, execution)
+	assert.Equal(t, digest, repeated)
+}
+
 func TestAddKillReason(t *testing.T) {
 	t.Parallel()
 

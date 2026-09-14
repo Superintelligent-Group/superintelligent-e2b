@@ -264,6 +264,10 @@ Key mechanisms (all under `pkg/sandbox/`):
   OTel. Sandbox and template-build log writes go through a flag-resolved HTTP route: the legacy
   collector remains the fallback primary destination, and configured shadow destinations can mirror
   writes during collector/storage migrations without changing sandbox behavior.
+- Sandbox termination events include a canonical provider terminal receipt (sandbox/execution
+  identity, close timestamp, and runtime execution data) plus its SHA-256. Consumers can bind
+  accounting evidence to the provider-owned lifecycle event without treating framework transfer
+  measurements as provider telemetry.
 
 ### Envd (`packages/envd`)
 
