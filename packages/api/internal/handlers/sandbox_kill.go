@@ -16,6 +16,7 @@ import (
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/terminalreceipt"
 )
 
 func (a *APIStore) deleteSnapshot(ctx context.Context, sandboxID string, teamID uuid.UUID) error {
@@ -96,6 +97,14 @@ func (a *APIStore) DeleteSandboxesSandboxID(
 	}
 
 	if killedOrRemoved {
+		if envelope, receiptErr := terminalreceipt.Load(ctx, a.redisClient, sandboxID); receiptErr == nil {
+			// The key is namespaced by sandbox ID, but validate the identity in
+			// the payload too so a stale/reused key can never cross the API.
+			if receiptID, ok := envelope.Receipt["sandbox_id"].(string); ok && receiptID == sandboxID {
+				c.JSON(http.StatusOK, envelope)
+				return
+			}
+		}
 		c.Status(http.StatusNoContent)
 	} else {
 		logger.L().Debug(ctx, "Sandbox not found for deletion", logger.WithSandboxID(sandboxID))

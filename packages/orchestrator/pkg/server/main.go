@@ -29,6 +29,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
+	"github.com/redis/go-redis/v9"
 )
 
 // Matches the template cache TTL so entries live as long as the
@@ -74,6 +75,7 @@ type Server struct {
 	persistence           storage.StorageProvider
 	featureFlags          *featureflags.Client
 	sbxEventsService      *events.EventsService
+	redisClient           redis.UniversalClient
 	startingSandboxes     *utils.AdjustableSemaphore
 	peerRegistry          peerclient.Registry
 	uploadedBuilds        *ttlcache.Cache[string, struct{}]
@@ -104,6 +106,7 @@ type ServiceConfig struct {
 	Persistence      storage.StorageProvider
 	FeatureFlags     *featureflags.Client
 	SbxEventsService *events.EventsService
+	RedisClient      redis.UniversalClient
 	PeerRegistry     peerclient.Registry
 	Uploads          *sandbox.Uploads
 }
@@ -131,6 +134,7 @@ func New(ctx context.Context, cfg ServiceConfig) (*Server, error) {
 		persistence:       cfg.Persistence,
 		featureFlags:      cfg.FeatureFlags,
 		sbxEventsService:  cfg.SbxEventsService,
+		redisClient:       cfg.RedisClient,
 		startingSandboxes: startingSandboxes,
 		peerRegistry:      cfg.PeerRegistry,
 		uploadedBuilds:    uploadedBuilds,

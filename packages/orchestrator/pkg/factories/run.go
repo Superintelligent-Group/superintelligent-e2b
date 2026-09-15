@@ -779,6 +779,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 		Persistence:      persistence,
 		FeatureFlags:     featureFlags,
 		SbxEventsService: eventsService,
+		RedisClient:      redisClient,
 		PeerRegistry:     peerRegistry,
 		Uploads:          uploads,
 	})
