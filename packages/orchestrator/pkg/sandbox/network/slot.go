@@ -101,12 +101,19 @@ func (s *Slot) TerminalEgressBytes() (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("read FORWARD counters: %w", err)
 	}
-	for _, stat := range stats {
-		if stat.Target == "ACCEPT" && stat.Input == s.VethName() && stat.Output == defaultGateway {
-			return stat.Bytes, nil
-		}
+	if bytes, ok := terminalEgressBytesFromStats(stats, s.VethName(), defaultGateway); ok {
+		return bytes, nil
 	}
 	return 0, fmt.Errorf("egress FORWARD rule not found for slot %q", s.Key)
+}
+
+func terminalEgressBytesFromStats(stats []iptables.Stat, veth, gateway string) (uint64, bool) {
+	for _, stat := range stats {
+		if stat.Target == "ACCEPT" && stat.Input == veth && stat.Output == gateway {
+			return stat.Bytes, true
+		}
+	}
+	return 0, false
 }
 
 func NewSlot(key string, idx int, config Config, egressProxy EgressProxy) (*Slot, error) {
