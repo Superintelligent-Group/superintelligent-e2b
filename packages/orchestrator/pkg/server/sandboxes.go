@@ -588,18 +588,15 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 	// Check health metrics before stopping the sandbox
 	sbx.Checks.Healthcheck(ctx, true)
 
-	// Start the cleanup in a goroutine—the initial kill request should be send as the first thing in stop, and at this point you cannot route to the sandbox anymore.
-	// We don't wait for the whole cleanup to finish here.
-	go func() {
-		err := sbx.Stop(context.WithoutCancel(ctx))
-		if err != nil {
-			sbxlogger.I(sbx).Error(ctx, "error stopping sandbox",
-				logger.WithSandboxID(in.GetSandboxId()),
-				zap.String("kill_reason", killReason),
-				zap.Error(err),
-			)
-		}
-	}()
+	// Stop before publishing the terminal event so provider-owned counters are
+	// captured while the slot's network rules still exist.
+	if err := sbx.Stop(context.WithoutCancel(ctx)); err != nil {
+		sbxlogger.I(sbx).Error(ctx, "error stopping sandbox",
+			logger.WithSandboxID(in.GetSandboxId()),
+			zap.String("kill_reason", killReason),
+			zap.Error(err),
+		)
+	}
 
 	teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
 	closedAt := time.Now().UTC()
@@ -949,6 +946,11 @@ func (s *Server) getSandboxExecutionData(sbx *sandbox.Sandbox) map[string]any {
 // JSON payload consumers use for evidence binding; callers must not replace
 // missing provider measurements with guessed zeroes.
 func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execution any) (map[string]any, string) {
+	egressBytes, egressErr := sbx.TerminalEgressMeasurement()
+	egress := unavailableTerminalMeasurement("provider_egress_surface_unavailable")
+	if egressErr == nil {
+		egress = map[string]any{"status": "measured", "bytes": egressBytes}
+	}
 	receipt := map[string]any{
 		"schema_version": 1,
 		"provider":       "e2b",
@@ -960,7 +962,7 @@ func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execu
 		// the provider owns an authoritative wire-byte/artifact/idle surface.
 		// Consumers must never turn an unavailable measurement into numeric zero.
 		"non_runtime": map[string]any{
-			"egress_bytes":   unavailableTerminalMeasurement("provider_egress_surface_unavailable"),
+			"egress_bytes":   egress,
 			"artifact_bytes": unavailableTerminalMeasurement("provider_artifact_surface_unavailable"),
 			"idle_seconds":   unavailableTerminalMeasurement("provider_idle_surface_unavailable"),
 		},

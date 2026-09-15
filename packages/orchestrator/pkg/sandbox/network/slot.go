@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/coreos/go-iptables/iptables"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -85,6 +86,27 @@ type Slot struct {
 
 	egressProxy EgressProxy
 	config      Config
+}
+
+// TerminalEgressBytes reads the provider-owned FORWARD rule counter for this
+// slot before network teardown. The rule matches the slot veth as input and
+// the host gateway as output, so it measures guest-originated wire bytes at
+// the provider boundary rather than device observations inside Firecracker.
+func (s *Slot) TerminalEgressBytes() (uint64, error) {
+	tables, err := iptables.New()
+	if err != nil {
+		return 0, fmt.Errorf("initialize iptables: %w", err)
+	}
+	stats, err := tables.StructuredStats("filter", "FORWARD")
+	if err != nil {
+		return 0, fmt.Errorf("read FORWARD counters: %w", err)
+	}
+	for _, stat := range stats {
+		if stat.Target == "ACCEPT" && stat.Input == s.VethName() && stat.Output == defaultGateway {
+			return stat.Bytes, nil
+		}
+	}
+	return 0, fmt.Errorf("egress FORWARD rule not found for slot %q", s.Key)
 }
 
 func NewSlot(key string, idx int, config Config, egressProxy EgressProxy) (*Slot, error) {
