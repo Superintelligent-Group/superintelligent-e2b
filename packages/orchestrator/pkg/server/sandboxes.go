@@ -39,6 +39,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/retry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/terminalreceipt"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
@@ -602,6 +603,9 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 	closedAt := time.Now().UTC()
 	eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
 	receipt, receiptSHA256 := buildSandboxTerminalReceipt(sbx, closedAt, eventData[executionEventDataKey])
+	if err := terminalreceipt.Store(ctx, s.redisClient, sbx.Runtime.SandboxID, receipt, receiptSHA256); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "terminal receipt unavailable for sandbox '%s': %s", in.GetSandboxId(), err)
+	}
 	eventData["terminal_receipt"] = receipt
 	eventData["terminal_receipt_sha256"] = receiptSHA256
 	addKillReason(eventData, killReason)
