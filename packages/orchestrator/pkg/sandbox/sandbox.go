@@ -265,6 +265,9 @@ type Sandbox struct {
 	updateMu             sync.Mutex
 	measurementLifecycle sync.Mutex
 	measurementStopping  bool
+	terminalNetworkMu    sync.RWMutex
+	terminalEgressBytes  *uint64
+	terminalEgressErr    error
 
 	// LifecycleID is a unique identifier for each Firecracker process.
 	// It is used internally by the orchestrator for map eviction guards
@@ -1230,6 +1233,20 @@ func (s *Sandbox) Stop(ctx context.Context) error {
 	})
 }
 
+// TerminalEgressMeasurement returns the provider-owned network measurement
+// captured after the guest has stopped and before its network slot is torn down.
+func (s *Sandbox) TerminalEgressMeasurement() (uint64, error) {
+	s.terminalNetworkMu.RLock()
+	defer s.terminalNetworkMu.RUnlock()
+	if s.terminalEgressBytes == nil {
+		if s.terminalEgressErr != nil {
+			return 0, s.terminalEgressErr
+		}
+		return 0, errors.New("terminal egress measurement not captured")
+	}
+	return *s.terminalEgressBytes, nil
+}
+
 // doStop performs the actual stop operation.
 func (s *Sandbox) doStop(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "sandbox-close")
@@ -1271,6 +1288,20 @@ func (s *Sandbox) doStop(ctx context.Context) error {
 	uffdStopErr := s.Resources.memory.Stop()
 	if uffdStopErr != nil {
 		errs = append(errs, fmt.Errorf("failed to stop uffd: %w", uffdStopErr))
+	}
+
+	if s.Resources.Slot != nil {
+		bytes, err := s.Resources.Slot.TerminalEgressBytes()
+		s.terminalNetworkMu.Lock()
+		if err != nil {
+			s.terminalEgressErr = err
+		} else {
+			s.terminalEgressBytes = &bytes
+		}
+		s.terminalNetworkMu.Unlock()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to capture terminal egress bytes: %w", err))
+		}
 	}
 
 	return errors.Join(errs...)
