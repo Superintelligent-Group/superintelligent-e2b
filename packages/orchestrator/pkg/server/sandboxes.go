@@ -956,6 +956,14 @@ func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execu
 		"execution_id":   sbx.Runtime.ExecutionID,
 		"closed_at":      closedAt.UTC().Format(time.RFC3339Nano),
 		"execution":      execution,
+		// These measurements are deliberately represented as unavailable until
+		// the provider owns an authoritative wire-byte/artifact/idle surface.
+		// Consumers must never turn an unavailable measurement into numeric zero.
+		"non_runtime": map[string]any{
+			"egress_bytes":   unavailableTerminalMeasurement("provider_egress_surface_unavailable"),
+			"artifact_bytes": unavailableTerminalMeasurement("provider_artifact_surface_unavailable"),
+			"idle_seconds":   unavailableTerminalMeasurement("provider_idle_surface_unavailable"),
+		},
 	}
 	encoded, err := json.Marshal(receipt)
 	if err != nil {
@@ -965,6 +973,13 @@ func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execu
 	}
 	digest := sha256.Sum256(encoded)
 	return receipt, hex.EncodeToString(digest[:])
+}
+
+func unavailableTerminalMeasurement(reason string) map[string]any {
+	return map[string]any{
+		"status": "unavailable",
+		"reason": reason,
+	}
 }
 
 // snapshotResult holds the data produced by snapshotAndCacheSandbox that
