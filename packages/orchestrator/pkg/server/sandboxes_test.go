@@ -151,6 +151,14 @@ func TestBuildSandboxTerminalReceiptIsCanonical(t *testing.T) {
 	assert.Equal(t, "sandbox-1", receipt["sandbox_id"])
 	assert.Equal(t, "execution-1", receipt["execution_id"])
 	assert.Equal(t, "2026-09-14T20:00:00.123Z", receipt["closed_at"])
+	nonRuntime, ok := receipt["non_runtime"].(map[string]any)
+	require.True(t, ok)
+	for _, field := range []string{"egress_bytes", "artifact_bytes", "idle_seconds"} {
+		measurement, ok := nonRuntime[field].(map[string]any)
+		require.True(t, ok, field)
+		assert.Equal(t, "unavailable", measurement["status"], field)
+		assert.NotContains(t, measurement, "value", field)
+	}
 	assert.Len(t, digest, 64)
 
 	_, repeated := buildSandboxTerminalReceipt(sbx, closedAt, execution)
