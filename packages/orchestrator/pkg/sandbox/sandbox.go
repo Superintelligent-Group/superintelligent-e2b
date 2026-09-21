@@ -31,6 +31,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/networkusage"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/terminalidle"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/prefetch"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/scheduling"
@@ -263,6 +264,8 @@ type Sandbox struct {
 	*Metadata
 
 	updateMu             sync.Mutex
+	idleMu               sync.Mutex
+	idleTracker          *terminalidle.Tracker
 	measurementLifecycle sync.Mutex
 	measurementStopping  bool
 	terminalNetworkMu    sync.RWMutex
@@ -326,6 +329,37 @@ func (s *Sandbox) RunUpdate(update func() error) error {
 	defer s.updateMu.Unlock()
 
 	return update()
+}
+
+// MarkProviderActivity records a provider lifecycle transition for terminal
+// idle accounting. The transition is owned by the orchestrator, rather than
+// inferred from framework receipts or timeout policy.
+func (s *Sandbox) MarkProviderActivity(at time.Time) error {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+
+	if s.idleTracker == nil {
+		return terminalidle.ErrActivityAfterTerminal
+	}
+
+	return s.idleTracker.Observe(at)
+}
+
+// TerminalIdleMeasurement closes the provider lifecycle activity window.
+func (s *Sandbox) TerminalIdleMeasurement(at time.Time) map[string]any {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+
+	if s.idleTracker == nil {
+		return (terminalidle.Measurement{
+			Status:     "unavailable",
+			Reason:     "provider_lifecycle_activity_unavailable",
+			Provenance: "e2b.provider.lifecycle",
+			ObservedAt: at,
+		}).AsMap()
+	}
+
+	return s.idleTracker.Close(at).AsMap()
 }
 
 func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
@@ -620,6 +654,7 @@ func (f *Factory) CreateSandbox(
 
 		Resources:    resources,
 		Metadata:     metadata,
+		idleTracker:  terminalidle.New(metadata.startedAt),
 		cgroupHandle: cgroupHandle,
 
 		Template:  template,
@@ -1035,6 +1070,7 @@ func (f *Factory) ResumeSandbox(
 
 		Resources:    resources,
 		Metadata:     metadata,
+		idleTracker:  terminalidle.New(metadata.startedAt),
 		cgroupHandle: cgroupHandle,
 
 		Template:  t,
