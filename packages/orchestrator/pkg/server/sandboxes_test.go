@@ -158,6 +158,8 @@ func TestBuildSandboxTerminalReceiptIsCanonical(t *testing.T) {
 		require.True(t, ok, field)
 		assert.Equal(t, "unavailable", measurement["status"], field)
 		assert.NotContains(t, measurement, "value", field)
+		assert.NotEmpty(t, measurement["provenance"], field)
+		assert.Equal(t, closedAt.Format(time.RFC3339Nano), measurement["observed_at"], field)
 	}
 	assert.Len(t, digest, 64)
 

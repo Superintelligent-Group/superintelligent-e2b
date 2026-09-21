@@ -951,9 +951,14 @@ func (s *Server) getSandboxExecutionData(sbx *sandbox.Sandbox) map[string]any {
 // missing provider measurements with guessed zeroes.
 func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execution any) (map[string]any, string) {
 	egressBytes, egressErr := sbx.TerminalEgressMeasurement()
-	egress := unavailableTerminalMeasurement("provider_egress_surface_unavailable")
+	egress := unavailableTerminalMeasurement("provider_egress_surface_unavailable", closedAt)
 	if egressErr == nil {
-		egress = map[string]any{"status": "measured", "bytes": egressBytes}
+		egress = map[string]any{
+			"status":      "measured",
+			"bytes":       egressBytes,
+			"provenance":  "e2b.provider.network",
+			"observed_at": closedAt.UTC().Format(time.RFC3339Nano),
+		}
 	}
 	receipt := map[string]any{
 		"schema_version": 1,
@@ -967,8 +972,8 @@ func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execu
 		// Consumers must never turn an unavailable measurement into numeric zero.
 		"non_runtime": map[string]any{
 			"egress_bytes":   egress,
-			"artifact_bytes": unavailableTerminalMeasurement("provider_artifact_surface_unavailable"),
-			"idle_seconds":   unavailableTerminalMeasurement("provider_idle_surface_unavailable"),
+			"artifact_bytes": unavailableTerminalMeasurement("provider_artifact_surface_unavailable", closedAt),
+			"idle_seconds":   unavailableTerminalMeasurement("provider_idle_surface_unavailable", closedAt),
 		},
 	}
 	encoded, err := json.Marshal(receipt)
@@ -981,10 +986,12 @@ func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execu
 	return receipt, hex.EncodeToString(digest[:])
 }
 
-func unavailableTerminalMeasurement(reason string) map[string]any {
+func unavailableTerminalMeasurement(reason string, observedAt time.Time) map[string]any {
 	return map[string]any{
-		"status": "unavailable",
-		"reason": reason,
+		"status":      "unavailable",
+		"reason":      reason,
+		"provenance":  "e2b.orchestrator.terminal_receipt",
+		"observed_at": observedAt.UTC().Format(time.RFC3339Nano),
 	}
 }
 
