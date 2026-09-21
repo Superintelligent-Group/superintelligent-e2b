@@ -274,6 +274,10 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	}
 
 	s.setupSandboxLifecycle(ctx, sbx)
+	if err := sbx.MarkProviderActivity(time.Now().UTC()); err != nil {
+		telemetry.ReportCriticalError(ctx, "failed to record provider create activity", err,
+			telemetry.WithSandboxID(sbx.Runtime.SandboxID))
+	}
 
 	// Read scheduling metadata after the sandbox resumed so the template's
 	// memfile/rootfs devices (and their headers) are resolved.
@@ -421,9 +425,12 @@ func (s *Server) Update(ctx context.Context, req *orchestrator.SandboxUpdateRequ
 
 			return status.Errorf(codes.Internal, "failed to update sandbox: %s", err)
 		}
-
 		// Publish event if any updates were applied.
 		if len(updates) > 0 {
+			if err := sbx.MarkProviderActivity(time.Now().UTC()); err != nil {
+				telemetry.ReportCriticalError(ctx, "failed to record provider update activity", err,
+					telemetry.WithSandboxID(sbx.Runtime.SandboxID))
+			}
 			teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
 			if req.GetEndTime() != nil {
 				eventData["set_timeout"] = req.GetEndTime().AsTime().Format(time.RFC3339)
@@ -973,7 +980,7 @@ func buildSandboxTerminalReceipt(sbx *sandbox.Sandbox, closedAt time.Time, execu
 		"non_runtime": map[string]any{
 			"egress_bytes":   egress,
 			"artifact_bytes": unavailableTerminalMeasurement("provider_artifact_surface_unavailable", closedAt),
-			"idle_seconds":   unavailableTerminalMeasurement("provider_idle_surface_unavailable", closedAt),
+			"idle_seconds":   sbx.TerminalIdleMeasurement(closedAt),
 		},
 	}
 	encoded, err := json.Marshal(receipt)
