@@ -15,7 +15,10 @@ if [ -z "${workdir}" ]; then
     # Use the user's home directory
     workdir=$(getent passwd "$user" | cut -d: -f6)
 fi
-cd "$workdir" || exit 1
+if ! cd "$workdir"; then
+    echo "Error: working directory does not exist: $workdir" >&2
+    exit 1
+fi
 
 # Get the parent folder of the source file/folder
 sourceFolder="$(dirname "$sourcePath")"
@@ -28,20 +31,32 @@ else
     targetPath="$(pwd)/$inputPath"
 fi
 
-cd "$sourceFolder" || exit 1
+# A missing parent folder means the source path was never part of the uploaded
+# build context - report it the same way as a missing entry instead of exiting
+# silently, which left the build with a bare "exit status 1".
+if ! cd "$sourceFolder"; then
+    echo "Error: source path does not exist: $sourcePath" >&2
+    exit 1
+fi
 
 # Get the entry (file, directory, or symlink) named by the source path
 entry="$(basename "$sourcePath")"
 
 if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
-    echo "Error: source path does not exist: $sourcePath"
+    echo "Error: source path does not exist: $sourcePath" >&2
     exit 1
 fi
 
 # Check type BEFORE applying ownership/permissions to avoid dereferencing symlinks
 if [ -L "$entry" ]; then
     # It's a symlink – create parent folders and move+rename it to the exact path
-    mkdir -p "$(dirname "$targetPath")"
+    if [[ "$targetPath" == */ ]]; then
+        # Docker COPY semantics: a trailing slash means the target is a
+        # directory — create it and move the entry inside under its own name
+        mkdir -p "$targetPath"
+    else
+        mkdir -p "$(dirname "$targetPath")"
+    fi
     # Change ownership of the symlink itself (not the target)
     chown -h "$owner" "$entry"
     # Note: chmod on symlinks affects the target, not the link itself in most systems
@@ -53,7 +68,13 @@ elif [ -f "$entry" ]; then
     if [ -n "$permissions" ]; then
         chmod "$permissions" "$entry"
     fi
-    mkdir -p "$(dirname "$targetPath")"
+    if [[ "$targetPath" == */ ]]; then
+        # Docker COPY semantics: a trailing slash means the target is a
+        # directory — create it and move the entry inside under its own name
+        mkdir -p "$targetPath"
+    else
+        mkdir -p "$(dirname "$targetPath")"
+    fi
     mv "$entry" "$targetPath"
 elif [ -d "$entry" ]; then
     # It's a directory – apply ownership/permissions recursively, then merge
@@ -75,6 +96,6 @@ elif [ -d "$entry" ]; then
     chmod -R u+rwx "$entry"
     rm -rf "$entry"
 else
-    echo "Error: entry is neither file, directory, nor symlink"
+    echo "Error: entry is neither file, directory, nor symlink: $sourcePath" >&2
     exit 1
 fi
