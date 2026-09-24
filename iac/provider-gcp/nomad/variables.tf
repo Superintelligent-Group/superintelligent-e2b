@@ -13,7 +13,7 @@ variable "orchestrator_node_pool" {
 variable "orchestrator_memory_mb" {
   type        = number
   description = "Nomad memory reservation for the orchestrator and Firecracker children."
-  default     = 4096
+  default     = 12288
 }
 
 variable "core_repository_name" {
