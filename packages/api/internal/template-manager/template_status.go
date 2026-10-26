@@ -170,6 +170,10 @@ func (c *PollBuildStatus) poll(ctx context.Context) {
 				return
 			}
 
+			// The grace period bounds a continuous outage, not the lifetime of
+			// this poller. A successful response starts any later outage anew.
+			c.transientErrorsSince = time.Time{}
+
 			// build status can return empty error when build is still in progress
 			// this will cause fast return to avoid pooling when build is already finished
 			if buildCompleted {

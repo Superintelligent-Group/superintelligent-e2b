@@ -129,6 +129,33 @@ func TestPollBuildStatus_transientRPCErrorKeepsBuildAlive(t *testing.T) {
 	})
 }
 
+func TestPollBuildStatus_recoveredRPCResetsGracePeriod(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		client := &scriptedClient{script: []getStatusResult{
+			{resp: &templatemanagergrpc.TemplateBuildStatusResponse{Status: templatemanagergrpc.TemplateBuildState_Building}},
+			{err: grpcDeadlineExceeded()},
+			{resp: completedStatus()},
+		}}
+		c := &PollBuildStatus{
+			client:               client,
+			logger:               logger.NewNopLogger(),
+			buildID:              uuid.New(),
+			transientErrorsSince: time.Now().Add(-transientErrorGracePeriod),
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), buildTimeout)
+		defer cancel()
+		c.poll(ctx)
+
+		failedReasons, finished, calls := client.snapshot()
+		if len(failedReasons) != 0 || !finished || calls != 3 {
+			t.Fatalf("recovered poll must restart transient grace: failures=%q finished=%t calls=%d", failedReasons, finished, calls)
+		}
+	})
+}
+
 // TestPollBuildStatus_transientRPCErrorEventuallyFailsBuild makes sure the
 // tolerance above stays bounded: a builder that never answers again still fails
 // the build, it just takes the grace period instead of a single hiccup.
