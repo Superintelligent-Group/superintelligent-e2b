@@ -440,6 +440,8 @@ sequenceDiagram
     API->>API: mark build ready in Postgres
 ```
 
+The API tolerates a bounded continuous outage of the template-manager status RPC while the builder keeps working; a successful response resets that outage window. Build completion and failure use terminal status writes that cannot overwrite an already terminal build, so concurrent pollers and an administrator cancellation cannot reverse the first recorded outcome. When the build polling deadline expires, the API records the failure before asking the build node to delete the build and release its slot.
+
 Builds are **layered** (`pkg/template/build/phases/`): base → user → one layer per recipe step →
 resize disk → finalize → optimize. Each layer is hashed and cached, so rebuilds only re-run changed
 steps. Resize disk grows the quiescent rootfs on the host; the other non-cached phases run in a real
