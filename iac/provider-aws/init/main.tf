@@ -15,3 +15,10 @@ module "cloudflare" {
 
   prefix = var.prefix
 }
+locals {
+  # Cost attribution is an explicit taxonomy, independent of resource names.
+  # These tags also survive targeted recovery plans without provider defaults.
+  resource_tags = {
+    Project = var.project_tag
+  }
+}
